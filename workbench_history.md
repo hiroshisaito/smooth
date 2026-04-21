@@ -285,6 +285,50 @@ SIMD 化の対象は後者のみ。
 - FAST_COMPARE_PIXEL は 1 cycle の整数比較。SIMD で 4 並列しても、pre-scan の store コストで相殺される可能性がある。本当に SIMD が効くのは "1 位置あたり複数 cycle" の演算(例: ComparePixel の ABS diff 合計)。
 - 将来 SIMD を入れるなら ComparePixel (4-neighbor sum-of-abs-diff) の vectorization、または Blendingf の alpha composite が候補。
 
+### 2026-04-21 22:35 JST — Step 6 完了 / v1.5.0 タグ
+
+**リリースビルド**(3 種):
+- `Mac/release/universal/smooth.plugin` — x86_64 + arm64 (推奨)
+- `Mac/release/arm64/smooth.plugin` — Apple Silicon 単独
+- `Mac/release/x86_64/smooth.plugin` — Intel 単独
+
+**zip 化**: `ditto -c -k --sequesterRsrc --keepParent` で AE が認識する形式。
+- `smooth.Mac.1.5.0.AE2025.universal.zip` (56 KB)
+- `smooth.Mac.1.5.0.AE2025.arm64.zip` (28 KB)
+- `smooth.Mac.1.5.0.AE2025.x86_64.zip` (31 KB)
+
+**実機確認**: universal 版を AE 2025 (Intel Mac) で適用 → 動作 OK。
+
+**タグ付け**: `v1.5.0` annotated tag 作成、コミット `eb2065b`。
+
+**RELEASE_NOTES**: `Mac/release/RELEASE_NOTES.md` (配布用) + `RELEASE_NOTES-v1.5.0.md` (リポジトリルート、tracked)。
+
+## Phase 1 最終サマリ
+
+**ブランチ**: `feature/smooth-mod-v1.5.0`
+**タグ**: `v1.5.0`
+**コミット数**: 9 (kickoff + Step 2 + Step 2 follow-up + Step 2 close + Step 3 + Step 4 + Step 5 + Release notes)
+
+**パフォーマンス達成**:
+
+| ケース | 1.4.0-ae2025 | 1.5.0 | Speedup |
+| --- | --- | --- | --- |
+| 1920×1080 **16bpc** (Phase 1 目標) | ~25 ms (AE 内計測) / 20 ms (スタンドアロン) | **7.0 ms** | **2.9×** |
+| 3840×2160 16bpc | ~80 ms 推定 | 31.8 ms | ~2.5× |
+
+Phase 1 目標(25 → 5〜8 ms)**達成**。
+
+**機能追加**:
+- AE SDK 非依存コアモジュール (`smooth_core.h`)
+- AE 非依存の回帰テスト基盤 (`tests/regression_test.cpp`, `tests/bench.sh`)
+- ベンチ用 SMDP raw dump ハーネス (`bench.h`)
+
+**未解決 / 将来課題**:
+- 2512×1412 8bpc で ~30 bytes (0.0002%) の境界差異(並列化で受け入れ、`SMOOTH_PARALLEL=0` で回避可)
+- SIMD 効果は薄く、この手の処理では GPU 化が次の本丸
+- Windows 側ビルドは未更新(Phase 2 で対応予定)
+- `PBXRezBuildPhase`/`Traditional headermap` の Xcode 警告(将来の移行対象)
+
 ## 意思決定ログ
 
 ### 2026-04-21 — 記録は手動追記方式
