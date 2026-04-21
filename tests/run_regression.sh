@@ -30,6 +30,23 @@ clang++ -std=c++17 -O2 \
     "$RUST_LIB" \
     -o "$BIN" || { echo "build failed"; exit 1; }
 
+WHITE_BIN="$ROOT/tests/test_white_option"
+echo "==> build synthetic white_option harness"
+clang++ -std=c++17 -O2 \
+    -DSMOOTH_PARALLEL=$SMOOTH_PARALLEL \
+    -I"$SDK/Examples/Headers" \
+    -I"$SDK/Examples/Headers/SP" \
+    -I"$SDK/Examples/Util" \
+    -I"$RUST_CRATE/include" \
+    -I"$ROOT" \
+    "$ROOT/tests/test_white_option.cpp" \
+    "$ROOT/util.cpp" \
+    "$RUST_LIB" \
+    -o "$WHITE_BIN" || { echo "white-option build failed"; exit 1; }
+
+echo "==> run synthetic white_option tests"
+"$WHITE_BIN" || { echo "white_option regression FAILED"; exit 1; }
+
 pass=0
 fail=0
 failed_frames=()

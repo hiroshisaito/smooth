@@ -85,21 +85,36 @@ inline void invoke_row_range_ffi(PixelType* in_ptr, PixelType* out_ptr,
     }
 }
 
-// メイン走査 + ブレンド処理。in_ptr 側は preProcess で白抜き済みの前提。
-// 呼び出し側は事前に in_ptr 全体を out_ptr にコピーしておくこと(PF_COPY 相当)。
+// メイン走査 + ブレンド処理。in_ptr に対して preProcess を行い、そのあとで
+// out_ptr に in_ptr の内容をコピーしてからスキャン + ブレンドを走らせる。
+// 呼び出し側は PF_COPY を事前に行う必要はない(本関数が in-place 前処理 +
+// 内部 memcpy で等価な結果を保証する)。
+//
+// この関数の契約:
+//   - in_ptr / out_ptr は少なくとも rowbytes * height バイトの独立した書込可能
+//     バッファを指していること。
+//   - 戻り時、out_ptr は smoothing 済み画像になる。in_ptr は preProcess 分の
+//     in-place 書き換えが施されている(white_option 時に白 → null_pixel)。
 template <typename PixelType>
 inline void process(PixelType* in_ptr, PixelType* out_ptr,
                     int logical_width, int height, int rowbytes,
                     const Params& p) {
     const int in_width = (int)(rowbytes / sizeof(PixelType));
 
-    // 1) 白抜きと境界検出
+    // 1) 白抜きと境界検出(in_ptr in-place)
     int eh_top, eh_left, eh_right, eh_bottom;
     preProcess<PixelType>(in_ptr, rowbytes, height,
                           &eh_top, &eh_left, &eh_right, &eh_bottom,
                           p.white_option);
 
-    // 2) 領域調整(端を 1px 内側に寄せる)
+    // 2) 変更後の in_ptr を out_ptr にまるごとコピー。
+    //    これで out_ptr の内部白ピクセルも透明化され、続く scan/blend は
+    //    エッジだけ上書きすれば整合が取れる。
+    std::memcpy(reinterpret_cast<void*>(out_ptr),
+                reinterpret_cast<const void*>(in_ptr),
+                static_cast<size_t>(rowbytes) * static_cast<size_t>(height));
+
+    // 3) 領域調整(端を 1px 内側に寄せる)
     if (eh_top == 0)                eh_top = 1;
     if (eh_left == 0)               eh_left = 1;
     if (eh_right == logical_width)  eh_right -= 1;

@@ -628,3 +628,34 @@ msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
 - 生成バイナリ: universal (x86_64 + arm64)、5 FFI シンボル確認 (`_smooth_core_{version, preprocess_u8/u16, process_row_range_u8/u16}`)
 
 **次 (Step 4)**: rayon で行ブロック並列化を Rust 内部に移設。C++ 側の `std::thread` / `std::vector<std::thread>` 枠組みを撤去し、`smooth_core_process_row_range_u8/u16` の中で並列化を完結させる。SEAM_HALO=0 の既知境界挙動は維持。
+
+### 2026-04-22 02:30 JST — Step 3 フォローアップ: white_option バグ修正
+
+**症状**(ユーザー AE 実機報告): `white option` ON で透明化エフェクトを使うと**エッジのピクセルのみ**が透明になり、**内部の白ピクセル**は白のまま残る。
+
+**原因追跡**: Phase 1 Step 3 の core 抽出リファクタ(commit 169e6ed)で、Effect.cpp の呼び出し順が変わっていた:
+
+```
+旧(正): preProcess(in_ptr) → PF_COPY(input→output) → scan/blend(out)
+新(バグ): PF_COPY(input→output) → smooth_core::process(in, out) {
+          preProcess(in)     [← in_ptr だけ透明化]
+          scan/blend(in→out) [← out のエッジしか書かない]
+        }
+```
+
+- 旧: PF_COPY が**透明化済みの** in_ptr を out_ptr にコピー → 内部白ピクセルも transparent
+- 新: PF_COPY が**元の** in_ptr を out_ptr にコピー → 内部白ピクセルは out_ptr に 0xFFFFFFFF のまま残り、scan/blend ではエッジしか書き換えないため白のまま
+
+**回帰テスト漏れ**: `frame_0047` が `white=1` だが、実際のピクセル内容は「透明背景 + 色付き図形」で白ピクセルが無い(corner dump 確認済)。よって preProcess の白置換が動かず、バグは exercise されなかった。他の 13 フレームはすべて `white=0`。
+
+**修正**:
+- [smooth_core.h](smooth_core.h) `process<T>()` に `std::memcpy(out_ptr, in_ptr, rowbytes*height)` を preProcess 後に追加(in の in-place 透明化を out にも反映)
+- [Effect.cpp](Effect.cpp) から `PF_COPY(input, output, NULL, NULL)` を削除(smooth_core 側で memcpy する契約に)
+- 契約を smooth_core.h のコメントに明記: 呼び出し側は PF_COPY 不要、out_ptr は rowbytes×height バイトの書込可能バッファであれば良い
+
+**新規回帰**: [tests/test_white_option.cpp](tests/test_white_option.cpp) — 合成した全白画像(アンカー 1px 以外)に `white_option=true` で `process` を実行、アンカー以外がすべて `alpha=0` になることを検証。8bpc/16bpc × 32x32/128x96 の 4 ケース追加。run_regression.sh が毎回実行。
+
+**検証結果**:
+- 合成 white_option 4/4 OK
+- ゴールデン 14/14 IDENTICAL 維持
+- Mac universal build 成功

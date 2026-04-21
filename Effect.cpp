@@ -474,8 +474,12 @@ static PF_Err smoothing(PF_InData   *in_data,
     BEGIN_PROFILE();
     SMOOTH_BENCH_TIMER_BEGIN();
 
-    // AE 側で in → out に丸ごとコピー(その後 out を in-place 編集)
-    err = PF_COPY(input, output, NULL, NULL);
+    err = PF_Err_NONE;
+
+    // 以前は PF_COPY(input, output) をここで実行していたが、white_option 時に
+    // 内部の白ピクセルが out に反映されないバグの原因となっていた。
+    // smooth_core::process() が preProcess → in_ptr in-place 改変 → out_ptr へ
+    // memcpy の順でコピーを担うため、AE SDK レベルのコピーは不要。
 
     // パラメータを core 形式へ変換
     smooth_core::Params core_params;

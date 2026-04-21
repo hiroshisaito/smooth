@@ -12,5 +12,6 @@
 /tests/.venv/
 /tests/goldens/
 /tests/regression_test
+/tests/test_white_option
 /rust/smooth_core/target/
 /rust/smooth_core/Cargo.lock
