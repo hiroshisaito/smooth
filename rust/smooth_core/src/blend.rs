@@ -4,7 +4,7 @@ use crate::types::{BlendingInfo, SmoothPixel, px_read, px_write};
 
 /// BlendingPixelf: blend `target` and `ref` by ratio, write to `output`.
 /// Matches util.h::BlendingPixelf semantics for AE's ARGB pre-multiplied alpha case split.
-#[inline]
+#[inline(always)]
 pub fn blending_pixel_f<P: SmoothPixel>(target_pixel: &P, ref_pixel: &P, output_pixel: &mut P, ratio: f32) {
     let max_value = P::max_value();
     let alpha   = (max_value as f32 * ratio) as u32;
@@ -37,7 +37,7 @@ pub fn blending_pixel_f<P: SmoothPixel>(target_pixel: &P, ref_pixel: &P, output_
 }
 
 /// Blendingf(in_ptr, out_ptr, blend_target, ref_target, out_target, ratio).
-#[inline]
+#[inline(always)]
 pub unsafe fn blending_f<P: SmoothPixel>(
     in_ptr: *mut P, out_ptr: *mut P,
     blend_target: i64, ref_target: i64, out_target: i64,

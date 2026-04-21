@@ -90,62 +90,62 @@ pub trait SmoothPixel: Copy + PartialEq + 'static {
 }
 
 impl SmoothPixel for Pixel8 {
-    #[inline] fn white_key()  -> Self { Pixel8 { alpha: 0xFF, red: 0xFF, green: 0xFF, blue: 0xFF } }
-    #[inline] fn null_pixel() -> Self { Pixel8 { alpha: 0,    red: 0,    green: 0,    blue: 0    } }
-    #[inline] fn rgb_eq(&self, o: &Self) -> bool { self.red == o.red && self.green == o.green && self.blue == o.blue }
-    #[inline] fn alpha_is_zero(&self) -> bool { self.alpha == 0 }
+    #[inline(always)] fn white_key()  -> Self { Pixel8 { alpha: 0xFF, red: 0xFF, green: 0xFF, blue: 0xFF } }
+    #[inline(always)] fn null_pixel() -> Self { Pixel8 { alpha: 0,    red: 0,    green: 0,    blue: 0    } }
+    #[inline(always)] fn rgb_eq(&self, o: &Self) -> bool { self.red == o.red && self.green == o.green && self.blue == o.blue }
+    #[inline(always)] fn alpha_is_zero(&self) -> bool { self.alpha == 0 }
 
-    #[inline]
+    #[inline(always)]
     fn delta_sum(&self, o: &Self) -> u32 {
         self.red.abs_diff(o.red)     as u32
             + self.green.abs_diff(o.green) as u32
             + self.blue.abs_diff(o.blue)   as u32
             + self.alpha.abs_diff(o.alpha) as u32
     }
-    #[inline] fn max_value() -> u32 { 0xFF }
+    #[inline(always)] fn max_value() -> u32 { 0xFF }
 
-    #[inline] fn red(&self)   -> u32 { self.red   as u32 }
-    #[inline] fn green(&self) -> u32 { self.green as u32 }
-    #[inline] fn blue(&self)  -> u32 { self.blue  as u32 }
-    #[inline] fn alpha(&self) -> u32 { self.alpha as u32 }
+    #[inline(always)] fn red(&self)   -> u32 { self.red   as u32 }
+    #[inline(always)] fn green(&self) -> u32 { self.green as u32 }
+    #[inline(always)] fn blue(&self)  -> u32 { self.blue  as u32 }
+    #[inline(always)] fn alpha(&self) -> u32 { self.alpha as u32 }
 
-    #[inline] fn set_red(&mut self,   v: u32) { self.red   = v as u8; }
-    #[inline] fn set_green(&mut self, v: u32) { self.green = v as u8; }
-    #[inline] fn set_blue(&mut self,  v: u32) { self.blue  = v as u8; }
-    #[inline] fn set_alpha(&mut self, v: u32) { self.alpha = v as u8; }
+    #[inline(always)] fn set_red(&mut self,   v: u32) { self.red   = v as u8; }
+    #[inline(always)] fn set_green(&mut self, v: u32) { self.green = v as u8; }
+    #[inline(always)] fn set_blue(&mut self,  v: u32) { self.blue  = v as u8; }
+    #[inline(always)] fn set_alpha(&mut self, v: u32) { self.alpha = v as u8; }
 
-    #[inline]
+    #[inline(always)]
     fn as_packed(&self) -> u64 {
         ((self.alpha as u64)) | ((self.red as u64) << 8) | ((self.green as u64) << 16) | ((self.blue as u64) << 24)
     }
 }
 
 impl SmoothPixel for Pixel16 {
-    #[inline] fn white_key()  -> Self { Pixel16 { alpha: 0x8000, red: 0x8000, green: 0x8000, blue: 0x8000 } }
-    #[inline] fn null_pixel() -> Self { Pixel16 { alpha: 0,      red: 0,      green: 0,      blue: 0      } }
-    #[inline] fn rgb_eq(&self, o: &Self) -> bool { self.red == o.red && self.green == o.green && self.blue == o.blue }
-    #[inline] fn alpha_is_zero(&self) -> bool { self.alpha == 0 }
+    #[inline(always)] fn white_key()  -> Self { Pixel16 { alpha: 0x8000, red: 0x8000, green: 0x8000, blue: 0x8000 } }
+    #[inline(always)] fn null_pixel() -> Self { Pixel16 { alpha: 0,      red: 0,      green: 0,      blue: 0      } }
+    #[inline(always)] fn rgb_eq(&self, o: &Self) -> bool { self.red == o.red && self.green == o.green && self.blue == o.blue }
+    #[inline(always)] fn alpha_is_zero(&self) -> bool { self.alpha == 0 }
 
-    #[inline]
+    #[inline(always)]
     fn delta_sum(&self, o: &Self) -> u32 {
         self.red.abs_diff(o.red)     as u32
             + self.green.abs_diff(o.green) as u32
             + self.blue.abs_diff(o.blue)   as u32
             + self.alpha.abs_diff(o.alpha) as u32
     }
-    #[inline] fn max_value() -> u32 { 0x8000 }
+    #[inline(always)] fn max_value() -> u32 { 0x8000 }
 
-    #[inline] fn red(&self)   -> u32 { self.red   as u32 }
-    #[inline] fn green(&self) -> u32 { self.green as u32 }
-    #[inline] fn blue(&self)  -> u32 { self.blue  as u32 }
-    #[inline] fn alpha(&self) -> u32 { self.alpha as u32 }
+    #[inline(always)] fn red(&self)   -> u32 { self.red   as u32 }
+    #[inline(always)] fn green(&self) -> u32 { self.green as u32 }
+    #[inline(always)] fn blue(&self)  -> u32 { self.blue  as u32 }
+    #[inline(always)] fn alpha(&self) -> u32 { self.alpha as u32 }
 
-    #[inline] fn set_red(&mut self,   v: u32) { self.red   = v as u16; }
-    #[inline] fn set_green(&mut self, v: u32) { self.green = v as u16; }
-    #[inline] fn set_blue(&mut self,  v: u32) { self.blue  = v as u16; }
-    #[inline] fn set_alpha(&mut self, v: u32) { self.alpha = v as u16; }
+    #[inline(always)] fn set_red(&mut self,   v: u32) { self.red   = v as u16; }
+    #[inline(always)] fn set_green(&mut self, v: u32) { self.green = v as u16; }
+    #[inline(always)] fn set_blue(&mut self,  v: u32) { self.blue  = v as u16; }
+    #[inline(always)] fn set_alpha(&mut self, v: u32) { self.alpha = v as u16; }
 
-    #[inline]
+    #[inline(always)]
     fn as_packed(&self) -> u64 {
         (self.alpha as u64) | ((self.red as u64) << 16) | ((self.green as u64) << 32) | ((self.blue as u64) << 48)
     }
@@ -155,7 +155,7 @@ impl SmoothPixel for Pixel16 {
 // Safe accessors on a raw-pointer buffer. Callers ensure `offset` is in-bounds.
 /// # Safety
 /// `ptr.add(offset)` must be within the allocated buffer and dereferenceable.
-#[inline]
+#[inline(always)]
 pub unsafe fn px_read<P: Copy>(ptr: *const P, offset: i64) -> P {
     *ptr.offset(offset as isize)
 }
@@ -163,7 +163,7 @@ pub unsafe fn px_read<P: Copy>(ptr: *const P, offset: i64) -> P {
 /// # Safety
 /// `ptr.add(offset)` must be within the allocated buffer and mutably dereferenceable;
 /// caller must ensure no other reference aliases the same slot during the write.
-#[inline]
+#[inline(always)]
 pub unsafe fn px_write<P: Copy>(ptr: *mut P, offset: i64, value: P) {
     *ptr.offset(offset as isize) = value;
 }

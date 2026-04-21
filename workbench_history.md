@@ -44,7 +44,7 @@
 | 2 | `preProcess<T>` を Rust 移植 | **完了** (2026-04-22) |
 | 3 | ヘルパー関数群 + `process_row_range` を Rust 移植(シリアル)※ Step 4 と統合 | **完了** (2026-04-22) |
 | 4 | rayon 並列化(Rust 内部に移設) | **完了** (2026-04-22) |
-| 5 | フル回帰テスト + ベンチ比較 | 未着手 |
+| 5 | フル回帰テスト + ベンチ比較 + tuning 試行 | **完了** (2026-04-22) |
 | 6 | Windows ビルド統合(別マシン作業) | 未着手 |
 
 ### 横断 TODO / 未決事項
@@ -697,3 +697,48 @@ msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
 - **Step 5 で原因切り分け + tuning (inline指定、abs_diff の手書き branchless 化、vector register 明示、代表関数の `#[inline(always)]`) を 1 回トライ。改善が鈍ければ現状で Phase 2-C 完了扱いにするかユーザー判断**
 
 **次 (Step 5)**: フル回帰テスト/ベンチ最終確認 + 速度チューニングの試行(もしくは現状 accept) → workbench まとめ。
+
+### 2026-04-22 03:30 JST — Step 5 (tuning 試行 + Phase 2-C クローズ)
+
+**実施した tuning**:
+- hot path 関数に `#[inline(always)]` を付与 — `compare_pixel` / `compare_pixel_equal` / `fast_compare_pixel` / `blending_pixel_f` / `blending_f` / `blend_line` / `px_read` / `px_write` / `SmoothPixel` trait 各メソッド
+
+**結果(tuning 前後ベンチ比較、ms、min-of-10)**:
+
+| frame | size | bpc | 前 serial | 後 serial | 前 parallel | 後 parallel |
+|---|---|---|---|---|---|---|
+| 135 | 2512×1412 | 8 | 16.7 | 18.2 | 7.6 | 7.4 |
+| 200 | 3840×2160 | 8 | 113.5 | 114.4 | 34.5 | 35.1 |
+| 500 | 3840×2160 | 16 | 145.8 | 147.0 | 41.5 | 43.9 |
+| 1000 | 1920×1080 | 16 | 35.1 | 35.2 | 10.0 | 10.9 |
+| 1500 | 1920×1080 | 16 | 34.3 | 34.6 | 10.1 | 10.6 |
+| 1767 | 1920×1080 | 16 | 34.2 | 34.5 | 10.1 | 11.7 |
+
+**判定**: `#[inline(always)]` はほぼ効果なし(LTO=true で既に inline 展開されていたため)。さらなる tuning(slice 化 + bounds-check 明示削除、手書き SIMD、`process_row_range` のタイル化など)は規模が大きく Phase 2-C の範囲を超える。**現状の 1.7× 遅さは known issue として accept**、Phase 2-A 着手後にタイル化+GPU 側の並列化と合わせて再設計する方針とする。
+
+**最終回帰**:
+
+| 条件 | 結果 |
+|---|---|
+| `cargo test --release` | 3/3 passed |
+| Mac universal `xcodebuild clean build` | BUILD SUCCEEDED |
+| `SMOOTH_PARALLEL=0` | 14/14 IDENTICAL + white_option 4/4 OK |
+| `SMOOTH_PARALLEL=1` | 13 IDENTICAL + 1 NEAR-ID (30 bytes、Phase 1 同一) + white_option 4/4 OK |
+| AE 実機(Mac universal) | Step 1/2/3/4 すべてユーザー目視確認 OK(Step 3 で white_option バグ発見→修正→再確認済) |
+
+## Phase 2-C クローズサマリ
+
+**達成**:
+- `smooth_core` の全処理(preProcess / process_row_range / helpers / 並列化)を Rust に移植完了
+- C++ 側は AE SDK との glue(Effect.cpp)+ 薄い wrapper(smooth_core.h)のみ、Rust crate を staticlib としてリンク
+- Xcode Run Script Phase で universal `.a`(x86_64 + arm64)を自動ビルド
+- FFI 表面: `smooth_core_{version, preprocess_u8/u16, process_row_range_u8/u16}` の 5 シンボル、`smooth_bbox_t` + `smooth_row_range_args_t`
+- Phase 1 の並列化挙動(SEAM_HALO=0、NEAR-ID tolerance 30 bytes)を維持
+- Step 3 follow-up で Phase 1 Step 3 由来の white_option バグ(回帰漏れ)を発見・修正
+- 合成 white_option テスト 4 ケースを回帰スイートに追加
+
+**残課題**(Phase 2-A 以降で扱う):
+- 速度 1.7× regression vs C++ Phase 1 → GPU 化(Phase 2-A)で置き換える or Rust 側で SIMD / タイル化
+- Windows ビルド統合(Phase 2-C Step 6、別マシン作業)
+- `SUPPORTS_THREADED_RENDERING` (MFR) → Phase 2-A 着手時にリマインド
+- cbindgen 検討 → FFI 表面が更に広がるなら導入
