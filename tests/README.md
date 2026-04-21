@@ -23,12 +23,14 @@
 
 2. **Install bench plugin**: copy `Mac/build/bench/smooth.plugin` into `~/Library/Application Support/Adobe/Common/Plug-ins/<ver>/MediaCore/` (or the AE2025 Plug-ins dir).
 
-3. **Run AE from Terminal** (so stderr bench logs are visible):
+3. **Run AE from Terminal directly** (keeps stderr attached to the terminal — `open -a` detaches it and only `timing.log` would be available):
 
    ```sh
-   open -a "Adobe After Effects 2025" --args -NSDocumentRevisionsDebugMode YES
-   # stderr goes to Console.app for now; timing.log is the reliable source
+   rm -rf /tmp/smooth_bench
+   "/Applications/Adobe After Effects 2025/Adobe After Effects 2025.app/Contents/MacOS/After Effects"
    ```
+
+   The Mach-O binary is named `After Effects` (not `Adobe After Effects 2025`). `timing.log` is written regardless, but live stderr is handy for spotting issues.
 
 4. **Create a test composition**:
    - Import each `tests/fixtures/*.png` as a separate footage
