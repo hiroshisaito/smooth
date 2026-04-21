@@ -742,3 +742,44 @@ msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
 - Windows ビルド統合(Phase 2-C Step 6、別マシン作業)
 - `SUPPORTS_THREADED_RENDERING` (MFR) → Phase 2-A 着手時にリマインド
 - cbindgen 検討 → FFI 表面が更に広がるなら導入
+
+### 2026-04-22 04:00 JST — Step 5 follow-up: 独立レビュー指摘の対処
+
+Phase 2-C クローズ前に、独立した Claude サブエージェント 4 本でレビュー(correctness/safety、API/maintainability、performance、test coverage)を走らせ、4 つの主要指摘を対処:
+
+**#2 performance (最大の発見)**: `fast_compare_pixel` が struct の 4 フィールドから shift+OR で packed 値を再構成していたため、LLVM が単一 load に fold できず、C++ 版の `*(PackedPixelType*)&pixel` 相当の速度が出ていなかった。修正後の [rust/smooth_core/src/compare.rs](rust/smooth_core/src/compare.rs) は `*const u32` / `*const u64` へ直接 cast して 1 命令 load に。`core::mem::size_of::<P>()` の match は monomorphize で定数分岐なので分岐自体は消える。
+
+ベンチ比較(parallel min、ms):
+
+| frame | size | bpc | 前 | 後 | 改善 |
+|---|---|---|---|---|---|
+| 135 | 2512×1412 | 8 | 7.6 | 6.0 | -21% |
+| 200 | 3840×2160 | 8 | 34.5 | 27.6 | -20% |
+| 500 | 3840×2160 | 16 | 41.5 | 31.9 | -23% |
+| 1000 | 1920×1080 | 16 | 10.0 | 10.0 | 同(HD 16bpc は帯域 bound の気配) |
+
+4K 系で 20〜23% 改善。C++ Phase 1 baseline(HD 16bpc 5.8 ms)との差は HD では依然残るが、4K 16bpc は 41.5 → 31.9 ms と Phase 1 水準に接近。
+
+**#4 FFI 契約文書化**: [smooth_core_ffi.h](rust/smooth_core/include/smooth_core_ffi.h) の先頭に caller contract セクションを追加(buffer layout / alignment / aliasing / threading)。`smooth_row_range_args_t` の field も half-open 明示。`smooth_core_preprocess_*` / `_process_row_range_*` の挙動も doc コメント化。
+
+**#3 SharedBuf newtype**: [rust/smooth_core/src/lib.rs](rust/smooth_core/src/lib.rs) の rayon 内で使っていた `in_ptr/out_ptr as usize` のトリックを `struct SharedBuf<P> { in_ptr, out_ptr }` + `unsafe impl Send/Sync` に置換。`SharedBuf` の doc コメントで "concurrent writes at strip boundaries are benign by design (Phase 1 SEAM_HALO=0 NEAR-ID residual)" を明示。将来 halo > 0 / タイル化に進む際は必ずこの型に触る設計。
+
+**#1 end_p 追加 4 箇所(false alarm と判定)**: レビューは `up_mode_left_blending` / `up_mode_top_blending` / `down_mode_left_blending` / `down_mode_top_blending` の `end_p = end as i32` にも f64 promotion を推奨したが、解析すると:
+- right/bottom の `- 0.000001` は **座標意味論**(end_p を end-1 に丸める意図)であり Rust の f32 精度が問題の本体だった
+- left/top は epsilon 減算が無く `(int)end` を直接取る設計なので、end が整数値のとき f32/f64 で同じ結果 → Rust 特有の precision 失敗は起きえない
+- 既存回帰(3840×2160 height=2160、2512×1412 height=1412)で height ≥ 1024 の top-blending は既に cover されており、14/14 IDENTICAL → 現状は正しい
+
+**防衛的強化**: `tests/test_white_option.cpp` に 64×1200(y>1024) の合成 tall 画像を白抜きテストに追加(8bpc / 16bpc)。これで将来リファクタで左上系に似た precision bug が紛れ込むと即検出される。
+
+**残する follow-ups**(PR body に記載、Phase 2-A 着手前に対処予定):
+- `smooth_row_range_args_t` に `abi_version` / `struct_size` 先頭 field を追加して将来の ABI 変更に備える
+- `parallel: i32` を `backend: u32` enum に昇格(`SMOOTH_BACKEND_CPU_SERIAL=0 / CPU_RAYON=1 / METAL=2 / CUDA=3`)
+- `BlendingInfo` を immutable params(ptr+width+height+range+lw)と mutable scratch(i/j/target/core/flag/mode)に分割
+- `SmoothPixel::as_packed` を基本 trait から外して `CpuFastCompare` 相当の別 trait へ(GPU 側は shader で実装する前提)
+- `SMOOTH_SKIP` 環境変数読取を `#[cfg(debug_assertions)]` gate(release build で 0 定数化)
+- `Cargo.lock` コミット(staticlib 再現性)
+- `Link8SquareExecute` / `Link8Mode03Execute` のカバレッジ確認(SMOOTH_SKIP マスクで goldens に差分が出るか計測)
+- NEAR-ID 許容値 `max_abs <= 32` の緩さ検討 — `<= 4` に絞る提案あり
+- `up_mode.rs` / `down_mode.rs` の重複(~90%)を `Direction` const generic で共通化(byte-exact 維持のまま)
+- 軽微: `Cinfo` → `BlendSpan` 改名、`DESIGN.md` 抽出
+- レビュー指摘の全量は `workbench_history.md` には転記せず、PR 本文で追跡

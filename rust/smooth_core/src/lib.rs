@@ -90,10 +90,49 @@ pub unsafe extern "C" fn smooth_core_process_row_range_u16(args: *const RowRange
     run_row_range::<Pixel16>(&*args);
 }
 
+/// Wrapper that lets the in/out pixel buffer pointers cross thread boundaries
+/// under `rayon::into_par_iter`.
+///
+/// # Safety invariant carried by the type (not by the compiler)
+///
+/// Multiple rayon workers dereference the same `*mut P` addresses stored here.
+/// That is sound only because Phase 1 established the following write-pattern
+/// invariant and Phase 2-C preserves it byte-for-byte:
+///
+/// * `in_ptr` is **read-only** after `smooth_core::process` finishes its
+///   `preProcess` + `memcpy(out, in)` phase. Workers never write to `in_ptr`.
+/// * `out_ptr` is written concurrently by workers, each handling a disjoint
+///   row strip `[j_start, j_end)`. Writes from up/downMode blending at strip
+///   boundaries can overlap by up to a few rows (Phase 1 `SEAM_HALO=0`); the
+///   resulting boundary residual is bounded, deterministic only up to thread
+///   scheduling, and intentionally accepted as NEAR-IDENTICAL in regression
+///   (~30 bytes per HD 16bpc frame).
+///
+/// This means the parallel path is **technically a data race under Rust's
+/// aliasing rules**, just as the C++ `std::thread` version was. The race is
+/// benign in the sense that: no pointer dereference is ever out of bounds; no
+/// object is partially written (writes are whole-pixel `*mut P = value`); and
+/// both strands converge on the same final pixel contents for non-boundary
+/// rows. A future revision that adds a proper halo pass (SEAM_HALO > 0) or
+/// moves to a tile-based model will replace this `unsafe impl Sync`.
+///
+/// Using this wrapper instead of raw `usize`-cast pointers makes the contract
+/// explicit; if someone later changes a worker to write into `in_ptr` or lets
+/// strips grow unbounded, they have to touch this type and see the comment.
+#[derive(Copy, Clone)]
+struct SharedBuf<P> {
+    in_ptr:  *mut P,
+    out_ptr: *mut P,
+}
+// SAFETY: see the doc comment above. The contract is enforced by design, not
+// by the compiler.
+unsafe impl<P> Send for SharedBuf<P> {}
+unsafe impl<P> Sync for SharedBuf<P> {}
+
 #[inline]
 unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs) {
-    // Snapshot all plain-value fields so the parallel closure does not capture
-    // the !Sync raw pointers in RowRangeArgs directly.
+    // Snapshot plain-value fields and wrap the raw pointers in SharedBuf so the
+    // parallel closure stays Send + Sync with the contract made explicit.
     let j_start       = a.j_start;
     let j_end         = a.j_end;
     let i_start       = a.i_start;
@@ -104,12 +143,14 @@ unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs) {
     let rowbytes      = a.rowbytes;
     let range         = a.range;
     let line_weight   = a.line_weight;
-    let in_addr       = a.in_ptr  as usize;
-    let out_addr      = a.out_ptr as usize;
+    let buf: SharedBuf<P> = SharedBuf {
+        in_ptr:  a.in_ptr  as *mut P,
+        out_ptr: a.out_ptr as *mut P,
+    };
 
-    let build_info = |in_addr: usize, out_addr: usize| BlendingInfo::<P> {
-        in_ptr:        in_addr  as *mut P,
-        out_ptr:       out_addr as *mut P,
+    let build_info = |buf: SharedBuf<P>| BlendingInfo::<P> {
+        in_ptr:  buf.in_ptr,
+        out_ptr: buf.out_ptr,
         width, logical_width, height, rowbytes,
         i: 0, j: 0,
         in_target: 0, out_target: 0,
@@ -125,7 +166,7 @@ unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs) {
 
     // Phase 1 compatible thresholds: small images / single-core → serial.
     if nthreads <= 1 || rows < 32 {
-        let tmpl = build_info(in_addr, out_addr);
+        let tmpl = build_info(buf);
         process_row_range(&tmpl, j_start, j_end, i_start, i_end);
         return;
     }
@@ -137,18 +178,8 @@ unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs) {
         let start = j_start + t * rows_per_thread;
         let end   = (start + rows_per_thread).min(j_end);
         if start >= end { return; }
-        let tmpl = BlendingInfo::<P> {
-            in_ptr:        in_addr  as *mut P,
-            out_ptr:       out_addr as *mut P,
-            width, logical_width, height, rowbytes,
-            i: 0, j: 0,
-            in_target: 0, out_target: 0,
-            core: [Cinfo::default(); 4],
-            flag: 0,
-            range,
-            mode: 0,
-            line_weight,
-        };
+        let tmpl = build_info(buf);
+        // SAFETY: see SharedBuf doc comment for the concurrent-write contract.
         unsafe { process_row_range(&tmpl, start, end, i_start, i_end); }
     });
 }
