@@ -20,6 +20,7 @@
 #include "Lack.h"
 
 #include "Effect.h"
+#include "bench.h"
 
 //---------------------------------------------------------------------------//
 // 定義
@@ -466,7 +467,8 @@ static PF_Err smoothing(PF_InData   *in_data,
 
 	PF_Rect extent_hint;
     BEGIN_PROFILE();
-	
+    SMOOTH_BENCH_TIMER_BEGIN();
+
 
 	// 白抜き & 領域情報取得
 	preProcess<PixelType>(	in_ptr,
@@ -875,6 +877,17 @@ static PF_Err smoothing(PF_InData   *in_data,
 
 
     END_PROFILE();
+
+    SMOOTH_BENCH_CAPTURE(
+        GET_WIDTH(input),
+        GET_HEIGHT(input),
+        (int)(sizeof(PixelType) * 8 / 4),           // bpc: Pixel8 -> 8, Pixel16 -> 16 (div by 4 channels)
+        input->rowbytes,
+        in_ptr,
+        out_ptr,
+        (uint32_t)((unsigned int)(params[PARAM_RANGE]->u.fs_d.value * (getMaxValue<PixelType>() * 4)) / 100),
+        (float)(params[PARAM_LINE_WEIGHT]->u.fs_d.value / 2.0 + 0.5),
+        params[PARAM_WHITE_OPTION]->u.bd.value ? 1 : 0);
 
 	return err;
 }

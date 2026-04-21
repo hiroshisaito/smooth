@@ -6,3 +6,5 @@
 /Mac/DerivedData/
 /Mac/release/
 /.claude/
+/tests/.venv/
+/tests/goldens/

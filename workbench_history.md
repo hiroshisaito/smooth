@@ -47,6 +47,46 @@
 
 **次アクション**: Step 2 でテスト素材(AE コンポ)と計測点を決め、現行バイナリで HD/4K の処理時間を計測、出力ピクセルをゴールデンとして保存する方式を検討する。
 
+### 2026-04-21 13:33 JST — Step 1 完了
+
+**コミット**: `6403e66 smooth-mod-v1.5.0: Phase 1 kickoff`
+
+- `.gitignore`, `Effect.cpp`, `version.h`, `workbench_history.md` を一括コミット
+- 4 files changed, 84 insertions(+), 2 deletions(-)
+
+**状態**: Step 1 クローズ。Step 2 に着手可能。
+
+### 2026-04-21 13:40 JST — Step 2 ベンチ基盤実装
+
+**実施**:
+- [bench.h](bench.h) 新設 — ヘッダオンリーで計測 / ピクセルダンプ
+  - `std::chrono::steady_clock` で Render 全体 ms 計測
+  - 入出力を `/tmp/smooth_bench/frame_NNNN_{in,out}.raw` に SMDP 形式で保存
+  - `timing.log` 追記 + stderr ログ
+  - `#ifdef SMOOTH_BENCH` でガード、通常ビルドはゼロコスト
+- [Effect.cpp](Effect.cpp) の `smoothing<PixelType>()` 先頭/末尾に `SMOOTH_BENCH_TIMER_BEGIN` / `SMOOTH_BENCH_CAPTURE` 挿入
+  - bpc は `sizeof(PixelType) * 8 / 4`(Pixel8→8, Pixel16→16)で算出
+- [tests/gen_test_images.py](tests/gen_test_images.py) — Pillow で 5 種の pixel-art fixture + HD/4K tiled 画像を生成
+  - `pip install --user` は PEP 668 に阻まれたので `tests/.venv/` で pillow
+- [tests/compare_raw.py](tests/compare_raw.py) — SMDP raw 同士のバイト diff
+- [tests/README.md](tests/README.md) — baseline capture 手順
+- [.gitignore](.gitignore) に `/tests/.venv/`, `/tests/goldens/` 追加
+
+**ビルド確認**:
+
+| ビルド | フラグ | 結果 |
+| --- | --- | --- |
+| 通常 | (なし) | BUILD SUCCEEDED |
+| Bench | `GCC_PREPROCESSOR_DEFINITIONS='SMOOTH_BENCH=1 $(inherited)'` | BUILD SUCCEEDED |
+
+Bench 版バイナリ: `Mac/build/bench/smooth.plugin` (arm64, 115,696 bytes)
+
+**試行・失敗**:
+- `pip install --user pillow` → PEP 668 で拒否。`python3 -m venv tests/.venv` で回避(解決済み)。
+
+**次アクション**: ユーザーに bench プラグインを AE2025 に配置してテストコンポを走らせてもらい、`/tmp/smooth_bench/` に dump を出力してもらう。
+出力が揃ったら `tests/goldens/v1.4.0-ae2025/` にコピー → Step 3 のリファクタ回帰比較用として固定。
+
 ## 試行・失敗ログ
 
 (空 — 発生次第追記)
