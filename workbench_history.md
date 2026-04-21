@@ -83,13 +83,84 @@ Bench 版バイナリ: `Mac/build/bench/smooth.plugin` (arm64, 115,696 bytes)
 
 **試行・失敗**:
 - `pip install --user pillow` → PEP 668 で拒否。`python3 -m venv tests/.venv` で回避(解決済み)。
+- 初回の README に書いた `open -a "Adobe After Effects 2025"` は stderr を捕まえられない。直接 Mach-O 起動に訂正。また AE 2025 の Mach-O バイナリ名は `After Effects`(`.app` 名とは別名)だったので `"/Applications/.../After Effects"` に修正。
 
 **次アクション**: ユーザーに bench プラグインを AE2025 に配置してテストコンポを走らせてもらい、`/tmp/smooth_bench/` に dump を出力してもらう。
 出力が揃ったら `tests/goldens/v1.4.0-ae2025/` にコピー → Step 3 のリファクタ回帰比較用として固定。
 
 ## 試行・失敗ログ
 
-(空 — 発生次第追記)
+### 2026-04-21 18:49 JST — "Couldn't find main entry point for smooth.plugin"
+
+**症状**: ユーザーが AE 2025 で smooth エフェクトを適用しようとしたところ、`Up_DlgShowC16` で上記エラー。AE のエフェクトメニューには表示されていた(= PiPL スキャン自体は通過)が、適用時のシンボル解決で失敗。
+
+**原因**: [Pipl.r](Pipl.r) に arm64 のエントリポイント宣言 (`CodeMacARM64`) が無かった。旧 PiPL は `CodeMachOPowerPC` / `CodeMacIntel32` / `CodeMacIntel64` のみ。arm64 バイナリで動かす場合は `CodeMacARM64 {"EntryPointFunc"}` を足さないと AE が arm64 用シンボルを見つけられない。
+
+**対処**:
+- [Pipl.r](Pipl.r) に `CodeMacARM64 {"EntryPointFunc"}` を追加
+- bench ビルドを clean build で作り直し、`smooth.rsrc` に `ma64` チャンクが入ったことを `DeRez` で確認(以前は `mach`/`mi32`/`mi64` のみ→`mach`/`mi32`/`mi64`/`ma64` に)
+
+**教訓**: 1.4.0 リリースバイナリ(ユニバーサル)も同じ問題を抱えていたはず。AE の arm64 適用未検証でリリースしていた。→ v1.5.0 の正式リリース前に 1.4.0 リリースも arm64 で再検証すべき(Step 6 で対応)。
+
+### 2026-04-21 19:10 JST — (続き) 本当の原因は x86_64/arm64 の取り違え
+
+**追加症状**: Pipl.r に `CodeMacARM64` を追加した後、再インストール+再起動しても **同じ** "Couldn't find main entry point" エラー。バイナリ側は `nm -g` で `_EntryPointFunc` の T 表記、`dyld_info -exports` でも露出済み、rsrc も `ma64` チャンク追加済み。ここまで検査して原因がわからず、最小 dlopen/dlsym テスト(`/tmp/dltest`)を自作。
+
+**決定的な発見**: `clang -arch arm64` でビルドした dltest を実行したら `/bin/bash: ... Bad CPU type in executable`。`uname -m` すると **`x86_64`**。CPU は Intel Core i9-9880H。つまりこの MacBook Pro は Intel 機で、arm64-only バイナリは dyld がそもそもロードできない。AE の "entry point not found" はその二次的な症状だった。
+
+**対処**:
+- bench ビルドを `ARCHS="x86_64 arm64"` でユニバーサル化して再ビルド
+- `lipo -info` で x86_64 + arm64 両アーキ確認
+- `clang -arch x86_64 dltest.c` でビルドした dltest から `dlsym("EntryPointFunc")` が成功することを確認
+
+**教訓の更新**: 開発マシンの `uname -m` / CPU 確認を **最初のステップ** にすべき。arm64 指定 build は開発者本人が Apple Silicon でない限り AE で動作確認すらできない。今後はデフォルトでユニバーサル、必要なときだけ片側ビルドにする。
+
+**CodeMacARM64 追加自体は有効**(Apple Silicon 機で配布するなら必須)。ただし今回のエラーの直接原因ではなかった。
+
+### 2026-04-21 19:50 JST — baseline 取得成功、ただし容量暴発
+
+**取得内容**:
+- 1768 フレーム分の dump を `/tmp/smooth_bench/` に生成
+  - 8bpc 64×64 fixtures(~135 フレーム)
+  - 8bpc 2512×1412(1 フレーム、15 ms)
+  - **16bpc 1920×1080(大多数、平均 ~25 ms)** ← Phase 1 の主計測対象
+- parameter バリエーション豊富(range 0〜10867、lw 0.5〜0.9、white 0/1)
+
+**問題**: 16bpc HD が 1 枚あたり ~31MB、全体で **111GB**。さらに `cp /tmp/smooth_bench/*.raw goldens/` が(当初は hang と誤解したが)実際はバックグラウンドで走り切り、goldens/ にも 111GB 複製されて合計 **222GB** 消費。ディスク空き 140GB まで逼迫。
+
+**対処**:
+- 代表 14 frame × in/out + timing.log = **29 files / 502MB** だけ goldens に残すサブセットに縮小
+- `/tmp/smooth_bench` を sudo rm で解放
+- 空き: 140GB → **361GB** に回復
+
+**保存された goldens**(frame number / 用途):
+- 0000, 0010(8bpc 64×64 基本)
+- 0047(white_option=1 のケース)
+- 0050, 0100(8bpc 64×64 パラメータ変化)
+- 0135(8bpc 2512×1412 大サイズ)
+- 0200, 0500, 0700, 1000, 1300, 1500, 1700, 1767(16bpc 1920×1080 HD、パラメータ animation)
+
+**試行・失敗ログ**:
+- ゴールデン全量保存しようとして 222GB 無駄コピー発生
+- `cp /tmp/smooth_bench/*.raw ...` を hang と誤認して Ctrl+C を連発。実は巨大ファイルを真面目にコピーしていただけ。一度は完走してしまっていた
+- 手順案の矛盾(① で対象削除してから ② で参照)をユーザー指摘で発覚、やり直し
+- 改行入り複数行コマンドはターミナル貼り付けで事故が起きやすい → 以降は 1 行化ルール
+
+**意思決定**: 以降、コマンドは **1 行・改行なし**、可能な限り Claude 側の Bash ツールで実行してユーザーのコピペ負担を減らす。複数案の提示を避け、1 案だけ出す。
+
+### 2026-04-21 19:55 JST — Step 2 クローズ
+
+**最終状態**:
+
+| 計測ケース | 1.4.0-ae2025 実測 | サンプル数 | 備考 |
+| --- | --- | --- | --- |
+| 64×64 8bpc | ~0.045〜0.748 ms | 多数 | ノイズ支配、回帰検出用 |
+| 2512×1412 8bpc | 15.011 ms | 1 | 中サイズ参考値 |
+| 1920×1080 **16bpc** | **~25 ms** | 多数 | Phase 1 高速化目標値 |
+
+**Phase 1 目標**: 1920×1080 16bpc を **25ms → 8〜5ms** に(並列化 + SIMD で 3〜5× を狙う)。
+
+**Step 3(コア抽出)に着手可能**な状態に到達。
 
 ## 意思決定ログ
 
