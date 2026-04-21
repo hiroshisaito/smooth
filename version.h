@@ -18,7 +18,7 @@
 #define HP                  "https://github.com/loilo-inc/smooth"
 
 #define MAJOR_VERSION       (1)
-#define MINOR_VERSION       (4)
+#define MINOR_VERSION       (5)
 #define BUILD_VERSION       (0)
 
 

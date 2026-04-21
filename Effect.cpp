@@ -404,7 +404,7 @@ static PF_Err ParamsSetup(  PF_InData       *in_data,
 
     def.param_type = PF_Param_CHECKBOX;
     def.flags = PF_ParamFlag_START_COLLAPSED;
-    PF_STRCPY(def.name, "white option");
+    PF_STRCPY(def.PF_DEF_NAME, "white option");
     def.u.bd.value = def.u.bd.dephault = FALSE;
     def.u.bd.u.nameptr = "transparent"; /* this is strictly a pointer; don't STRCPY into it! */
     
