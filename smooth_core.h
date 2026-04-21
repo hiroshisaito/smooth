@@ -25,6 +25,7 @@
 #include "downMode.h"
 #include "Lack.h"
 #include "8link.h"
+#include "smooth_core_ffi.h"
 
 #ifndef SMOOTH_PARALLEL
 #define SMOOTH_PARALLEL 1
@@ -38,71 +39,27 @@ struct Params {
     bool         white_option; // 白抜き実施
 };
 
-// 白/透明ピクセル生成(旧 Effect.cpp の static inline を移設)
-inline void getWhitePixel(PF_Pixel16* white)  { PF_Pixel16 c = {0x8000, 0x8000, 0x8000, 0x8000}; *white = c; }
-inline void getWhitePixel(PF_Pixel8*  white)  { PF_Pixel8  c = {0xFF, 0xFF, 0xFF, 0xFF};         *white = c; }
-inline void getNullPixel (PF_Pixel16* null_p) { PF_Pixel16 c = {0, 0, 0, 0};                     *null_p = c; }
-inline void getNullPixel (PF_Pixel8*  null_p) { PF_Pixel8  c = {0, 0, 0, 0};                     *null_p = c; }
-
-// 白抜きと境界検出。in_ptr は in-place 書き換え(白色ピクセルを null pixel に)。
-// rect の top/left/right/bottom は出力される領域(half-open ではない、end は含む側を +1 した値)。
+// Phase 2-C Step 2: preProcess は Rust FFI に委譲。
+// 8bpc (sizeof==4) → smooth_core_preprocess_u8、16bpc (sizeof==8) → _u16。
 template <typename PixelType>
 inline void preProcess(PixelType* in_ptr, int rowbytes, int height,
                        int* out_top, int* out_left, int* out_right, int* out_bottom,
                        bool is_white_trans) {
-    PixelType key;
-    PixelType null_pixel;
-    smooth_core::getWhitePixel(&key);
-    smooth_core::getNullPixel(&null_pixel);
-
-    const int width = (int)(rowbytes / sizeof(PixelType));
-
-    int  top = 0, left = width, right = 0, bottom = 0;
-    bool top_found = false, left_found = false;
-
-    if (is_white_trans) {
-        int t = 0;
-        for (int j = 0; j < height; j++) {
-            if (!top_found) top = j;
-            for (int i = 0; i < width; i++) {
-                if (key.red == in_ptr[t].red &&
-                    key.green == in_ptr[t].green &&
-                    key.blue == in_ptr[t].blue) {
-                    in_ptr[t] = null_pixel;
-                } else if (in_ptr[t].alpha == 0) {
-                    // already transparent
-                } else {
-                    top_found = true;
-                    left_found = true;
-                    if (left > i) left = i;
-                    if (right < i) right = i;
-                    if (bottom < j) bottom = j;
-                }
-                t++;
-            }
-        }
+    smooth_bbox_t bbox = {0, 0, 0, 0};
+    if constexpr (sizeof(PixelType) == 4) {
+        smooth_core_preprocess_u8(reinterpret_cast<void*>(in_ptr),
+                                  rowbytes, height,
+                                  is_white_trans ? 1 : 0, &bbox);
     } else {
-        int t = 0;
-        for (int j = 0; j < height; j++) {
-            if (!top_found) top = j;
-            for (int i = 0; i < width; i++) {
-                if (!(key.red == in_ptr[t].red && key.green == in_ptr[t].green && key.blue == in_ptr[t].blue) &&
-                    in_ptr[t].alpha != 0) {
-                    top_found = true;
-                    left_found = true;
-                    if (left > i) left = i;
-                    if (right < i) right = i;
-                    if (bottom < j) bottom = j;
-                }
-                t++;
-            }
-        }
+        static_assert(sizeof(PixelType) == 8, "preProcess only supports 8bpc (4B) or 16bpc (8B) pixels");
+        smooth_core_preprocess_u16(reinterpret_cast<void*>(in_ptr),
+                                   rowbytes, height,
+                                   is_white_trans ? 1 : 0, &bbox);
     }
-
-    *out_top    = top_found  ? top  : 0;
-    *out_left   = left_found ? left : 0;
-    *out_right  = right + 1;
-    *out_bottom = bottom + 1;
+    *out_top    = bbox.top;
+    *out_left   = bbox.left;
+    *out_right  = bbox.right;
+    *out_bottom = bbox.bottom;
 }
 
 // 行範囲 [j_start, j_end) をスキャン+ブレンドする。

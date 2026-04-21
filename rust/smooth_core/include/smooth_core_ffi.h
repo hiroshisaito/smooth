@@ -10,9 +10,31 @@ extern "C" {
 
 #include <stdint.h>
 
-/* Linkage probe. Returns 0x0002_0000 in Step 1.
+/* Linkage probe.
  * Upper 16 bits = major version (2), lower 16 bits = FFI revision. */
 uint32_t smooth_core_version(void);
+
+/* Step 2: preProcess.
+ * bbox semantics (match legacy C++ smooth_core::preProcess):
+ *   top    = first row index that contains a non-white, non-zero-alpha pixel, else 0
+ *   left   = minimum column index of such a pixel across all rows, else 0
+ *   right  = (maximum column index) + 1, or 1 if none found
+ *   bottom = (maximum row index of such a pixel) + 1, or 1 if none found
+ *
+ * When is_white_trans is non-zero, pixels whose RGB (alpha ignored) matches the
+ * "white key" (0xFF for u8, 0x8000 for u16) are overwritten with the null pixel
+ * (all channels zero), in place. */
+typedef struct {
+    int32_t top;
+    int32_t left;
+    int32_t right;
+    int32_t bottom;
+} smooth_bbox_t;
+
+void smooth_core_preprocess_u8 (void *in_ptr, int32_t rowbytes, int32_t height,
+                                int32_t is_white_trans, smooth_bbox_t *bbox_out);
+void smooth_core_preprocess_u16(void *in_ptr, int32_t rowbytes, int32_t height,
+                                int32_t is_white_trans, smooth_bbox_t *bbox_out);
 
 #ifdef __cplusplus
 }

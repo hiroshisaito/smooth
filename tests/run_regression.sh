@@ -9,12 +9,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SDK="$ROOT/references/AfterEffectsSDK_25.6_61_win/ae25.6_61.64bit.AfterEffectsSDK"
 GOLDENS="$ROOT/tests/goldens/v1.4.0-ae2025"
 BIN="$ROOT/tests/regression_test"
+RUST_CRATE="$ROOT/rust/smooth_core"
+RUST_LIB="$RUST_CRATE/target/universal/release/libsmooth_core.a"
+
+echo "==> build Rust smooth_core (universal)"
+"$RUST_CRATE/build-universal.sh" >/dev/null || { echo "cargo build failed"; exit 1; }
 
 echo "==> build regression harness"
 clang++ -std=c++17 -O2 \
     -I"$SDK/Examples/Headers" \
     -I"$SDK/Examples/Headers/SP" \
     -I"$SDK/Examples/Util" \
+    -I"$RUST_CRATE/include" \
     -I"$ROOT" \
     "$ROOT/tests/regression_test.cpp" \
     "$ROOT/util.cpp" \
@@ -22,6 +28,7 @@ clang++ -std=c++17 -O2 \
     "$ROOT/downMode.cpp" \
     "$ROOT/Lack.cpp" \
     "$ROOT/8link.cpp" \
+    "$RUST_LIB" \
     -o "$BIN" || { echo "build failed"; exit 1; }
 
 pass=0

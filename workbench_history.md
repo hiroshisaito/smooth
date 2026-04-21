@@ -541,3 +541,42 @@ msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
 **`.gitignore` 更新**: `/rust/smooth_core/target/`, `/rust/smooth_core/Cargo.lock` 追加
 
 **次 (Step 2)**: `smooth_core::preProcess<T>` を Rust 側で再実装し、C++ から呼んで回帰テストを通す。
+
+### 2026-04-22 00:30 JST — Step 2 (preProcess Rust 移植)
+
+**目的**: Phase 2-C の最初の機能移植。旧 [smooth_core.h](smooth_core.h) の `preProcess<PixelType>`(白抜き + bbox 検出)を Rust に再実装し、C++ 側は FFI 呼び出しの薄皮にする。
+
+**Rust 側**:
+- `rust/smooth_core/src/preprocess.rs` 新設 — `Pixel8` / `Pixel16` (`#[repr(C)]`, alpha-first レイアウトで PF_Pixel / PF_Pixel16 と一致) / `SmoothBbox` / `SmoothPixel` trait / `pre_process<P>()`
+- 白キー: 8bpc = `0xFF×3`、16bpc = `0x8000×3`。**alpha は比較対象外**、RGB のみで判定(旧 C++ と同じ)
+- unit tests 3 件: `all_transparent_returns_origin_bbox` / `white_gets_replaced_when_enabled` / `white_kept_when_disabled_bbox_spans_non_white` すべて pass
+- `rust/smooth_core/src/lib.rs` に `smooth_core_preprocess_u8` / `_u16` を追加、`smooth_core_version` は `0x0002_0001` に bump
+- `rust/smooth_core/include/smooth_core_ffi.h` に `smooth_bbox_t` と 2 関数宣言追加
+
+**C++ 側**:
+- [smooth_core.h](smooth_core.h): `preProcess<PixelType>` の内部を `if constexpr (sizeof == 4 / == 8)` で u8 / u16 FFI にディスパッチ。呼び出し側(`process<T>`)は**無変更**
+- `getWhitePixel` / `getNullPixel` は smooth_core 名前空間から削除(Rust 側に集約)
+- `#include "smooth_core_ffi.h"` を smooth_core.h に追加
+
+**AE SDK 型レイアウト確認**: `AE_Effect.h` L1360-1374 で `PF_Pixel = { alpha, red, green, blue }` (u8)、`PF_Pixel16 = { alpha, red, green, blue }` (u16) を確認。Rust 側の `#[repr(C)]` 構造体と同一レイアウト。
+
+**回帰テスト** (`tests/run_regression.sh` に Rust lib ビルド + `-I rust/smooth_core/include` + `libsmooth_core.a` リンクを追加):
+
+| # | frame | w×h | bpc | 結果 |
+| --- | --- | --- | --- | --- |
+| 1-5 | 0, 10, 47, 50, 100 | 64×64 | 8 | IDENTICAL |
+| 6 | 135 | 2512×1412 | 8 | NEAR-ID 30/14187776 (0.0002%, max_abs=23)※ |
+| 7 | 200 | 3840×2160 | 8 | IDENTICAL |
+| 8-10 | 500, 700, — | 3840×2160 | 16 | IDENTICAL |
+| 11-14 | 1000, 1300, 1500, 1700, 1767 | 1920×1080 | 16 | IDENTICAL |
+
+※ Phase 1 Step 4 以来の既知の境界残差(SEAM_HALO=0 による並列 strip 境界。preProcess ではなく process_row_range の挙動に起因)。Step 2 で新たな差分は生じていない。
+
+**ビルド検証**:
+- Rust 単体: `cargo test --release` → 3 passed / 0 failed
+- Mac universal: `xcodebuild clean build` → BUILD SUCCEEDED (250 KB bundle)
+- Symbol check: `nm smooth` で `_smooth_core_version` / `_smooth_core_preprocess_u8` / `_smooth_core_preprocess_u16` 3 つ確認
+
+**Step 2 完了判定**: preProcess の 100% Rust 化、回帰差分ゼロ(Phase 1 と同等)。
+
+**次 (Step 3)**: ヘルパー関数群(downMode / upMode / Lack / 8link)の移植。`process_row_range` の `*.CountLength` / `*.Blending` / `LackMode*Execute` / `Link8*Execute` が対象。C++ 側 `BlendingInfo<T>` に対応する Rust 構造体の設計から。
