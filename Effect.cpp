@@ -23,6 +23,7 @@
 #include "Effect.h"
 #include "bench.h"
 #include "smooth_core.h"
+#include "smooth_core_ffi.h"
 
 //---------------------------------------------------------------------------//
 // 定義
@@ -343,13 +344,16 @@ static PF_Err About (   PF_InData       *in_data,
     char str[256];
     memset( str, 0, 256 );
 
-    sprintf(    out_data->return_msg, 
-                 "%s, v%d.%d.%d %s\n%s\n",
-                NAME, 
-                MAJOR_VERSION, 
+    const uint32_t rust_ffi = smooth_core_version();
+
+    sprintf(    out_data->return_msg,
+                 "%s, v%d.%d.%d %s\nrust_core ffi=0x%08x\n%s\n",
+                NAME,
+                MAJOR_VERSION,
                 MINOR_VERSION,
                 BUILD_VERSION,
                 stage_str,
+                rust_ffi,
                 str );
 
     return PF_Err_NONE;

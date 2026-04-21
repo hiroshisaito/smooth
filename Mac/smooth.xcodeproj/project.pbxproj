@@ -95,6 +95,7 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = C4E618CE095A3CE90012CA3F /* Build configuration list for PBXNativeTarget "smooth" */;
 			buildPhases = (
+				A0C0CA7B11111111A0C01111 /* Run Cargo Build */,
 				C4E618C8095A3CE80012CA3F /* Resources */,
 				C4E618C9095A3CE80012CA3F /* Sources */,
 				C4E618CA095A3CE80012CA3F /* Frameworks */,
@@ -143,6 +144,28 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A0C0CA7B11111111A0C01111 /* Run Cargo Build */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Run Cargo Build";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/bash;
+			shellScript = "set -e\nexport PATH=\"$HOME/.cargo/bin:$PATH\"\ncd \"$SRCROOT/../rust/smooth_core\"\n./build-universal.sh\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXRezBuildPhase section */
 		C4E618EA095A3E040012CA3F /* Rez */ = {
@@ -219,6 +242,11 @@
 					"$(SRCROOT)/../references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Util",
 					"$(SRCROOT)/../references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Headers/SP",
 					"$(SRCROOT)/../references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Resources",
+					"$(SRCROOT)/../rust/smooth_core/include",
+				);
+				OTHER_LDFLAGS = (
+					"-L$(SRCROOT)/../rust/smooth_core/target/universal/release",
+					"-lsmooth_core",
 				);
 				ONLY_ACTIVE_ARCH = YES;
 				REZ_PREPROCESSOR_DEFINITIONS = __MACH__;
@@ -291,6 +319,11 @@
 					"$(SRCROOT)/../references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Util",
 					"$(SRCROOT)/../references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Headers/SP",
 					"$(SRCROOT)/../references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Resources",
+					"$(SRCROOT)/../rust/smooth_core/include",
+				);
+				OTHER_LDFLAGS = (
+					"-L$(SRCROOT)/../rust/smooth_core/target/universal/release",
+					"-lsmooth_core",
 				);
 				ONLY_ACTIVE_ARCH = YES;
 				REZ_PREPROCESSOR_DEFINITIONS = __MACH__;

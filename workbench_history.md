@@ -469,3 +469,42 @@ msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
 
 **Phase 2-D クローズ**。Mac/Windows 両方の 1.5.0 バイナリが揃った。
 タグ運用の方針(v1.5.0 再発行 or v1.5.0-win 追加)はユーザー決定待ち。
+
+---
+
+## Phase 2-C: Rust core 移植
+
+### 2026-04-21 23:00 JST — ビルド系後処理 (Mac Xcode HEADER_SEARCH_PATHS)
+
+**問題**: Windows 側コミットで [Effect.cpp](Effect.cpp) に `#include "AEConfig.h"` 追加 → Mac で `fatal error: 'AEConfig.h' file not found`。`Mac/smooth.xcodeproj` の `HEADER_SEARCH_PATHS` が `$(SRCROOT)/../../sdk/Examples/...`(repo 外の `/Users/<user>/Documents/GitHub/sdk`)を指しており、Phase 1 ビルド時はアドホックなシンボリックリンクで解決していたと推定。
+
+**対処**: Release/Debug 両構成の `HEADER_SEARCH_PATHS` を `$(SRCROOT)/../references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/{Headers,Util,Headers/SP,Resources}` に変更。シンボリックリンクなしで universal build 成功(commit `c373ccc`)。
+
+### 2026-04-21 23:30 JST — Step 1 着手 (Rust crate scaffold + FFI)
+
+**目的**: Phase 2-C の土台を整備。Rust 側で 1 シンボル(`smooth_core_version`)を exposé し、Mac plugin が Rust static lib をリンクできることを確認。
+
+**ブランチ**: `feature/smooth-mod-phase2-C-rust`(master から派生)
+
+**作成物**:
+- `rust/smooth_core/Cargo.toml` — staticlib、release は `opt-level=3` / `lto=true` / `codegen-units=1` / `panic=abort`
+- `rust/smooth_core/rust-toolchain.toml` — stable、x86_64-apple-darwin + aarch64-apple-darwin 指定
+- `rust/smooth_core/src/lib.rs` — `smooth_core_version() -> u32` のみ
+- `rust/smooth_core/include/smooth_core_ffi.h` — C ABI ヘッダ(手書き、後日 cbindgen 検討)
+- `rust/smooth_core/build-universal.sh` — x86_64 + arm64 をそれぞれ cargo build → `lipo -create` で universal `.a` 生成
+
+**Xcode 統合**:
+- `Mac/smooth.xcodeproj/project.pbxproj` に `PBXShellScriptBuildPhase` を新設(id `A0C0CA7B11111111A0C01111`、`name = "Run Cargo Build"`、`alwaysOutOfDate = 1`)
+- ターゲットの `buildPhases` 先頭に挿入(Resources の前)。スクリプトは `rust/smooth_core/build-universal.sh` を呼ぶだけ
+- Release/Debug 両構成に `OTHER_LDFLAGS = ("-L$(SRCROOT)/../rust/smooth_core/target/universal/release", "-lsmooth_core")`
+- `HEADER_SEARCH_PATHS` に `$(SRCROOT)/../rust/smooth_core/include` を追加
+
+**疎通確認**:
+- [Effect.cpp](Effect.cpp) の `About` に `smooth_core_version()` 呼び出しを追加 → return_msg に `rust_core ffi=0x00020000` を載せる
+- `xcodebuild clean build` 成功
+- 生成 binary: `Mac/build/Release/smooth.plugin/Contents/MacOS/smooth`(universal, 約 250 KB)
+- `nm` で `_smooth_core_version` シンボル確認済
+
+**`.gitignore` 更新**: `/rust/smooth_core/target/`, `/rust/smooth_core/Cargo.lock` 追加
+
+**次 (Step 2)**: `smooth_core::preProcess<T>` を Rust 側で再実装し、C++ から呼んで回帰テストを通す。
