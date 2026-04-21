@@ -32,11 +32,16 @@ struct Cinfo
 
 
 // 合成関数用の情報用構造体 //
+// (smooth-mod-v1.5.0 Step 3) AE SDK 型非依存化:
+//   PF_LayerDef* の代わりに raw 寸法を直接保持する。
 template <typename PixelType>
 struct BlendingInfo
 {
-    PF_LayerDef         *input, *output;    // 入出力画像
-	PixelType			*in_ptr, *out_ptr;	// 画像データへのポインタ
+    PixelType			*in_ptr, *out_ptr;	// 画像データへのポインタ
+    int                 width;              // 1 行あたりピクセル数 (rowbytes / sizeof(PixelType))
+    int                 logical_width;      // 画像の論理幅 (旧 PF_LayerDef::width)
+    int                 height;             // 画像の高さ
+    int                 rowbytes;           // 1 行あたりバイト数
     int                 i,j;                // 現在処理中の座標値
     long                in_target,          // 処理中の座標値の1次配列インデックス  (inputに対する)
                         out_target;         //                                      (outputに対する)

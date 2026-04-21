@@ -24,12 +24,11 @@
 template<typename PixelType>
 void upMode_LeftCountLength(BlendingInfo<PixelType> *info)
 {
-    PF_LayerDef *output         = info->output;
 
     long        count_target = 0;
     int         len = 1,
-                width           = GET_WIDTH(info->input),
-                height          = output->height;
+                width           = info->width,
+                height          = info->height;
     u_int       *flg            = &info->core[0].flg;
 
     while(1)
@@ -122,12 +121,11 @@ void upMode_LeftCountLength(BlendingInfo<PixelType> *info)
 template<typename PixelType>
 void upMode_RightCountLength(BlendingInfo<PixelType> *info)
 {
-    PF_LayerDef *output         = info->output;
 
     long        count_target = 0;
     int         len = 0,
-                width           = GET_WIDTH(info->input),
-                height          = output->height;
+                width           = info->width,
+                height          = info->height;
     u_int       *flg            = &info->core[1].flg;
 
     // 始めの1回は左の方だけ検査 //
@@ -240,12 +238,11 @@ void upMode_RightCountLength(BlendingInfo<PixelType> *info)
 template<typename PixelType>
 void upMode_TopCountLength( BlendingInfo<PixelType> *info)
 {
-    PF_LayerDef *output         = info->output;
 
     long        count_target = 0;
     int         len = 0,
-                width           = GET_WIDTH(info->input),
-                height          = output->height;
+                width           = info->width,
+                height          = info->height;
     u_int       *flg            = &info->core[2].flg;
 
     //----------------------------------------------------------//
@@ -368,12 +365,11 @@ void upMode_TopCountLength( BlendingInfo<PixelType> *info)
 template<typename PixelType>
 void upMode_BottomCountLength( BlendingInfo<PixelType> *info)
 {
-    PF_LayerDef *output         = info->output;
 
     long        count_target = 0;
     int         len = 1,
-                width           = GET_WIDTH(info->input),
-                height          = output->height;
+                width           = info->width,
+                height          = info->height;
     u_int       *flg            = &info->core[3].flg;
 
     //----------------------------------------------------------//
@@ -479,7 +475,7 @@ template<typename PixelType>
 void upMode_LeftBlending( BlendingInfo<PixelType>  *info)
 {
     long        t;
-    int         in_width    = GET_WIDTH(info->input);
+    int         in_width    = info->width;
     float       start       = info->core[0].start;
     float       end         = info->core[0].end;
 
@@ -561,7 +557,7 @@ void upMode_RightBlending(BlendingInfo<PixelType>  *info)
     long        length      = info->core[1].length;
     float       start       = info->core[1].start;
     float       end         = info->core[1].end;
-    int         in_width    = GET_WIDTH(info->input);
+    int         in_width    = info->width;
 
 #if 0
     else if(flg & CR_FLG_FILL)
@@ -634,8 +630,8 @@ void upMode_TopBlending( BlendingInfo<PixelType> *info)
     long        length      = info->core[2].length;
     float       start       = info->core[2].start;
     float       end         = info->core[2].end;
-    int         in_width    = GET_WIDTH(info->input);
-    int         out_width   = GET_WIDTH(info->output);
+    int         in_width    = info->width;
+    int         out_width   = info->width;
 
 
     // 通常Length の値は半分にしてつかうけど今回は単位が半ピクセル単位なので2倍、len*(1/2)*2=len
@@ -709,8 +705,8 @@ void upMode_BottomBlending( BlendingInfo<PixelType> *info)
     long        t;
     float       start       = info->core[3].start;
     float       end         = info->core[3].end;
-    int         in_width    = GET_WIDTH(info->input);
-    int         out_width   = GET_WIDTH(info->output);
+    int         in_width    = info->width;
+    int         out_width   = info->width;
 
 #if 0
     else if(flg & CR_FLG_FILL)

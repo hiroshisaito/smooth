@@ -20,9 +20,8 @@ void LackMode01Execute( BlendingInfo<PixelType> *info )
     long range;
 
 	PixelType	*in_ptr = info->in_ptr;
-    PF_LayerDef	*input  = info->input;
 
-    width   = GET_WIDTH( input );
+    width   = info->width;
     h       = info->core[0].length; // left
     v       = info->core[2].length; // top
     range   = info->range;
@@ -76,9 +75,8 @@ void LackMode02Execute( BlendingInfo<PixelType> *info )
     long         range;
 
 	PixelType	*in_ptr = info->in_ptr;
-    PF_LayerDef	*input  = info->input;
 
-    width   = GET_WIDTH( input );
+    width   = info->width;
     h       = info->core[0].length; // left
     v       = info->core[3].length; // bottom
     range   = info->range;
@@ -137,13 +135,12 @@ void LackMode0304Execute( BlendingInfo<PixelType> *info )
     long         range;
 
 	PixelType	*in_ptr = info->in_ptr;
-    PF_LayerDef	*input  = info->input;
     
     h = 1;
     v = 1;
     target  = info->in_target;
-    input   = info->input;
-    width   = GET_WIDTH( input );
+    
+    width   = info->width;
     range   = info->range;
 
 
@@ -159,7 +156,7 @@ void LackMode0304Execute( BlendingInfo<PixelType> *info )
         // 長さカウント
         //-------------------------------
         // →
-        for( i=info->i; i<input->width-1; i++, target++ )
+        for( i=info->i; i<info->logical_width-1; i++, target++ )
         {
             if( ComparePixel( target, target+1 ) ||
                 ComparePixel( target+width, target+width+1 ))
@@ -218,7 +215,7 @@ void LackMode0304Execute( BlendingInfo<PixelType> *info )
         // 長さカウント
         //-------------------------------
         // →
-        for( i=info->i; i<input->width-1; i++, target++ )
+        for( i=info->i; i<info->logical_width-1; i++, target++ )
         {
             if( ComparePixel( target, target+1 ) ||
                 ComparePixel( target-width, target-width+1 ))
@@ -231,7 +228,7 @@ void LackMode0304Execute( BlendingInfo<PixelType> *info )
         
         // ↓ 
         target  = info->in_target;
-        for( j=info->j; j<input->height-1; j++, target+=width )
+        for( j=info->j; j<info->height-1; j++, target+=width )
         {
             if( ComparePixel( target, target+width ) ||
                 ComparePixel( target-1, target-1 + width ))

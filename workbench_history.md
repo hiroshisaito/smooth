@@ -162,6 +162,48 @@ Bench 版バイナリ: `Mac/build/bench/smooth.plugin` (arm64, 115,696 bytes)
 
 **Step 3(コア抽出)に着手可能**な状態に到達。
 
+### 2026-04-21 20:30 JST — Step 3 完了
+
+**実施**:
+- [define.h](define.h): `BlendingInfo<T>` から `PF_LayerDef* input, output` を削除、`width / logical_width / height / rowbytes` を追加。
+- sed でメカニカル置換(6 ファイル): `GET_WIDTH(info->input)` → `info->width` など。
+- `PF_LayerDef*` ローカル宣言 `= info->input/output;` を削除。
+- [smooth_core.h](smooth_core.h) 新設: `smooth_core::Params` + `preProcess<T>` + `process<T>` に [Effect.cpp](Effect.cpp) の走査ループ本体を移設。AE SDK 型(`PF_InData` / `PF_ParamDef` / `PF_LayerDef` / `PF_Rect`)を core から排除。
+- `getWhitePixel` / `getNullPixel` を Effect.cpp から smooth_core 名前空間に移設。
+- `FAST_COMPARE_PIXEL` マクロが要求する `PackedPixelType` typedef を process<T> 内で `std::conditional` で自動導出。
+- [Effect.cpp](Effect.cpp) の `smoothing<T>()` を ~430 行 → ~15 行に縮小。PF_COPY + パラメータ変換 + `smooth_core::process()` 呼び出しだけに。
+
+**回帰テスト**: 新規 [tests/regression_test.cpp](tests/regression_test.cpp) + [tests/run_regression.sh](tests/run_regression.sh) を作成。
+- AE 非依存。SMDP raw を読み込み → `smooth_core::process()` 実行 → 期待出力と `memcmp`。
+- clang++ で直接ビルド(Xcode 不要)。util.cpp / upMode.cpp / downMode.cpp / Lack.cpp / 8link.cpp もリンク。
+
+**結果**:
+```
+PASS: 14  FAIL: 0
+frame=0   w=64   h=64   bpc=8  IDENTICAL
+frame=10  w=64   h=64   bpc=8  IDENTICAL
+frame=47  w=64   h=64   bpc=8  white=1 IDENTICAL
+frame=50  w=64   h=64   bpc=8  IDENTICAL
+frame=100 w=64   h=64   bpc=8  IDENTICAL
+frame=135 w=2512 h=1412 bpc=8  IDENTICAL
+frame=200 w=3840 h=2160 bpc=8  IDENTICAL
+frame=500 w=3840 h=2160 bpc=16 IDENTICAL
+frame=700 w=3840 h=2160 bpc=16 IDENTICAL
+frame=1000..1767 w=1920 h=1080 bpc=16 IDENTICAL
+```
+
+1.4.0-ae2025 と byte-identical を確認。core 抽出はロジック変更を一切伴わなかった。
+
+**試行・失敗**:
+- 初回ビルドで `PackedPixelType` 未定義エラー → `std::conditional` で自動導出に変更。
+- 回帰テストリンク時に upMode 等のテンプレートインスタンシエーションで unresolved → compile 対象に全 cpp を追加。
+- `getWhitePixel/getNullPixel` は Effect.cpp の static inline だったので smooth_core.h に移設。
+
+**意思決定**:
+- `smooth_core::process` は現状 inline template(ヘッダオンリー)。Step 4 で並列化する際に per-row 処理関数を独立させる際、必要なら .cpp 分離する。
+- Effect.cpp に残った走査ループ本体は `#if 0 ... #endif` ではなく物理削除で良いが、Step 4 着手時の参照用に一旦残している。
+- 回帰テストは `tests/goldens/v1.4.0-ae2025/` 14 frames に対し byte-identical 必須。以降の Step 4/5 でもこのテストを gate にする。
+
 ## 意思決定ログ
 
 ### 2026-04-21 — 記録は手動追記方式
