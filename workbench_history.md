@@ -27,6 +27,39 @@
 
 **各ステップの必須確認**: 入力→出力が 1.4.0 と完全一致(ゴールデン比較)を毎回走らせる。
 
+## Phase 2 スコープ
+
+| # | 項目 | ブランチ | 状態 |
+| --- | --- | --- | --- |
+| D | Windows ビルド対応(AE2025 x64) | `feature/smooth-mod-phase2` (merged) | **完了** (2026-04-21) |
+| C | Rust コア移植(smooth_core → Rust staticlib、FFI) | `feature/smooth-mod-phase2-C-rust` | 進行中 |
+| A | GPU 対応(Mac: Metal / Win: CUDA 等) | (未作成) | 未着手 |
+| B | 隣接ピクセル重み調整(機能追加) | (未作成) | 未着手・優先度低 |
+
+### Phase 2-C 内部ステップ
+
+| # | 内容 | 状態 |
+| --- | --- | --- |
+| 1 | Rust crate スキャフォールド + FFI スタブ + Xcode 統合 | **完了** (2026-04-21) |
+| 2 | `preProcess<T>` を Rust 移植 | 進行中 |
+| 3 | ヘルパー関数群(downMode / upMode / Lack / 8link)を Rust 移植 | 未着手 |
+| 4 | メインループ(`process_row_range`)を Rust 移植 + rayon 並列化 | 未着手 |
+| 5 | フル回帰テスト + ベンチ比較 | 未着手 |
+| 6 | Windows ビルド統合(別マシン作業) | 未着手 |
+
+### 横断 TODO / 未決事項
+
+- **SUPPORTS_THREADED_RENDERING (MFR) 対応**: `PF_OutFlag2_SUPPORTS_THREADED_RENDERING` フラグ追加は**Phase 2-A の中で判断**する方針(独立ステップにしない)。理由: GPU の per-thread リソース戦略(`MTLCommandQueue` 共有/分離)、VRAM 圧迫、fallback 制御と相互依存するため。Phase 2-A 着手時に Claude からリマインドする。
+  - AE ログで確認済の現状: `Non-thread-safe effects used: KOJI_SMOOTH`(= AE が単レイヤを直列化している状態。内部 row-block 並列は動いているので単フレーム内利得は維持)
+- **ユーザー主要懸念(Phase 2-A 設計時に扱う)**: 高解像度フッテージ(8K 32bpc)を GPU が一気に処理できるか / strip render 要否 / MFR 化したとき GPU が fallback しないか / VRAM 圧迫。
+- **タグ運用**: v1.5.0 は Phase 1 Mac 版で釘。Windows 対応後の再発行 or `v1.5.0-win` 追加は未決(Phase 2-D 完了時点)。
+- **Xcode 警告**:
+  - `MACOSX_DEPLOYMENT_TARGET = 10.11` → `10.13` 以上に上げる要請あり
+  - `ALWAYS_SEARCH_USER_PATHS = NO` への移行推奨
+  - `Build Carbon Resources` build phase の移行(Rez → Copy Bundle Resources)
+  - 優先度は低(ビルドは成功しているので警告のまま進行)
+- **cbindgen 導入検討**: Phase 2-C FFI ヘッダは現在手書き。Step 5 以降で cbindgen への切り替えを検討(FFI 関数が増えた段階で)。
+
 ## 進捗ログ
 
 ### 2026-04-21 13:30 JST — Step 1 着手
