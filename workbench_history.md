@@ -247,6 +247,44 @@ Phase 1 目標(25 ms → 5〜8 ms)達成。
 - 代替案として「halo=128 sequential 修復」による厳密同一は検討したが、シーム再処理の sequential コストが並列効果を打ち消し net-negative(HD 16bpc で 53ms)だったため却下。
 - 将来(Phase 2 GPU 化など)で改めて seam-free の厳密アルゴリズム(2-pass detect/apply 等)を検討する余地あり。
 
+### 2026-04-21 22:05 JST — Step 5 SIMD 試行と中止
+
+**事前プロファイル**(corner body を無効化した状態と比較):
+
+| ケース | corner body 無効 | 通常 | body コスト | scan コスト |
+| --- | --- | --- | --- | --- |
+| HD 16bpc | 3.4 ms | 7.0 ms | 3.6 ms | ~3.4 ms (48%) |
+| 4K 8bpc  | 15.1 ms | 22.4 ms | 7.3 ms | ~15 ms (67%) |
+| 4K 16bpc | 13.2 ms | 29.0 ms | 15.8 ms | ~13 ms (45%) |
+
+scan 側は preProcess (serial, 2M px 走査) + FAST_COMPARE_PIXEL ループ (parallel)。
+SIMD 化の対象は後者のみ。
+
+**実装**: `pre_scan_row_ne<T>()` を SSE2 / NEON で実装し、行単位で `uint8_t` の "隣接差分フラグ" を事前計算。inner loop の `FAST_COMPARE_PIXEL` を配列ルックアップに差し替え。
+- 8bpc (32bit/pixel): SSE2 `cmpeq_epi32` 4 並列、NEON `vceqq_u32` 4 並列
+- 16bpc (64bit/pixel): 32bit 比較 + shuffle で 64bit eq を合成、2 並列
+
+**計測結果**(repeat=30, PARALLEL+SIMD vs PARALLEL のみ):
+
+| ケース | PARALLEL (ms) | PARALLEL+SIMD (ms) | 差 |
+| --- | --- | --- | --- |
+| HD 16bpc | 7.0 | 7.2 | +0.2 ms(悪化) |
+| 4K 8bpc | 23.2 | 23.3 | ±0 |
+| 4K 16bpc | 31.8 | 29.1 | −2.7 ms |
+| 2512×1412 | 5.3 | 5.9 | +0.6 ms(悪化) |
+
+**判定**: 改善は 4K 16bpc のみで、HD (Phase 1 主ターゲット) では改悪。要因推定:
+1. `-O2` で clang が既に FAST_COMPARE_PIXEL を自動ベクトル化済み。明示 SIMD と差がない。
+2. pre-scan は行単位で `uint8_t` バッファを書き出すため、メモリ書き込みコスト(1 行 1920 bytes)が追加。
+3. inner loop が配列ルックアップになっても、既にキャッシュに in_ptr が乗っているため L1 帯域が足りる。
+
+**中止**: ユーザー方針("効果が薄い場合は深追いせず中止")に従い、Step 5 の SIMD 実装は巻き戻し(`git checkout smooth_core.h`)。Step 6 リリース仕上げに進む。
+
+**負の教訓の保存**:
+- auto-vectorization が効いている箇所を手書き SIMD で置換しても勝てない。既にフルベクトル化されている前提で見積もる必要あり。
+- FAST_COMPARE_PIXEL は 1 cycle の整数比較。SIMD で 4 並列しても、pre-scan の store コストで相殺される可能性がある。本当に SIMD が効くのは "1 位置あたり複数 cycle" の演算(例: ComparePixel の ABS diff 合計)。
+- 将来 SIMD を入れるなら ComparePixel (4-neighbor sum-of-abs-diff) の vectorization、または Blendingf の alpha composite が候補。
+
 ## 意思決定ログ
 
 ### 2026-04-21 — 記録は手動追記方式
