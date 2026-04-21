@@ -10,13 +10,10 @@
 #ifndef SMOOTH_CORE_H_
 #define SMOOTH_CORE_H_
 
-#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <cstddef>
-#include <thread>
 #include <type_traits>
-#include <vector>
 
 #include "define.h"
 #include "util.h"
@@ -57,7 +54,7 @@ inline void preProcess(PixelType* in_ptr, int rowbytes, int height,
 }
 
 // Phase 2-C Step 3: process_row_range は Rust 実装(FFI 1 本)。
-// Rust 側で FAST_COMPARE / ComparePixel / 角パターン処理 / ブレンドまで完結する。
+// Step 4: 並列化も Rust 側(rayon)に移設。SMOOTH_PARALLEL マクロが args.parallel に反映される。
 template <typename PixelType>
 inline void invoke_row_range_ffi(PixelType* in_ptr, PixelType* out_ptr,
                                  int width, int logical_width, int height, int rowbytes,
@@ -76,6 +73,7 @@ inline void invoke_row_range_ffi(PixelType* in_ptr, PixelType* out_ptr,
     args.j_end         = j_end;
     args.i_start       = i_start;
     args.i_end         = i_end;
+    args.parallel      = SMOOTH_PARALLEL ? 1 : 0;
 
     if constexpr (sizeof(PixelType) == 4) {
         smooth_core_process_row_range_u8(&args);
@@ -124,58 +122,12 @@ inline void process(PixelType* in_ptr, PixelType* out_ptr,
         return;  // 何も処理しない領域
     }
 
-#if SMOOTH_PARALLEL
-    // Phase 1 と同じ行ブロック並列化(SEAM_HALO=0)。境界修復は Step 4 で rayon に移設して再設計。
-    constexpr int SEAM_HALO = 0;
-
-    int nthreads = (int)std::thread::hardware_concurrency();
-    if (nthreads <= 0) nthreads = 1;
-
-    const int rows = eh_bottom - eh_top;
-    if (nthreads <= 1 || rows < 32) {
-        invoke_row_range_ffi<PixelType>(in_ptr, out_ptr,
-                                         in_width, logical_width, height, rowbytes,
-                                         p.range, p.line_weight,
-                                         eh_top, eh_bottom, eh_left, eh_right);
-        return;
-    }
-
-    const int rows_per_thread = (rows + nthreads - 1) / nthreads;
-    std::vector<std::thread> workers;
-    workers.reserve(nthreads);
-    std::vector<std::pair<int,int>> strips;
-    strips.reserve(nthreads);
-    for (int t = 0; t < nthreads; t++) {
-        const int start = eh_top + t * rows_per_thread;
-        const int end   = std::min(start + rows_per_thread, eh_bottom);
-        if (start >= end) break;
-        strips.emplace_back(start, end);
-        workers.emplace_back([=]() {
-            invoke_row_range_ffi<PixelType>(in_ptr, out_ptr,
-                                             in_width, logical_width, height, rowbytes,
-                                             p.range, p.line_weight,
-                                             start, end, eh_left, eh_right);
-        });
-    }
-    for (auto& w : workers) w.join();
-
-    for (size_t k = 1; k < strips.size(); k++) {
-        const int boundary = strips[k].first;
-        const int seam_start = std::max(eh_top,    boundary - SEAM_HALO);
-        const int seam_end   = std::min(eh_bottom, boundary + SEAM_HALO);
-        if (seam_start < seam_end) {
-            invoke_row_range_ffi<PixelType>(in_ptr, out_ptr,
-                                             in_width, logical_width, height, rowbytes,
-                                             p.range, p.line_weight,
-                                             seam_start, seam_end, eh_left, eh_right);
-        }
-    }
-#else
+    // 行ブロック並列化は Rust 側(rayon)で完結。C++ は FFI を 1 回呼ぶだけ。
+    // SMOOTH_PARALLEL マクロで切替(回帰テストが SMOOTH_PARALLEL=0 をシリアル比較に使う)。
     invoke_row_range_ffi<PixelType>(in_ptr, out_ptr,
                                      in_width, logical_width, height, rowbytes,
                                      p.range, p.line_weight,
                                      eh_top, eh_bottom, eh_left, eh_right);
-#endif
 }
 
 } // namespace smooth_core

@@ -97,10 +97,10 @@ impl SmoothPixel for Pixel8 {
 
     #[inline]
     fn delta_sum(&self, o: &Self) -> u32 {
-        abs_diff_u8(self.red, o.red) as u32
-            + abs_diff_u8(self.green, o.green) as u32
-            + abs_diff_u8(self.blue,  o.blue)  as u32
-            + abs_diff_u8(self.alpha, o.alpha) as u32
+        self.red.abs_diff(o.red)     as u32
+            + self.green.abs_diff(o.green) as u32
+            + self.blue.abs_diff(o.blue)   as u32
+            + self.alpha.abs_diff(o.alpha) as u32
     }
     #[inline] fn max_value() -> u32 { 0xFF }
 
@@ -128,10 +128,10 @@ impl SmoothPixel for Pixel16 {
 
     #[inline]
     fn delta_sum(&self, o: &Self) -> u32 {
-        (abs_diff_i32(self.red   as i32, o.red   as i32)
-        + abs_diff_i32(self.green as i32, o.green as i32)
-        + abs_diff_i32(self.blue  as i32, o.blue  as i32)
-        + abs_diff_i32(self.alpha as i32, o.alpha as i32)) as u32
+        self.red.abs_diff(o.red)     as u32
+            + self.green.abs_diff(o.green) as u32
+            + self.blue.abs_diff(o.blue)   as u32
+            + self.alpha.abs_diff(o.alpha) as u32
     }
     #[inline] fn max_value() -> u32 { 0x8000 }
 
@@ -151,15 +151,6 @@ impl SmoothPixel for Pixel16 {
     }
 }
 
-#[inline]
-fn abs_diff_u8(a: u8, b: u8) -> u8 {
-    if a >= b { a - b } else { b - a }
-}
-
-#[inline]
-fn abs_diff_i32(a: i32, b: i32) -> i32 {
-    (a - b).abs()
-}
 
 // Safe accessors on a raw-pointer buffer. Callers ensure `offset` is in-bounds.
 /// # Safety

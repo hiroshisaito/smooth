@@ -30,8 +30,11 @@ void smooth_core_preprocess_u16(void *in_ptr, int32_t rowbytes, int32_t height,
 
 /* Step 3: process_row_range.
  * One call handles the full scan+blend pass for rows [j_start, j_end) x cols [i_start, i_end).
- * Callers build a RowRangeArgs per invocation. Serial; Step 4 will add parallelism
- * (internal to Rust). */
+ *
+ * Step 4: parallelism is now internal to Rust.
+ *   parallel = 0  => serial (byte-exact reproduction of Phase 1 serial baseline).
+ *   parallel = 1  => rayon strip-parallel (Phase 1 SEAM_HALO=0 boundary behaviour,
+ *                    row-block strips scaled to rayon::current_num_threads()). */
 typedef struct {
     void    *in_ptr;
     void    *out_ptr;
@@ -45,6 +48,7 @@ typedef struct {
     int32_t  j_end;
     int32_t  i_start;
     int32_t  i_end;
+    int32_t  parallel;       /* 0 = serial, 1 = rayon strip-parallel */
 } smooth_row_range_args_t;
 
 void smooth_core_process_row_range_u8 (const smooth_row_range_args_t *args);

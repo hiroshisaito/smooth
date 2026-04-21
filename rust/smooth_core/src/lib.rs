@@ -77,6 +77,7 @@ pub struct RowRangeArgs {
     pub j_end:         i32,
     pub i_start:       i32,
     pub i_end:         i32,
+    pub parallel:      i32,      // 0 = serial, 1 = rayon strip-parallel
 }
 
 #[no_mangle]
@@ -91,20 +92,63 @@ pub unsafe extern "C" fn smooth_core_process_row_range_u16(args: *const RowRange
 
 #[inline]
 unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs) {
-    let template = BlendingInfo::<P> {
-        in_ptr:        a.in_ptr  as *mut P,
-        out_ptr:       a.out_ptr as *mut P,
-        width:         a.width,
-        logical_width: a.logical_width,
-        height:        a.height,
-        rowbytes:      a.rowbytes,
+    // Snapshot all plain-value fields so the parallel closure does not capture
+    // the !Sync raw pointers in RowRangeArgs directly.
+    let j_start       = a.j_start;
+    let j_end         = a.j_end;
+    let i_start       = a.i_start;
+    let i_end         = a.i_end;
+    let width         = a.width;
+    let logical_width = a.logical_width;
+    let height        = a.height;
+    let rowbytes      = a.rowbytes;
+    let range         = a.range;
+    let line_weight   = a.line_weight;
+    let in_addr       = a.in_ptr  as usize;
+    let out_addr      = a.out_ptr as usize;
+
+    let build_info = |in_addr: usize, out_addr: usize| BlendingInfo::<P> {
+        in_ptr:        in_addr  as *mut P,
+        out_ptr:       out_addr as *mut P,
+        width, logical_width, height, rowbytes,
         i: 0, j: 0,
         in_target: 0, out_target: 0,
         core: [Cinfo::default(); 4],
         flag: 0,
-        range: a.range,
-        mode:  0,
-        line_weight: a.line_weight,
+        range,
+        mode: 0,
+        line_weight,
     };
-    process_row_range(&template, a.j_start, a.j_end, a.i_start, a.i_end);
+
+    let rows = j_end - j_start;
+    let nthreads = if a.parallel == 0 { 1 } else { rayon::current_num_threads() as i32 };
+
+    // Phase 1 compatible thresholds: small images / single-core → serial.
+    if nthreads <= 1 || rows < 32 {
+        let tmpl = build_info(in_addr, out_addr);
+        process_row_range(&tmpl, j_start, j_end, i_start, i_end);
+        return;
+    }
+
+    let rows_per_thread = (rows + nthreads - 1) / nthreads;
+
+    use rayon::iter::{IntoParallelIterator, ParallelIterator};
+    (0..nthreads).into_par_iter().for_each(|t| {
+        let start = j_start + t * rows_per_thread;
+        let end   = (start + rows_per_thread).min(j_end);
+        if start >= end { return; }
+        let tmpl = BlendingInfo::<P> {
+            in_ptr:        in_addr  as *mut P,
+            out_ptr:       out_addr as *mut P,
+            width, logical_width, height, rowbytes,
+            i: 0, j: 0,
+            in_target: 0, out_target: 0,
+            core: [Cinfo::default(); 4],
+            flag: 0,
+            range,
+            mode: 0,
+            line_weight,
+        };
+        unsafe { process_row_range(&tmpl, start, end, i_start, i_end); }
+    });
 }

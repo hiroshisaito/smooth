@@ -11,14 +11,19 @@ REPEAT="${1:-20}"
 # 再ビルド(SMOOTH_PARALLEL を CLI から渡せるように)
 SDK="$ROOT/references/AfterEffectsSDK_25.6_61_win/ae25.6_61.64bit.AfterEffectsSDK"
 MODE_FLAG="${SMOOTH_PARALLEL:-1}"
+RUST_CRATE="$ROOT/rust/smooth_core"
+RUST_LIB="$RUST_CRATE/target/universal/release/libsmooth_core.a"
+"$RUST_CRATE/build-universal.sh" >/dev/null || { echo "cargo build failed"; exit 1; }
 clang++ -std=c++17 -O2 \
     -DSMOOTH_PARALLEL=$MODE_FLAG \
     -I"$SDK/Examples/Headers" \
     -I"$SDK/Examples/Headers/SP" \
     -I"$SDK/Examples/Util" \
+    -I"$RUST_CRATE/include" \
     -I"$ROOT" \
     "$ROOT/tests/regression_test.cpp" \
-    "$ROOT/util.cpp" "$ROOT/upMode.cpp" "$ROOT/downMode.cpp" "$ROOT/Lack.cpp" "$ROOT/8link.cpp" \
+    "$ROOT/util.cpp" \
+    "$RUST_LIB" \
     -o "$BIN" 2>/dev/null || { echo "build failed"; exit 1; }
 echo "# built with SMOOTH_PARALLEL=$MODE_FLAG"
 

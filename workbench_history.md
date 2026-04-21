@@ -43,7 +43,7 @@
 | 1 | Rust crate スキャフォールド + FFI スタブ + Xcode 統合 | **完了** (2026-04-21) |
 | 2 | `preProcess<T>` を Rust 移植 | **完了** (2026-04-22) |
 | 3 | ヘルパー関数群 + `process_row_range` を Rust 移植(シリアル)※ Step 4 と統合 | **完了** (2026-04-22) |
-| 4 | rayon 並列化(Rust 内部に移設) | 未着手 |
+| 4 | rayon 並列化(Rust 内部に移設) | **完了** (2026-04-22) |
 | 5 | フル回帰テスト + ベンチ比較 | 未着手 |
 | 6 | Windows ビルド統合(別マシン作業) | 未着手 |
 
@@ -659,3 +659,41 @@ msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
 - 合成 white_option 4/4 OK
 - ゴールデン 14/14 IDENTICAL 維持
 - Mac universal build 成功
+
+### 2026-04-22 03:00 JST — Step 4 (rayon で並列化を Rust 内部化)
+
+**目的**: C++ 側の `std::thread` / `std::vector<std::thread>` による行ブロック並列化を撤去し、並列化を Rust 内部に移設。C++ は `smooth_core_process_row_range` FFI を 1 回呼ぶだけ。SEAM_HALO=0 の Phase 1 境界挙動は維持。
+
+**実装**:
+- `rust/smooth_core/Cargo.toml`: `rayon = "1"` 依存追加
+- `rust/smooth_core/include/smooth_core_ffi.h`: `smooth_row_range_args_t` に `parallel: int32_t` フィールド追加 (0=serial / 1=rayon)
+- `rust/smooth_core/src/lib.rs`: `run_row_range` を rewrite
+  - 並列フラグが立ち & rows >= 32 & nthreads > 1 の場合: `rayon::current_num_threads()` で strip 数を決定、`(0..nthreads).into_par_iter().for_each` で並列化
+  - 各 worker が自前の `BlendingInfo` (raw pointer は `usize` 経由で Send 対応) で `process_row_range` を呼ぶ
+  - 小画像/シングルコア/`parallel=0` はシリアル実行(Phase 1 と同じしきい値)
+- [smooth_core.h](smooth_core.h): `#include <thread>` / `<vector>` / `<algorithm>` 削除。`process<T>()` の `std::thread` ループ + シーム再パス部分を削除し、FFI 1 回呼び出しに縮小。`SMOOTH_PARALLEL` マクロは `args.parallel` に伝える役目だけ残す
+
+**検証**:
+- Rust `cargo test --release`: 3/3 passed
+- Mac universal `xcodebuild clean build`: BUILD SUCCEEDED
+- 回帰テスト `SMOOTH_PARALLEL=0`: **14/14 IDENTICAL + 合成 white_option 4/4 OK**
+- 回帰テスト `SMOOTH_PARALLEL=1`: **13 IDENTICAL + 1 NEAR-ID (frame 135, 30/14187776 bytes, 0.0002%、Phase 1 ベースライン一致) + 合成 white_option 4/4 OK**
+
+**ベンチ比較(repeat=10、`tests/bench.sh`、MacBook Pro Intel Core i9-9880H / 8 コア)**:
+
+| frame | size | bpc | serial (min) | parallel (min) | speedup |
+|---|---|---|---|---|---|
+| 135 | 2512×1412 | 8 | 16.7 ms | 7.6 ms | 2.2× |
+| 200 | 3840×2160 | 8 | 113.5 ms | 34.5 ms | 3.3× |
+| 500 | 3840×2160 | 16 | 145.8 ms | 41.5 ms | 3.5× |
+| 1000 | 1920×1080 | 16 | 35.1 ms | 10.0 ms | 3.5× |
+| 1500 | 1920×1080 | 16 | 34.3 ms | 10.1 ms | 3.4× |
+| 1767 | 1920×1080 | 16 | 34.2 ms | 10.1 ms | 3.4× |
+
+**速度リグレッション(記録)**:
+- Phase 1 C++ の HD 16bpc (1920×1080) parallel は **5.8 ms** / serial **19 ms** だった(workbench 上記録)。現 Rust parallel **10.1 ms** / serial **34 ms** で、どちらも C++ の **約 1.7× 遅い**
+- 原因候補: (a) ジェネリクスの monomorphize で inline 展開が微妙に違う / (b) `#[inline(always)]` 指定不足 / (c) f64 promotion (Step 3 で修正した end_p 計算)の 1 箇所追加コスト / (d) `std::thread` から rayon への切替によるオーバーヘッド差(rayon は初回 lazy init 済みなので pool 生成は含まない)
+- 現時点では HD 16bpc 10ms 以下で実用域、4K 16bpc 42ms で許容範囲
+- **Step 5 で原因切り分け + tuning (inline指定、abs_diff の手書き branchless 化、vector register 明示、代表関数の `#[inline(always)]`) を 1 回トライ。改善が鈍ければ現状で Phase 2-C 完了扱いにするかユーザー判断**
+
+**次 (Step 5)**: フル回帰テスト/ベンチ最終確認 + 速度チューニングの試行(もしくは現状 accept) → workbench まとめ。

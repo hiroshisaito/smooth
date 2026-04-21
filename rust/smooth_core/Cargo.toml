@@ -7,6 +7,9 @@ edition = "2021"
 name       = "smooth_core"
 crate-type = ["staticlib"]
 
+[dependencies]
+rayon = "1"
+
 [profile.release]
 opt-level   = 3
 lto         = true
