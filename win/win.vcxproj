@@ -267,11 +267,13 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="..\8link.h" />
+    <ClInclude Include="..\bench.h" />
     <ClInclude Include="..\define.h" />
     <ClInclude Include="..\downMode.h" />
     <ClInclude Include="..\Effect.h" />
     <ClInclude Include="..\Lack.h" />
     <ClInclude Include="..\resource.h" />
+    <ClInclude Include="..\smooth_core.h" />
     <ClInclude Include="..\upMode.h" />
     <ClInclude Include="..\util.h" />
     <ClInclude Include="..\version.h" />

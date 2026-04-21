@@ -329,6 +329,52 @@ Phase 1 目標(25 → 5〜8 ms)**達成**。
 - Windows 側ビルドは未更新(Phase 2 で対応予定)
 - `PBXRezBuildPhase`/`Traditional headermap` の Xcode 警告(将来の移行対象)
 
+---
+
+# Phase 2
+
+Phase 1 をマージせずに同ブランチで続行。ブランチ名を `feature/smooth-mod-v1.5.0` → `feature/smooth-mod-phase2` に変更。
+
+## Phase 2 計画(優先順)
+
+1. **D. Windows 追従**(マシン都合で本ビルドは別機)
+2. B. 隣接依存ウェイト調整 or C. Rust コア化
+3. A. GPU 化(Metal Smart FX)
+
+## Phase 2-D: Windows 追従(Mac 側準備)
+
+### 2026-04-21 22:50 JST — ソース準備完了
+
+**対象**: Windows 機での Phase 1 相当の動作保証(並列化込みの 1.5.0 を Win でもビルド可能に)。
+
+**Mac 側でできたこと**:
+- [win/win.vcxproj](win/win.vcxproj) と [win/win.vcxproj.filters](win/win.vcxproj.filters) に Phase 1 新規ヘッダ(`smooth_core.h`, `bench.h`)を登録。
+- [bench.h](bench.h) に Windows 用ガード追加:
+  - `<direct.h>` と `_mkdir` を Win で使う分岐
+  - dump dir を `/tmp/smooth_bench` or `C:\Temp\smooth_bench` に分岐
+- [win/BUILD_WINDOWS.md](win/BUILD_WINDOWS.md) 新設 — ビルド手順・SDK パス設定・AE 配置・既知事項を整理。
+- [Pipl.r](Pipl.r) の `CodeMacARM64` 追加は Windows では無視される(PiPLTool がプラットフォーム別に解釈)。
+
+**Mac 側の回帰確認**:
+- bench ビルド(`SMOOTH_BENCH=1`)を Mac で再ビルド → BUILD SUCCEEDED。`bench.h` の Windows ガードが Mac 側を壊していないこと確認済み。
+
+**Windows 側で実施予定(別マシン)**:
+- VS2017+ で `win.sln` を開く
+- AE SDK パスを環境変数 `SDKPath` または include ディレクトリで通す
+- Release x64 ビルド → `win.aex` 出力
+- AE 2025 に配置し動作確認
+- 配布用 zip 作成(`smooth.Win.1.5.0.AE2025.x64.zip`)
+
+### Windows ビルド時に想定されるハマりどころ
+
+| 項目 | 対処 |
+| --- | --- |
+| `PlatformToolset=v141`(VS2017)が未インストール | VS Installer で追加 or v142/v143 に一括変更 |
+| `$(SDKPath)` 環境変数未設定 | ユーザー環境変数 or プロパティページで設定 |
+| PiPL 生成時に `PiPLTool.exe` が動かない | SDK Resources 配下のパスが `$(SDKPath)Resources\PiPLTool` に解決されるか確認 |
+| `std::thread` リンクエラー | Runtime Library `/MD` (Multi-threaded DLL) 選択 |
+| 回帰テストを走らせたい | `run_regression.sh` は bash。WSL or Git Bash で実行。`regression_test.cpp` のソースは POSIX 非依存 |
+
 ## 意思決定ログ
 
 ### 2026-04-21 — 記録は手動追記方式
