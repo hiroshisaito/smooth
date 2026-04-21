@@ -15,8 +15,11 @@ RUST_LIB="$RUST_CRATE/target/universal/release/libsmooth_core.a"
 echo "==> build Rust smooth_core (universal)"
 "$RUST_CRATE/build-universal.sh" >/dev/null || { echo "cargo build failed"; exit 1; }
 
-echo "==> build regression harness"
+SMOOTH_PARALLEL="${SMOOTH_PARALLEL:-1}"
+
+echo "==> build regression harness (SMOOTH_PARALLEL=$SMOOTH_PARALLEL)"
 clang++ -std=c++17 -O2 \
+    -DSMOOTH_PARALLEL=$SMOOTH_PARALLEL \
     -I"$SDK/Examples/Headers" \
     -I"$SDK/Examples/Headers/SP" \
     -I"$SDK/Examples/Util" \
@@ -24,10 +27,6 @@ clang++ -std=c++17 -O2 \
     -I"$ROOT" \
     "$ROOT/tests/regression_test.cpp" \
     "$ROOT/util.cpp" \
-    "$ROOT/upMode.cpp" \
-    "$ROOT/downMode.cpp" \
-    "$ROOT/Lack.cpp" \
-    "$ROOT/8link.cpp" \
     "$RUST_LIB" \
     -o "$BIN" || { echo "build failed"; exit 1; }
 

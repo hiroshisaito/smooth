@@ -41,9 +41,9 @@
 | # | 内容 | 状態 |
 | --- | --- | --- |
 | 1 | Rust crate スキャフォールド + FFI スタブ + Xcode 統合 | **完了** (2026-04-21) |
-| 2 | `preProcess<T>` を Rust 移植 | 進行中 |
-| 3 | ヘルパー関数群(downMode / upMode / Lack / 8link)を Rust 移植 | 未着手 |
-| 4 | メインループ(`process_row_range`)を Rust 移植 + rayon 並列化 | 未着手 |
+| 2 | `preProcess<T>` を Rust 移植 | **完了** (2026-04-22) |
+| 3 | ヘルパー関数群 + `process_row_range` を Rust 移植(シリアル)※ Step 4 と統合 | **完了** (2026-04-22) |
+| 4 | rayon 並列化(Rust 内部に移設) | 未着手 |
 | 5 | フル回帰テスト + ベンチ比較 | 未着手 |
 | 6 | Windows ビルド統合(別マシン作業) | 未着手 |
 
@@ -580,3 +580,51 @@ msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
 **Step 2 完了判定**: preProcess の 100% Rust 化、回帰差分ゼロ(Phase 1 と同等)。
 
 **次 (Step 3)**: ヘルパー関数群(downMode / upMode / Lack / 8link)の移植。`process_row_range` の `*.CountLength` / `*.Blending` / `LackMode*Execute` / `Link8*Execute` が対象。C++ 側 `BlendingInfo<T>` に対応する Rust 構造体の設計から。
+
+### 2026-04-22 02:00 JST — Step 3 (helpers + process_row_range Rust 化、シリアル版)
+
+**スコープ変更**: 当初 Step 3(ヘルパー群)と Step 4(メインループ+rayon)を分ける計画だったが、FFI 境界を細かく切ると (a) 24+ の C ABI が必要で重い、(b) 各ピクセルで境界を跨ぎオーバーヘッド大、(c) Step 3 単独では回帰テストが組めない、という問題があり統合。**Step 3 = 全部シリアル移植、Step 4 = rayon 並列化のみ** とした(workbench スコープ表も更新)。
+
+**新規 Rust ファイル** (`rust/smooth_core/src/`):
+
+| ファイル | 内容 | 行数 |
+|---|---|---|
+| `types.rs` | `Pixel8`/`Pixel16` に `SmoothPixel` trait 実装(u32 arithmetic、as_packed で FAST_COMPARE 用 u64 pack)、`BlendingInfo<P>` (raw `*mut P` + 状態)、`Cinfo`、`CR_FLG_FILL` / `SECOND_COUNT` / `BLEND_MODE_*` 定数、`px_read`/`px_write` unsafe ヘルパー | ~170 |
+| `compare.rs` | `compare_pixel` / `compare_pixel_equal` / `fast_compare_pixel`(C++ ComparePixel マクロ相当) | ~30 |
+| `blend.rs` | `blending_pixel_f` / `blending_f` / `blend_line`(util.cpp の Blendingf / BlendLine 相当) | ~90 |
+| `lack.rs` | `lack_mode_01_execute` / `_02_execute` / `_0304_execute`(Lack.cpp 相当) | ~170 |
+| `up_mode.rs` | 8 関数(LeftCountLength / RightCountLength / TopCountLength / BottomCountLength / 同 Blending、upMode.cpp 相当) | ~280 |
+| `down_mode.rs` | 同 8 関数(downMode.cpp 相当) | ~280 |
+| `link8.rs` | `count_length` / `count_length_two_lines` / `blend_outside` / `blend_inside` / `link8_execute` / `link8_mode_{01,02,03,04}_execute` / `link8_square_execute`(8link.cpp 相当、MAX_LENGTH=128) | ~450 |
+| `process.rs` | `process_row_range<P>`(mode_flg スキャン + case 3/5/7/11/13/15 + 突起 mode3、smooth_core.h 相当) | ~200 |
+
+**FFI 追加**(`rust/smooth_core/src/lib.rs` + `include/smooth_core_ffi.h`):
+- `smooth_row_range_args_t`(11 フィールド: `in_ptr/out_ptr/width/logical_width/height/rowbytes/range/line_weight/j_start/j_end/i_start/i_end`)
+- `smooth_core_process_row_range_u8/u16` エクスポート
+- `smooth_core_version` → `0x0002_0002` に bump
+
+**C++ 側**(`smooth_core.h`):
+- `process_row_range<T>` テンプレートを**削除**。FFI 呼び出しの薄皮ヘルパー `invoke_row_range_ffi<T>` に置換
+- `#include "upMode.h" / "downMode.h" / "Lack.h" / "8link.h"` も削除(smooth_core 自身は C++ ヘルパー群に依存しない)
+- Phase 1 の `std::thread` 並列化枠組みはそのまま(各 worker が FFI を呼ぶ)。Step 4 で rayon 内部化予定
+
+**回帰テスト**(`tests/run_regression.sh` に `SMOOTH_PARALLEL=0/1` env 対応追加):
+
+| 条件 | 結果 |
+|---|---|
+| `SMOOTH_PARALLEL=0` | **14/14 IDENTICAL** (byte-exact) |
+| `SMOOTH_PARALLEL=1` | 13 IDENTICAL + 1 NEAR-ID (frame 135: 30/14187776 bytes、Phase 1 ベースライン一致) |
+
+**遭遇した bug (修復済)**:
+- **症状**: `SMOOTH_PARALLEL=0` で frame 135 (2512×1412 8bpc) のみ 11536 bytes 差分、max_abs=82
+- **診断**: A/B diff ハーネスで C++ old 実装と新 Rust 実装を並走 → pixel (1202, 194) が Rust だけ未書込(input 0x24 のまま)、C++ は 0x5A に blend
+- **原因**: `down_mode_right_blending` で `end_p = (end - 0.000001) as i32` 実行時、`end` が f32 (1203.0)、`0.000001` も f32 として型推論される。f32 の 1024 以上での ULP は ~1.22e-4 で 1e-6 を表現できず、1203.0 - 0.000001 が **f32 では 1203.0 にそのまま rounded back**。i32 cast で 1203 → C++ が期待する 1202 と off-by-one
+- **C++ では成立していた理由**: `0.000001` は C++ では double リテラル、`float - double` は double に昇格、double 精度で 1202.999999 となり `(int)` で 1202
+- **修正**: `up_mode.rs` / `down_mode.rs` の `end_p` 計算 4 箇所すべて `(end as f64 - 0.000001) as i32` にし、減算を f64 で行う
+
+**ビルド検証**:
+- Rust 単体 `cargo test --release`: 3 passed / 0 failed
+- Mac universal `xcodebuild clean build`: BUILD SUCCEEDED
+- 生成バイナリ: universal (x86_64 + arm64)、5 FFI シンボル確認 (`_smooth_core_{version, preprocess_u8/u16, process_row_range_u8/u16}`)
+
+**次 (Step 4)**: rayon で行ブロック並列化を Rust 内部に移設。C++ 側の `std::thread` / `std::vector<std::thread>` 枠組みを撤去し、`smooth_core_process_row_range_u8/u16` の中で並列化を完結させる。SEAM_HALO=0 の既知境界挙動は維持。

@@ -1,9 +1,5 @@
 // Phase 2-C Step 2: preProcess() ported from C++ smooth_core.h.
 //
-// - White pixel replacement (optional): RGB-only match, alpha NOT compared.
-//   Matching pixels are overwritten in-place with the null pixel (all zero).
-// - Bounding box detection over non-white, non-fully-transparent pixels.
-//
 // Layout assumption: PixelN is `{ alpha, red, green, blue }` in memory order,
 // matching AE SDK's PF_Pixel / PF_Pixel16 definitions in AE_Effect.h.
 
@@ -34,26 +30,7 @@ pub struct SmoothBbox {
     pub bottom: i32,
 }
 
-pub trait SmoothPixel: Copy + PartialEq {
-    fn white_key() -> Self;
-    fn null_pixel() -> Self;
-    fn rgb_eq(&self, other: &Self) -> bool;
-    fn alpha_is_zero(&self) -> bool;
-}
-
-impl SmoothPixel for Pixel8 {
-    #[inline] fn white_key()  -> Self { Pixel8  { alpha: 0xFF, red: 0xFF, green: 0xFF, blue: 0xFF } }
-    #[inline] fn null_pixel() -> Self { Pixel8  { alpha: 0,    red: 0,    green: 0,    blue: 0    } }
-    #[inline] fn rgb_eq(&self, o: &Self) -> bool { self.red == o.red && self.green == o.green && self.blue == o.blue }
-    #[inline] fn alpha_is_zero(&self) -> bool { self.alpha == 0 }
-}
-
-impl SmoothPixel for Pixel16 {
-    #[inline] fn white_key()  -> Self { Pixel16 { alpha: 0x8000, red: 0x8000, green: 0x8000, blue: 0x8000 } }
-    #[inline] fn null_pixel() -> Self { Pixel16 { alpha: 0,      red: 0,      green: 0,      blue: 0      } }
-    #[inline] fn rgb_eq(&self, o: &Self) -> bool { self.red == o.red && self.green == o.green && self.blue == o.blue }
-    #[inline] fn alpha_is_zero(&self) -> bool { self.alpha == 0 }
-}
+use crate::types::SmoothPixel;
 
 pub fn pre_process<P: SmoothPixel>(
     pixels: &mut [P],
@@ -129,7 +106,7 @@ mod tests {
 
     #[test]
     fn all_transparent_returns_origin_bbox() {
-        let mut img = vec![make_pixel8(0, 0, 0, 0); 4 * 3]; // 4x3
+        let mut img = vec![make_pixel8(0, 0, 0, 0); 4 * 3];
         let bb = pre_process(&mut img, 4, 3, false);
         assert_eq!(bb.top, 0);
         assert_eq!(bb.left, 0);
@@ -139,17 +116,14 @@ mod tests {
 
     #[test]
     fn white_gets_replaced_when_enabled() {
-        // 3x2 image: [W, W, W / W, red_opaque, W]
         let w  = make_pixel8(0xFF, 0xFF, 0xFF, 0xFF);
         let r  = make_pixel8(0xFF, 0xFF, 0x00, 0x00);
         let mut img = vec![w, w, w, w, r, w];
         let bb = pre_process(&mut img, 3, 2, true);
-        // all W should become null_pixel (0,0,0,0), R stays
         for idx in [0, 1, 2, 3, 5] {
             assert_eq!(img[idx], make_pixel8(0, 0, 0, 0), "idx {idx}");
         }
         assert_eq!(img[4], r);
-        // bbox points at the red pixel at (1,1), returned as right+1/bottom+1
         assert_eq!(bb.top,    1);
         assert_eq!(bb.left,   1);
         assert_eq!(bb.right,  2);
@@ -162,7 +136,6 @@ mod tests {
         let r = make_pixel8(0xFF, 0xFF, 0x00, 0x00);
         let mut img = vec![w, w, w, w, r, w];
         let bb = pre_process(&mut img, 3, 2, false);
-        // nothing changed
         assert_eq!(img[0], w);
         assert_eq!(img[4], r);
         assert_eq!(bb.top,    1);

@@ -147,11 +147,23 @@ int main(int argc, char** argv) {
 
     size_t diffs = 0;
     int max_abs = 0;
+    const size_t pxsize = (in.bpc == 8) ? 4 : 8;
+    const size_t pixels_per_row = in.rowbytes / pxsize;
+    int first_diff_count = 0;
     for (size_t i = 0; i < expected.pixels.size(); i++) {
         if (out[i] != expected.pixels[i]) {
             diffs++;
             const int d = std::abs((int)out[i] - (int)expected.pixels[i]);
             if (d > max_abs) max_abs = d;
+            if (first_diff_count < 4 && std::getenv("SMOOTH_DUMP_DIFFS")) {
+                const size_t pixel_idx = i / pxsize;
+                const size_t x = pixel_idx % pixels_per_row;
+                const size_t y = pixel_idx / pixels_per_row;
+                const size_t ch = i % pxsize;
+                std::fprintf(stderr, "  diff#%d byte=%zu px=(%zu,%zu) ch=%zu out=%u exp=%u\n",
+                             first_diff_count, i, x, y, ch, out[i], expected.pixels[i]);
+                first_diff_count++;
+            }
         }
     }
     // Step 4: 並列化による境界残差許容誤差

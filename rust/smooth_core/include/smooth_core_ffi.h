@@ -15,15 +15,7 @@ extern "C" {
 uint32_t smooth_core_version(void);
 
 /* Step 2: preProcess.
- * bbox semantics (match legacy C++ smooth_core::preProcess):
- *   top    = first row index that contains a non-white, non-zero-alpha pixel, else 0
- *   left   = minimum column index of such a pixel across all rows, else 0
- *   right  = (maximum column index) + 1, or 1 if none found
- *   bottom = (maximum row index of such a pixel) + 1, or 1 if none found
- *
- * When is_white_trans is non-zero, pixels whose RGB (alpha ignored) matches the
- * "white key" (0xFF for u8, 0x8000 for u16) are overwritten with the null pixel
- * (all channels zero), in place. */
+ * bbox semantics: see smooth_core.h / Rust pre_process. */
 typedef struct {
     int32_t top;
     int32_t left;
@@ -35,6 +27,28 @@ void smooth_core_preprocess_u8 (void *in_ptr, int32_t rowbytes, int32_t height,
                                 int32_t is_white_trans, smooth_bbox_t *bbox_out);
 void smooth_core_preprocess_u16(void *in_ptr, int32_t rowbytes, int32_t height,
                                 int32_t is_white_trans, smooth_bbox_t *bbox_out);
+
+/* Step 3: process_row_range.
+ * One call handles the full scan+blend pass for rows [j_start, j_end) x cols [i_start, i_end).
+ * Callers build a RowRangeArgs per invocation. Serial; Step 4 will add parallelism
+ * (internal to Rust). */
+typedef struct {
+    void    *in_ptr;
+    void    *out_ptr;
+    int32_t  width;          /* rowbytes / sizeof(Pixel) */
+    int32_t  logical_width;
+    int32_t  height;
+    int32_t  rowbytes;
+    uint32_t range;
+    float    line_weight;
+    int32_t  j_start;
+    int32_t  j_end;
+    int32_t  i_start;
+    int32_t  i_end;
+} smooth_row_range_args_t;
+
+void smooth_core_process_row_range_u8 (const smooth_row_range_args_t *args);
+void smooth_core_process_row_range_u16(const smooth_row_range_args_t *args);
 
 #ifdef __cplusplus
 }
