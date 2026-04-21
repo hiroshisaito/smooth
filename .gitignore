@@ -1,3 +1,11 @@
 /win/x64/
 /win/.vs/
 .DS_Store
+/references/
+/Mac/build/
+/Mac/DerivedData/
+/Mac/release/
+/.claude/
+/tests/.venv/
+/tests/goldens/
+/tests/regression_test
