@@ -19,8 +19,17 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
-#include <sys/stat.h>
-#include <sys/types.h>
+
+#if defined(_WIN32)
+  #include <direct.h>    // _mkdir
+  #define SMOOTH_BENCH_MKDIR(path) _mkdir(path)
+  #define SMOOTH_BENCH_DUMP_DIR "C:\\Temp\\smooth_bench"
+#else
+  #include <sys/stat.h>
+  #include <sys/types.h>
+  #define SMOOTH_BENCH_MKDIR(path) mkdir((path), 0755)
+  #define SMOOTH_BENCH_DUMP_DIR "/tmp/smooth_bench"
+#endif
 
 namespace smooth_bench {
 
@@ -50,12 +59,12 @@ inline std::mutex& io_lock() {
     return m;
 }
 
-inline const char* dump_dir() { return "/tmp/smooth_bench"; }
+inline const char* dump_dir() { return SMOOTH_BENCH_DUMP_DIR; }
 
 inline void ensure_dir_once() {
     static std::once_flag flag;
     std::call_once(flag, []() {
-        mkdir(dump_dir(), 0755);
+        SMOOTH_BENCH_MKDIR(dump_dir());
     });
 }
 
