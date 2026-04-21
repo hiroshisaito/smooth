@@ -399,3 +399,73 @@ Phase 1 をマージせずに同ブランチで続行。ブランチ名を `feat
 | HD (1920×1080, 16bpc) | - | - | - |
 | 4K (3840×2160, 8bpc) | - | - | - |
 | 4K (3840×2160, 16bpc) | - | - | - |
+
+### 2026-04-21 22:06 JST — Phase 2-D Windows 初回ビルド成功
+
+**環境**:
+- マシン: Windows 10 Pro (19045.6456) / Intel
+- Visual Studio 2026 Community (v18.4.0, MSVC 19.44.35225)
+- インストール済みツールセット: v143, v145(v141 は未インストール)
+- Windows SDK: 10.0.26100.0(10.0.18362.0 も在り)
+- AE SDK: `references/AfterEffectsSDK_25.6_61_win/ae25.6_61.64bit.AfterEffectsSDK/Examples/`
+
+**vcxproj 変更**(`win/win.vcxproj`):
+- `WindowsTargetPlatformVersion` を `10.0.14393.0` → `10.0`(インストール済み最新 SDK を自動選択)
+- `PlatformToolset` を `v141` → `v143`(4 箇所)
+- Release|x64 / Debug|x64 の `OutDir` / Link `OutputFile` を `C:\Program Files\Adobe\Adobe After Effects CC 2017\...` → `$(SolutionDir)Release\x64\` / `$(SolutionDir)Debug\x64\` のローカル相対に
+- `TargetName` を `KP_smooth` → `smooth`(配布ファイル名を `smooth.aex` に統一)
+- `IncludePath` の `$(SDKPath)\Headers` → `$(SDKPath)Headers`(バックスラッシュ重複除去、`SDKPath` は末尾 `\` 前提)
+- `StructMemberAlignment` を `4Bytes` → `Default`(Win11 SDK `winnt.h` が非 default pack を `static_assert` で拒否)
+- `PreprocessorDefinitions` に `NOMINMAX` を追加(Release / Debug x64)
+
+**ビルドコマンド**:
+```
+set SDKPath=D:\GitHub\smooth\references\AfterEffectsSDK_25.6_61_win\ae25.6_61.64bit.AfterEffectsSDK\Examples\
+msbuild D:\GitHub\smooth\win\win.sln /p:Configuration=Release /p:Platform=x64 /m
+```
+(vcvars64.bat を最小 env で call する必要あり。git bash から継承した `PATH` に Microsoft Office `\Common` が含まれていると vcvars64 内の `if` が `\Common was unexpected at this time.` で死ぬ)
+
+**遭遇したエラーと対処**:
+
+| # | エラー | 原因 | 対処 |
+| --- | --- | --- | --- |
+| 1 | `winnt.h(2597): static_assert failed: Windows headers require the default packing option` | vcxproj の `StructMemberAlignment=4Bytes` が Win11 SDK の pack assert に引っかかる | `Default` に変更 |
+| 2 | `Param_Utils.h(18): 'strlcpy': identifier not found` | `Param_Utils.h` の `#ifdef AE_OS_WIN` の else 枝が走った。`AE_OS_WIN` は `AEConfig.h` でしか定義されないが、SDK の `Param_Utils.h` / `AE_Effect.h` は `AEConfig.h` をインクルードしていない。Mac では `strlcpy` が libc にあるので顕在化しなかった | `Effect.cpp` に `#include "AEConfig.h"` を追加(AE_Effect.h より前) |
+| 3 | `smooth_core.h(376): '(' illegal token on right side of '::'`(`std::min`/`std::max`) | `<windef.h>` の `min`/`max` マクロが `std::min`/`std::max` と衝突 | `NOMINMAX` を Preprocessor Definitions に追加 |
+
+**成功ビルド成果物**:
+- `win/Release/x64/smooth.aex` — 239,104 bytes
+- `win/Release/x64/smooth.lib` — 1,720 bytes
+- PiPL リソース検証(文字列マッチ): `KOJI_SMOOTH` / `EntryPointFunc` / `LoiLo` すべて .aex バイナリ内に存在
+
+**警告(非致命)**:
+- C4819 (code page 932) — ソース内 UTF-8 コメントが Shift-JIS で解釈できない。Mac 側 .mm/.cpp と同一ソースなのでリリース品質には影響なし。
+- MSB8065 (PiPL 出力パス警告) — CustomBuild の `Outputs` 宣言が `..\Pipl.rc` だが実際の cl コマンドは `win\Pipl.rc` に出力。`win\Pipl.rc` は既存のためビルドは問題なし。インクリメンタル最適化がやや崩れる程度。
+
+**次アクション**:
+- AE 2025 (Windows) 実機で smooth.aex 動作確認(AE 未インストール環境のため未実施)
+- 動作 OK 確認後、`smooth.Win.1.5.0.AE2025.x64.zip` 作成
+- Mac 側で v1.5.0 タグ再発行 or `v1.5.0-win` を追加(方針は要相談)
+
+### 2026-04-21 22:10 JST — AE 2025 (Windows) 実機動作確認
+
+**配置先**: `D:\Program Files\Adobe After Effects 2025\Support Files\Plug-ins\Effects\smooth.aex`
+
+**結果**: ユーザー確認 OK。エフェクトメニュー `LoiLo > smooth` 表示 → 適用 → パラメータ動作確認済み。
+
+**補助変更**:
+- `win/win.vcxproj.user` の `LocalDebuggerCommand` を `C:\Program Files\Adobe\Adobe After Effects CC 2017\...` → `D:\Program Files\Adobe After Effects 2025\Support Files\AfterFX.exe` に更新(VS からの F5 デバッガ起動用)
+
+### 2026-04-21 22:34 JST — 配布 zip 作成
+
+**成果物**: `win/release/smooth.Win.1.5.0.AE2025.x64.zip` (113,775 bytes)
+
+| ファイル | SHA256 |
+| --- | --- |
+| smooth.aex (239,104 bytes) | `7D9B30EA45AC455605F8FF2B9B446A073ED42C85CD0410BEA994E519A86E6A14` |
+| smooth.Win.1.5.0.AE2025.x64.zip (113,775 bytes) | `84DF87951F08773CB8C0FE7662ECCD72BF5487DB5D7A5902748FE7938D9674C2` |
+
+**作成コマンド**: `Compress-Archive -Path win/Release/x64/smooth.aex -DestinationPath win/release/smooth.Win.1.5.0.AE2025.x64.zip`
+
+**Phase 2-D クローズ**。Mac/Windows 両方の 1.5.0 バイナリが揃った。
+タグ運用の方針(v1.5.0 再発行 or v1.5.0-win 追加)はユーザー決定待ち。

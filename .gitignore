@@ -1,5 +1,8 @@
 /win/x64/
 /win/.vs/
+/win/Release/
+/win/release/
+/win/Debug/
 .DS_Store
 /references/
 /Mac/build/
