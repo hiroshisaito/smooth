@@ -1080,3 +1080,25 @@ Phase 2-D v1.5.0 Win バイナリを更新(旧 `24FEFCFA...D01F36D1` は build-i
 **教訓(ルール化)**:
 - AE プラグインの out_flags / out_flags2 は **SDK doc の記述 ≠ AE 実行時の要求** という差がある。新しい flag を立てる時は、SDK doc の条件文だけで判断せず、実機で verification failure を見て必要な flag を追加する方針
 - legacy render + MFR を組み合わせる場合、`SUPPORTS_GET_FLATTENED_SEQUENCE_DATA` は事実上必須(sequence_data 未使用でも)
+
+### 2026-04-22 18:40 JST — Step 3 Mac AE 実機 MFR 動作確認(GREEN、全項目 PASS)
+
+`0.1.0+42688f8` を `/Applications/Adobe After Effects 2025/Plug-ins/Effects/` に install、AE 2025 (25.0.1x2 release) 起動・プロジェクト読込・書き出しを実施。
+
+| 確認項目 | 結果 | 根拠 |
+|---|---|---|
+| 起動時 verification-failure ダイアログ | **出ない** | ログ内 `{25::248}` 系エラー無し |
+| プロジェクト読込時 verification-failure ダイアログ | **出ない** | 同上 |
+| エフェクトヘッダの黄色 ⚠️(non-MFR 警告) | **消えている** | UI 確認 |
+| Effect Controls の Build 表示 | **`0.1.0+42688f8`** 表示 | スクリーンショット |
+| About ダイアログ | `smooth, v1.5.0` / `rust_core 0.1.0+42688f8 ffi=0x00020003` | スクリーンショット |
+| AE レンダーログの thread-safe 分類 | `Thread-safe effects used: KOJI_SMOOTH` / `Non-thread-safe effects used: <none>`(全レンダリングレポートで一貫) | ログ |
+| 書き出し時の MFR 並列度 | `Render threads used: 11 / 13`, `Max allowed concurrency: 16` | ログ `Multithreaded render report` |
+| 基本機能(range / line weight / white_option) | 従来通り | ユーザ確認 |
+
+**ログから読める MFR の実効性**:
+- 書き出し(バッチ)では `Render threads used: 11` や `13` に到達、`Max allowed concurrency: 16` とペアで動作している(このマシンは AE の MFR 上限 16 threads 設定)
+- 単フレーム UI プレビュー系レポートは `Render threads used: 2` / `Max allowed concurrency: 2` になっているが、これは AE 側が単フレーム用途では MFR を意図的に絞る仕様で、MFR 実装の問題ではない
+- `KOJI_SMOOTH` が `Non-thread-safe effects used:` 側に一度も出ていないことが、Step 1 のスレッドセーフ監査が正しかった最終証明
+
+**Phase 2-B close 条件**: 満たした。次は Windows チーム同期 (Step 4) → CPU-only v1.5.0 リリース準備 (Step 5)。
