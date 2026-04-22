@@ -1,7 +1,7 @@
 # Phase 2-A: GPU 対応 調査ノート
 
 開始日: 2026-04-23
-最終改訂: 2026-04-23(review round 3 反映)
+最終改訂: 2026-04-23(review round 4 反映)
 対象: smooth プラグインの GPU レンダリング対応(Phase 2-B MFR 済み、タグ `v1.5.1` リリース済の上に載せる形)
 
 **現行リポジトリのバージョン文字列基準**:
@@ -13,6 +13,7 @@
 
 - **2026-04-23 round 1 review 反映**: GPU selector を `PF_Cmd_SMART_RENDER_GPU` 前提に統一、CPU fallback 経路を legacy `PF_Cmd_RENDER` ではなく SmartRender 化後の `PF_Cmd_SMART_RENDER`(CPU)に修正、CUDA context push/pop 方針を「サンプル準拠で省略、spike で検証」に後退、once-fallen-always-fall を sequence_data 単位に一本化、Metal `waitUntilCompleted` を commit-only に統一、FLOAT_COLOR_AWARE flag を smooth の ToDo に明示追加、DX12 ステージ表矛盾修正、range UI 値域を実コードに合わせて訂正、進捗表を更新、参考実装を `SDK_Invert_ProcAmp` に確定(GP/EMP は blit hook で別物)、`.claude/` 非公開メモ依存を本文に繰り込み、GetDeviceCount の project-level 設定反映の断定を仮説化、newBufferWithLength NG の表現を「フレーム本体のみ」に限定。
 - **2026-04-23 round 2 review 反映**: once-fallen-always-fall の保存設計を **sequence_data 直接書き込みから 2 層分離に変更**(sequence_data には UUID のみ、fallen flag は plugin-global `DashMap<UUID, AtomicBool>`)、理由は SDK の render 時 sequence_data read-only 契約(AE_Effect.h L926)と `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER` の span-boundary-discard 仕様が本用途と不整合のため。永続化自己矛盾(save/load 後の再試行可否)も 2 層分離で解消。CUDA context push/pop を Item 6 側でも「spike 検証、default は SDK 準拠で省略」に統一。GetDeviceCount 由来の判定を結論部でも「第一候補 + spike 実測確認」に揃える。Item 6 §6.3 差分表の sequence_data セル、§5.8 sequence_data 節を新設計に書き直し。冒頭プラットフォーム順序節を現結論(Metal + CUDA、DX12 defer)に合わせて書き直し、当初案だった wgpu/Vulkan 抽象化も議論終了済みである旨を明記。
+- **2026-04-23 round 4 review 反映**: SEQUENCE_RESETUP / SEQUENCE_SETDOWN の thread-affinity 記述を修正。round 3 で §4.6 に「main-thread 系 selector のみで書き込む」「SETDOWN の selector は main thread」という表現が残っていたが、SDK AE_Effect.h L1123 は RESETUP が either thread で発生する旨を明記、L1140 の SETDOWN 記述に thread 保証は無い。main-thread 前提で lock 無し書き込みを設計すると AE が render thread で RESETUP/SETDOWN を発行した際に race を起こすため、表現を「render 以外の lifecycle selector で書く、ただし thread-affinity は前提しない。副作用(GPU_FALLEN insert/remove、pipeline HashMap 更新等)は thread-safe 構造で扱う」に修正(§4.6 の書き込み範囲説明、SEQUENCE_SETDOWN 動作フロー bullet、§4.6 要件表の read-only 契約行の 3 箇所)。SETUP のみ GET_FLATTENED_SEQUENCE_DATA 有効時に UI thread 保証(L1123)であることを併記。
 - **2026-04-23 round 3 review 反映**: (1) **SEQUENCE_RESETUP で UUID を必ず再生成する方針に修正**。SDK AE_Effect.h L1094-L1113 の通り RESETUP は save/load・duplicate(複製元と複製先の両方)・in_data 変更で呼ばれ、plugin から duplicate を判別できない。以前の「flattened から UUID 復元」案では複製元と複製先が同一 UUID を共有し `GPU_FALLEN` 干渉と片側 SEQUENCE_SETDOWN による他方の sticky 状態消去が起きるため、RESETUP で常に新 UUID を振り直す形に統一。save/load 越しは `GPU_FALLEN` がプロセス境界で消えるので新 UUID でも fresh retry という意図通りの挙動になる。(2) **`PF_EffectSequenceDataSuite1` の骨子コードを実 API に訂正**。SDK ヘッダ AE_GeneralPlug.h L5713-L5718 の通り suite は `PF_GetConstSequenceData(PF_ProgPtr, PF_ConstHandle*)` 一本で、checkout/checkin ペアは存在しない。round 2 で書いていた `CheckoutConstSequenceData` / `CheckinSequenceData` 名の骨子をそのまま書くとコンパイル通らないので、`PF_ConstHandle` 受け取り → 1 段 dereference → struct cast に書き直し。(3) **§4.8 SmartRender パイプライン図の "sequence_data の gpu_fallen セット" 表記を修正**(round 2 で 2 層分離に移行したのに 1 箇所旧設計のまま残っていた)、"plugin-global DashMap<UUID, AtomicBool>(GPU_FALLEN)に fallen セット" に訂正。(4) **`SmoothSequenceData` の ABI を 2 × u64(`instance_uuid_hi`/`instance_uuid_lo`)に本 doc 全域で統一**、§4.6 冒頭で `instance_uuid: u128` になっていた箇所を §6.5 と揃えた(C 側 align と C⇄Rust FFI 互換のため 2 × u64 を採用)。
 
 ## スコープ確定
@@ -659,7 +660,7 @@ AE_Effect.h L926-L930 に明記:
        instance_uuid_lo: u64,
    }
    ```
-   SEQUENCE_FLATTEN / SEQUENCE_RESETUP / GET_FLATTENED_SEQUENCE_DATA を実装して save/load / duplicate に対応。**書き込みは SEQUENCE_SETUP / RESETUP / CHANGED 等の main-thread 系 selector のみ、render 時は read-only でアクセス**(`PF_EffectSequenceDataSuite1::PF_GetConstSequenceData` 経由、`PF_ConstHandle` を受け取って dereference)。
+   SEQUENCE_FLATTEN / SEQUENCE_RESETUP / GET_FLATTENED_SEQUENCE_DATA を実装して save/load / duplicate に対応。**書き込みは render 系(`PF_Cmd_SMART_RENDER` / `PF_Cmd_SMART_RENDER_GPU`)以外の lifecycle selector(SETUP / RESETUP / SETDOWN / CHANGED 等)でのみ行う、render 時は read-only でアクセス**(`PF_EffectSequenceDataSuite1::PF_GetConstSequenceData` 経由、`PF_ConstHandle` を受け取って dereference)。**なお thread-affinity の前提は置かない**: SDK AE_Effect.h L1123 は RESETUP が either thread で発生すると明記、SETDOWN も main-thread 保証なし。SETUP のみ `GET_FLATTENED_SEQUENCE_DATA` 有効時に UI thread 限定(L1123)。したがって lifecycle selector 側の副作用(`GPU_FALLEN` insert/remove、pipeline HashMap 更新等)は全て thread-safe な構造(`DashMap` / `Atomic*` / `RwLock`)で扱う必要がある — これらが render 並列と同時に走り得る前提。
 
 2. **plugin-global HashMap(in-memory、プロセス生存期間のみ)**: fallen flag を保持
    ```rust
@@ -675,13 +676,13 @@ AE_Effect.h L926-L930 に明記:
 - `SMART_RENDER_GPU` 入口: sequence_data(read-only、`PF_GetConstSequenceData` 経由)から UUID 取得、`GPU_FALLEN.get(&uuid)` で fallen 判定
   - fallen の場合: CPU 経路実行、`PF_Err_NONE` return
   - そうでない場合: GPU 試行 → 失敗時 `GPU_FALLEN.entry(uuid).or_insert(AtomicBool::new(false)).store(true, Relaxed)` → CPU fallback → `PF_Err_NONE` return
-- `SEQUENCE_SETDOWN`: sequence_data(read-only OK、selector は main thread)から UUID 取得して `GPU_FALLEN.remove(&uuid)` で掃除。RESETUP で UUID が再生成されているので、duplicate 後は複製元と複製先の setdown が別 key を触り衝突しない。
+- `SEQUENCE_SETDOWN`: sequence_data(read-only アクセス)から UUID 取得して `GPU_FALLEN.remove(&uuid)` で掃除。SDK は SETDOWN の thread-affinity を保証していない(AE_Effect.h L1140 に記述無し)ため、render thread と並行発生し得る前提で扱う。`DashMap::remove` は内部 shard lock で thread-safe、かつ他 instance の render thread が同 `DashMap` を別 UUID で読む操作と干渉しない(UUID が key になっているため)。RESETUP で UUID が再生成されているので、duplicate 後は複製元と複製先の setdown が別 key を触り衝突しない。
 
 **この設計で得られるもの**:
 
 | 要件 | 達成 |
 |---|---|
-| sequence_data render 時 read-only 契約の遵守 | ✓(書き込みは main-thread 系 selector でのみ) |
+| sequence_data render 時 read-only 契約の遵守 | ✓(書き込みは render 以外の lifecycle selector のみ、thread-affinity は前提しない) |
 | `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER` 不要 | ✓(MFR 並列度を失わない) |
 | per-effect-instance の独立性(他インスタンスに波及しない) | ✓(RESETUP 時 UUID 再生成により duplicate 後も独立) |
 | セッション/span をまたいで sticky(バッチ書き出し全体で CPU 固定) | ✓(HashMap はプロセス生存中保持、SLOWER flag の "span 境界で discard" の影響なし) |
