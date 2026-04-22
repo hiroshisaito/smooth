@@ -1003,3 +1003,80 @@ rust_core 0.1.0+902d0e2+dirty  ffi=0x00020003
 Phase 2-D v1.5.0 Win バイナリを更新(旧 `24FEFCFA...D01F36D1` は build-id 機能なし、偽成功チェックだけの版。新 SHA は `smooth_core_build_id()` + `PARAM_BUILD_INFO` button 付き)。
 
 **今後の運用**: 偽成功チェックは「AE で Effect Controls の `Build:` キャプションが `git rev-parse --short HEAD` と一致するか」が最短の 1 段確認。dumpbin / findstr はビルド直後の CI 的自動検証に回す。
+
+---
+
+## Phase 2-B: MFR 対応(SUPPORTS_THREADED_RENDERING)
+
+### 2026-04-22 17:50 JST — Step 1 Thread-safety audit(GREEN)
+
+計画改訂(MFR を GPU より先、CPU-only v1.5.0 としてリリース)に従い、既存コードが Multi-Frame Rendering の要件を満たすか監査した。
+
+**SDK 要件**([AE_Effect.h L912-930](references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Headers/AE_Effect.h)):
+- Render セレクタが複数スレッドから同時に呼ばれる可能性あり
+- Sequence Setup/Resetup/SetDown/PreRender/Render は thread-safe 必須
+- Global Setup/Setdown はメインスレッドのみ(保証)
+- `sequence_data` は render 時 read-only、`in_data->sequence_data` は NULL
+- `PF_OutFlag_SEQUENCE_DATA_NEEDS_FLATTENING` を立てている場合は `SUPPORTS_GET_FLATTENED_SEQUENCE_DATA` も必要
+
+**監査結果**:
+
+| 項目 | 状態 |
+|---|---|
+| C++ `util.cpp` の `static StartCounter` | `#if _PROFILE` 内、Release build では死コード ✓ |
+| `bench.h` の `static atomic / mutex / once_flag` | `#ifdef SMOOTH_BENCH` 内、自身で thread-safe ✓ |
+| Rust `BUILD_ID: &str` | immutable static ✓ |
+| Rust `INIT: Once / MASK: AtomicU32`(SMOOTH_SKIP 用) | concurrent init / Relaxed load で安全 ✓ |
+| `static mut` / `UnsafeCell` / `thread_local` | 全てなし ✓ |
+| rayon global pool | reentrant、複数 caller thread から並行呼出 OK ✓ |
+| `BlendingInfo` / `SharedBuf` の raw pointer | per-frame 独立(AE が異なる frame に異なる PF_LayerDef を渡す)、フレーム間 alias なし ✓ |
+| `sequence_data` | 未使用、`SEQUENCE_DATA_NEEDS_FLATTENING` も未設定、N/A ✓ |
+| `PF_Cmd_RENDER` (legacy) 経路 | per-call 独立 buffer、thread-safe ✓ |
+
+**結論**: 現コードは MFR 要件を満たしている。コード変更は flag 2 箇所(Effect.cpp の out_flags2 と Pipl.r の AE_Effect_Global_OutFlags_2)のみで済む。
+
+### 2026-04-22 17:55 JST — Step 2 MFR flag 追加
+
+**変更**:
+
+- [Effect.cpp](Effect.cpp) `GlobalSetup`: `out_data->out_flags2 |= PF_OutFlag2_I_AM_THREADSAFE | PF_OutFlag2_SUPPORTS_THREADED_RENDERING`(bit 27 = `0x08000000` を OR)。両者の関係を inline コメントで明記、「Pipl.r 側と必ず同期」と警告
+- [Pipl.r](Pipl.r) `AE_Effect_Global_OutFlags_2`: `0x00000010` → `0x08000010`。コメントで bit 内訳を明記
+- `my_version` / `AE_Effect_Version` / `smooth_core_version` / `BUILD_VERSION` のいずれも**bump 不要**(param layout 不変、FFI 不変、build_id UI で SHA 一意識別)
+
+**検証**:
+- Mac universal `xcodebuild clean build`: BUILD SUCCEEDED
+- `nm smooth | grep EntryPoint`: `_EntryPointFunc`(C linkage、unmangled)確認
+- 回帰 `SMOOTH_PARALLEL=0`: 14/14 IDENTICAL + synthetic white_option 6/6 OK
+- 回帰 `SMOOTH_PARALLEL=1`: 13 IDENTICAL + 1 NEAR-ID (frame 135, 30 bytes, Phase 1 baseline) + white_option 6/6 OK
+- `cargo test --release`: 3/3 passed
+
+**次 (Step 3)**: AE 2025 実機で MFR 動作確認:
+1. 黄色 ⚠️ アイコン(non-MFR 警告)が**消えていること**
+2. RenderTaskManager ログの `Thread-safe effects used:` に `KOJI_SMOOTH` が載ること(`Non-thread-safe effects used:` から移動)
+3. 複数レイヤ同時プレビュー / バッチ書き出しで CPU 全コア使用率が跳ねること(MFR の効果)
+4. Phase 2-D 同様の基本機能回帰(白抜き含む)でレンダー結果が従来通り
+
+### 2026-04-22 18:30 JST — Step 3 で遭遇した事故と追加修正(同じ commit に統合済)
+
+**症状**: Step 2 の build を AE 2025 に install すると、起動時と project load 時の 2 回、以下のエラーダイアログが出る:
+
+> After Effects error: internal verification failure, sorry! {Plug-ins which set
+> PF_OutFlag2_SUPPORTS_THREADED_RENDERING and PF_OutFlag_SEQUENCE_DATA_NEEDS_FLATTENING
+> must implement PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA} ( 25 :: 248 )
+
+ダイアログ OK 後は MFR 自体は動作(ログ末尾で `Thread-safe effects used: KOJI_SMOOTH` 確認)するが、毎回警告が出る状態。
+
+**原因分析**: SDK doc([AE_Effect.h L1005](references/AfterEffectsSDK_25.6_61_mac/ae25.6_61.64bit.AfterEffectsSDK/Examples/Headers/AE_Effect.h))は「`SEQUENCE_DATA_NEEDS_FLATTENING` と `SUPPORTS_THREADED_RENDERING` の**両方**が立っている時に `SUPPORTS_GET_FLATTENED_SEQUENCE_DATA` が必須」と書かれている。本 plugin は `SEQUENCE_DATA_NEEDS_FLATTENING` を立てていない(全 out_flags = `I_WRITE_INPUT_BUFFER | DEEP_COLOR_AWARE` のみ、sequence_data も未使用)。
+
+しかし AE 2025 の `FLTp_EnforceFlagCombinations` は、**legacy render (`PF_Cmd_RENDER`) 経路の MFR 対応 plugin 全般**に `SUPPORTS_GET_FLATTENED_SEQUENCE_DATA` を要求する実装になっている。SDK doc の記述が実際の挙動より緩い(or AE 側が保守的)。
+
+**修正**: `PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA`(bit 23 = `0x00800000`)を Effect.cpp の out_flags2 と Pipl.r の AE_Effect_Global_OutFlags_2 に追加:
+
+- Effect.cpp: `| PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA` を out_flags2 に追加、経緯を inline コメントで明記
+- Pipl.r: `0x08000010` → `0x08800010` に同期
+
+`PF_Cmd_GET_FLATTENED_SEQUENCE_DATA` のハンドラは**追加不要**。sequence_data 未使用の plugin では AE がデフォルトで NULL を受け取って満足する(要確認、NG ならハンドラ追加で対処)。
+
+**教訓(ルール化)**:
+- AE プラグインの out_flags / out_flags2 は **SDK doc の記述 ≠ AE 実行時の要求** という差がある。新しい flag を立てる時は、SDK doc の条件文だけで判断せず、実機で verification failure を見て必要な flag を追加する方針
+- legacy render + MFR を組み合わせる場合、`SUPPORTS_GET_FLATTENED_SEQUENCE_DATA` は事実上必須(sequence_data 未使用でも)

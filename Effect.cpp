@@ -394,7 +394,22 @@ static PF_Err GlobalSetup ( PF_InData       *in_data,
 
 	// input buffer を加工します
     out_data->out_flags  |= PF_OutFlag_I_WRITE_INPUT_BUFFER | PF_OutFlag_DEEP_COLOR_AWARE;
-    out_data->out_flags2 |= PF_OutFlag2_I_AM_THREADSAFE;
+    // PF_OutFlag2_I_AM_THREADSAFE: legacy (SDK で "unused" とされる互換シグナル、維持)
+    // PF_OutFlag2_SUPPORTS_THREADED_RENDERING (bit 27 = 0x08000000):
+    //   Multi-Frame Rendering 対応。Render セレクタが複数スレッドから同時に呼ばれる。
+    //   Pipl.r::AE_Effect_Global_OutFlags_2 と**常に同期**すること(同期忘れは effect
+    //   が legacy 扱いになるだけで AE はエラーを出さないので気付きにくい)。
+    // PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA (bit 23 = 0x00800000):
+    //   SDK doc は「SEQUENCE_DATA_NEEDS_FLATTENING と THREADED_RENDERING の両方が
+    //   立つ時に必須」と書かれているが、AE 2025 の FLTp_EnforceFlagCombinations は
+    //   legacy render (PF_Cmd_RENDER) 経路の MFR 対応 plugin 全般に要求してくる
+    //   (sequence_data 未使用でも plugin scan / project load 時に verification
+    //   failure の error dialog が出る)。本 plugin は sequence_data を使っていない
+    //   ため、PF_Cmd_GET_FLATTENED_SEQUENCE_DATA ハンドラは未実装 = AE が NULL を
+    //   受けて問題なし。
+    out_data->out_flags2 |= PF_OutFlag2_I_AM_THREADSAFE
+                          | PF_OutFlag2_SUPPORTS_THREADED_RENDERING
+                          | PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA;
 
     return PF_Err_NONE;
 }
