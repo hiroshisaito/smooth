@@ -53,6 +53,22 @@ extern "C" {
  * Bump the low 16 bits whenever any of the structs below changes layout. */
 uint32_t smooth_core_version(void);
 
+/* Human-readable build identity, captured at Rust crate build time.
+ *
+ * Format: "<crate-semver>+<git-short-sha>[+dirty]"
+ *   e.g.  "0.1.0+0c5b06d"       (clean)
+ *         "0.1.0+0c5b06d+dirty" (uncommitted changes present at build)
+ *         "0.1.0+unknown"       (git unavailable, e.g. tarball build)
+ *
+ * The returned pointer is a static null-terminated ASCII string valid for the
+ * lifetime of the loaded plugin; do NOT free it.
+ *
+ * Intended use: the C++ plugin surface this in the Effect Controls panel and
+ * the About dialog so a human can tell at a glance which build is loaded.
+ * This is the primary defence against "false-success" stale-cache builds
+ * (Phase 2-D post-mortem documents one such incident). */
+const char *smooth_core_build_id(void);
+
 /* Step 2: preProcess.
  *
  * Scans `in_ptr` once and:

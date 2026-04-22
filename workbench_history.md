@@ -870,3 +870,82 @@ Phase 2-D **正式クローズ**。Mac (universal) + Windows (x64) ともに Pha
 **教訓(追加)**:
 - 「コミット → push → タグ」まで完了していても、別ツール経由のリセットで作業ツリーが戻る可能性がある。CI や配布成果物が orphan コミットを指さないよう、重要タグは release zip と同時に SHA256 を workbench に釘付けしておく(今回は最終値を上表に固定記載)
 - 偽成功の可能性があるときは、バイナリサイズ・含まれる文字列(FFI シンボル名)・linker tlog の 3 点で疑いを晴らす。ユーザー目視確認だけでは Phase 間の退行は検出できない(Phase 1 と Phase 2-C の外観が同一なため)
+
+---
+
+## Build-id UI 追加(偽成功再発防止)
+
+### 2026-04-22 14:00 JST — ユーザー視認可能なビルド識別子を Effect Controls に表示
+
+**背景**: Phase 2-D の偽成功(incremental build キャッシュによる Phase 1 C++ 相当バイナリ)が「ユーザー AE 目視テスト」では検出できず、clean rebuild 強制まで気付けなかった。再発防止に、プラグイン UI 上で「今どのビルドが動いているか」をユーザーが常時確認できる仕組みが必要と判断。
+
+**ブランチ**: `feature/build-id-display`(master から派生、Phase 2-D `8f0ce84` 後)
+
+**追加物**:
+
+- `rust/smooth_core/build.rs`(新規) — `git rev-parse --short HEAD` と `git diff --quiet HEAD`(dirty 判定)を実行し、`cargo:rustc-env=SMOOTH_CORE_GIT_SHA=<sha>[+dirty]` を出力。`cargo:rerun-if-changed=../../.git/HEAD` と `../../.git/index` を登録して HEAD 移動時/commit 時に build.rs が再実行される。`git` 非導入環境では `"unknown"` にフォールバック
+- `rust/smooth_core/src/lib.rs` — 静的 `BUILD_ID = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMOOTH_CORE_GIT_SHA"), "\0")` を埋め込み、FFI `smooth_core_build_id() -> *const c_char` を追加。返り値は process 寿命の static null-terminated ASCII
+- `rust/smooth_core/include/smooth_core_ffi.h` — `const char *smooth_core_build_id(void);` 宣言と doc コメント追加。偽成功再発防止が主要用途であることを明記
+
+**C++ 側**:
+
+- [Effect.cpp](Effect.cpp): `PARAM_BUILD_INFO` を enum に追加(末尾 = 既存 index 維持で後方互換)。`ParamsSetup` で `PF_Param_BUTTON` を 1 つ追加、`def.PF_DEF_NAME="Build"`、`button_d.u.namesptr = smooth_core_build_id()`。フラグ `PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP`(動画化抑制)
+- `About()` の return_msg に `rust_core <build_id>  ffi=0x%08x` 形式で build_id を追加
+- `out_data->my_version` を `PF_VERSION(2,0,0,0,0)` → `PF_VERSION(2,0,0,1,0)` に bump(param 追加通知、old project migration 用)
+- `smooth_core_version()` を `0x0002_0002` → `0x0002_0003` に bump(新 FFI 追加シグナル、後方互換)
+
+**期待 UI**:
+
+```
+Effect Controls / smooth
+  transparent [ ] ← 既存 (white option)
+  range       [===|===] ← 既存
+  line weight [===|===] ← 既存
+  Build       [ 0.1.0+902d0e2+dirty ] ← 新規、クリック時 no-op
+```
+
+About ダイアログ(右クリック → Effect Info):
+```
+smooth, v1.5.0 
+rust_core 0.1.0+902d0e2+dirty  ffi=0x00020003
+```
+
+**検証**:
+- `cargo build --release` 成功。`strings libsmooth_core.a | grep "^0\."` で `0.1.0+902d0e2+dirty` 確認
+- `cargo test --release`: 3/3 passed
+- Mac universal `xcodebuild clean build`: BUILD SUCCEEDED
+- `nm smooth.plugin/.../smooth` で `_smooth_core_build_id` シンボル確認(既存 5 + 新 1 = 計 6 symbols)
+- `strings smooth` で `0.1.0+902d0e2+dirty` 埋め込み確認
+- 回帰テスト `SMOOTH_PARALLEL=0/1`: 14/14 維持 + 合成 white_option 6/6 OK
+
+**Windows 追従**: 通常の dev flow。master merge 後に Windows 側で `git pull` → MSBuild すれば自動反映。Windows 固有の変更は不要(build.rs は cwd 相対で共通動作、vcxproj PreBuildEvent が `build-windows.bat` 経由で cargo を呼ぶ既存フローに乗る)。詳細は `docs/WINDOWS_BUILD_ID_INTEGRATION.md` (PR に同梱)。
+
+**再発防止効果**:
+- ユーザーが AE で smooth を適用すると Effect Controls に `Build: 0.1.0+<sha>[+dirty]` が常時表示され、どの commit で build されたかが一目でわかる
+- 偽成功(古い incremental cache)が疑われた場合、表示される SHA が現在の master HEAD と一致するか確認するだけで判別可能
+- `+dirty` サフィックスが付いている間は未コミットの変更を含むため配布前に必ずクリーンビルドを要求できる
+
+**遭遇した事故と修正(同じ commit に統合済)**:
+- 初回インストールで AE が `effect "smooth" has version mismatch. Code version is 2.0 and PiPL version is 2.0. (100200) (25 :: 16)` を表示して effect を拒否
+- 原因: `Effect.cpp` で `out_data->my_version` を `PF_VERSION(2,0,0,0,0)` → `PF_VERSION(2,0,0,1,0)`(=0x100200=1049088)に bump したが、[Pipl.r](Pipl.r) の `AE_Effect_Version` が `1048576`(=0x100000=PF_VERSION(2,0,0,0,0))のままで**PiPL resource との不一致**
+- AE は起動時に両者を照合して一致しないと版不整合エラーで effect を不可視化する
+- 修正: `Pipl.r` の `AE_Effect_Version` を `1049088` に揃え、コメントに「Effect.cpp::GlobalSetup の my_version と必ず同期」と明記
+- **教訓(Phase 2 以降のルール化)**: `Effect.cpp::my_version` と `Pipl.r::AE_Effect_Version` は**常に同じ数値(十進)で同期**させる。片方だけ bump すると AE で version mismatch エラー
+
+**続く事故と修正(同じ commit に統合済)**:
+- 2 度目のインストール後、`Build` パラメータはキャプション `0.1.0+024d084` で表示されたが、**クリックしても About ダイアログが出ない**(ユーザー報告: 「About がない FAIL」)
+- 原因: `PF_Param_BUTTON` のクリックイベント(`PF_Cmd_USER_CHANGED_PARAM`)は、param の `flags` に `PF_ParamFlag_SUPERVISE`(= 1 << 6)を立てないと AE から届かない。SDK ヘッダ `AE_Effect.h` L480 に明記されている挙動(`call me with PF_Cmd_USER_CHANGED_PARAM (new in AE 4.0)`)
+- さらに、`EntryPointFunc` が旧来の 5 引数シグネチャで `void *extra` を受けていなかったため、イベントが届いても `param_index` を取得できない構造だった
+- 修正 2 点:
+  1. Build ボタンの `def.flags` に `PF_ParamFlag_SUPERVISE` を追加
+  2. `EntryPointFunc` に 6 番目の `void *extra` 引数を追加。`PF_Cmd_USER_CHANGED_PARAM` case を追加し、`extra` を `PF_UserChangedParamExtra*` にキャスト、`param_index == PARAM_BUILD_INFO` なら `About()` を呼ぶ
+- ユーザー体験: Effect Controls の `Build` 行をクリックすると About ダイアログが出て、`rust_core 0.1.0+<sha>[+dirty]  ffi=0x00020003` を含む詳細情報が見える
+- **教訓**: PF_Param_BUTTON 追加時は `PF_ParamFlag_SUPERVISE` を忘れない。EntryPointFunc の 6 番目引数は旧プラグインでは省略可だが、ボタン型を使う場合は必須
+
+**さらに続く事故と修正(同じ commit に統合済)**:
+- 3 度目のインストール後、AE が `Actual missing plugin: KOJI_SMOOTH` + `Couldn't find main entry point for smooth.plugin` を表示し、effect が **Missing Effect** 扱いになった
+- 原因: `Effect.h` の `EntryPointFunc` 宣言が `extern "C"` 付きで**5 引数のまま**だったのに対し、`Effect.cpp` の定義は前項で **6 引数に変更**していた。シグネチャが不一致のため C++ は 2 つを**別関数**として扱い、`extern "C"` 宣言は 5 引数版に、`void *extra` 付き 6 引数版には**適用されず名前マングルされた**(symbol: `__Z14EntryPointFunciP9PF_InDataP10PF_OutDataPP11PF_ParamDefP11PF_LayerDefPv`)
+- AE は `Pipl.r::CodeMacARM64 {"EntryPointFunc"}` で宣言された**アンマングル名**を探すため symbol 発見失敗 → プラグイン読み込み不能
+- 修正: `Effect.h` の宣言を `Effect.cpp` と同じ 6 引数シグネチャに更新。コメントで「この 2 つの宣言は必ず一致させること、不一致だと Missing Effect になる」と明記
+- シンボル確認: `nm smooth.plugin/.../smooth | grep EntryPoint` が `_EntryPointFunc`(C linkage、unmangle)を表示することを毎回確認すべき
+- **教訓(重要)**: AE プラグインのエントリ関数は `extern "C"` 下のシグネチャが `.h` と `.cpp` で**完全に一致**していなければならない。`DllExport`(macro)は linkage を決めないため、`extern "C"` が実効的 linkage を決定する

@@ -19,7 +19,27 @@ use process::process_row_range;
 
 #[no_mangle]
 pub extern "C" fn smooth_core_version() -> u32 {
-    0x0002_0002
+    // 0x0002_0003: added smooth_core_build_id() (backwards compatible — old callers keep working).
+    0x0002_0003
+}
+
+/// Human-readable build identity, captured at Rust crate build time by
+/// `build.rs`. Format: `<CARGO_PKG_VERSION>+<git-short-sha>[+dirty]`.
+/// The trailing \0 makes it a valid null-terminated C string.
+static BUILD_ID: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "+",
+    env!("SMOOTH_CORE_GIT_SHA"),
+    "\0",
+);
+
+/// Returns a pointer to a static null-terminated ASCII string describing the
+/// Rust crate build (crate semver + git short SHA + optional `+dirty`).
+/// The pointer is valid for the lifetime of the process; callers must NOT
+/// free it.
+#[no_mangle]
+pub extern "C" fn smooth_core_build_id() -> *const core::ffi::c_char {
+    BUILD_ID.as_ptr() as *const core::ffi::c_char
 }
 
 // --- preProcess FFI (Step 2) ---

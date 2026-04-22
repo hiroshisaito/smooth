@@ -27,12 +27,13 @@
 
 //---------------------------------------------------------------------------//
 // 定義
-enum 
+enum
 {
     PARAM_INPUT = 0,
     PARAM_WHITE_OPTION,
     PARAM_RANGE,
     PARAM_LINE_WEIGHT,
+    PARAM_BUILD_INFO,   // 読み取り専用の Build 表示(偽成功判別用)
     PARAM_NUM,
 };
 
@@ -252,48 +253,49 @@ PF_Err EntryPointFunc(    PF_Cmd          cmd,
                             PF_InData       *in_data,
                             PF_OutData      *out_data,
                             PF_ParamDef     *params[],
-                            PF_LayerDef     *output )
+                            PF_LayerDef     *output,
+                            void            *extra )
 {
     PF_Err      err = PF_Err_NONE;
-    
+
     try
     {
         switch (cmd)
         {
             case PF_Cmd_ABOUT:              // Aboutボタンを押した
-                err = About(in_data, 
-                            out_data, 
-                            params, 
+                err = About(in_data,
+                            out_data,
+                            params,
                             output);
                 break;
 
 
             case PF_Cmd_GLOBAL_SETUP:       // Global setup 読み込まれた時1度だけ呼ばれるはず
-                err = GlobalSetup(  in_data, 
+                err = GlobalSetup(  in_data,
                                     out_data,
-                                    params, 
+                                    params,
                                     output);
                 break;
 
             case PF_Cmd_GLOBAL_SETDOWN:     // Global setdown 終了時1度だけ呼ばれるはず
-                err = GlobalSetdown(in_data, 
+                err = GlobalSetdown(in_data,
                                     out_data,
-                                    params, 
+                                    params,
                                     output);
                 break;
 
             case PF_Cmd_PARAMS_SETUP:       // パラメータの設定
-                err = ParamsSetup(  in_data, 
-                                    out_data, 
-                                    params, 
+                err = ParamsSetup(  in_data,
+                                    out_data,
+                                    params,
                                     output);
                 break;
 
 
             case PF_Cmd_RENDER:             // レンダリング
-                err = Render(   in_data, 
-                                out_data, 
-                                params, 
+                err = Render(   in_data,
+                                out_data,
+                                params,
                                 output);
                 break;
 
@@ -303,6 +305,17 @@ PF_Err EntryPointFunc(    PF_Cmd          cmd,
 								params,
 								output);
 				break;
+
+            case PF_Cmd_USER_CHANGED_PARAM:
+                // ユーザーがパラメータ(主にボタン)を操作した時。
+                // Build ボタンをクリックしたら About ダイアログを出す。
+                {
+                    PF_UserChangedParamExtra *ucp = reinterpret_cast<PF_UserChangedParamExtra*>(extra);
+                    if (ucp && ucp->param_index == PARAM_BUILD_INFO) {
+                        err = About(in_data, out_data, params, output);
+                    }
+                }
+                break;
 
         }
     }
@@ -345,14 +358,16 @@ static PF_Err About (   PF_InData       *in_data,
     memset( str, 0, 256 );
 
     const uint32_t rust_ffi = smooth_core_version();
+    const char *build_id    = smooth_core_build_id();
 
     sprintf(    out_data->return_msg,
-                 "%s, v%d.%d.%d %s\nrust_core ffi=0x%08x\n%s\n",
+                 "%s, v%d.%d.%d %s\nrust_core %s  ffi=0x%08x\n%s\n",
                 NAME,
                 MAJOR_VERSION,
                 MINOR_VERSION,
                 BUILD_VERSION,
                 stage_str,
+                build_id,
                 rust_ffi,
                 str );
 
@@ -373,8 +388,9 @@ static PF_Err GlobalSetup ( PF_InData       *in_data,
                             PF_LayerDef     *output )
 {
     // versionをpiplとあわせないといけないの&&PiPlは直値のみ
-    // 使いづらいから使わないので0固定
-    out_data->my_version    = PF_VERSION(2,0,0,0,0);    
+    // 使いづらいから使わないので0固定。
+    // build=1: Build 表示パラメータ(PARAM_BUILD_INFO)追加
+    out_data->my_version    = PF_VERSION(2,0,0,1,0);
 
 	// input buffer を加工します
     out_data->out_flags  |= PF_OutFlag_I_WRITE_INPUT_BUFFER | PF_OutFlag_DEEP_COLOR_AWARE;
@@ -444,10 +460,24 @@ static PF_Err ParamsSetup(  PF_InData       *in_data,
                         FALSE,          //WANT_PHASE,
                         PARAM_LINE_WEIGHT ); // ID
 
+    // Build 表示(読み取り専用)。
+    // Rust staticlib からビルド識別子("0.1.0+<sha>[+dirty]")を取得し、
+    // Effect Controls パネルに静的表示する。偽成功(incremental cache による
+    // Phase 1 相当バイナリ)をユーザーがひと目で判別できるようにするのが目的。
+    // ボタンとして表示され、クリック時には PF_Cmd_USER_CHANGED_PARAM 経由で
+    // About ダイアログを呼び出して詳細情報を出す(EntryPointFunc 参照)。
+    // PF_ParamFlag_SUPERVISE を立てないとクリックが届かない(AE_Effect.h L480)。
+    AEFX_CLR_STRUCT(def);
+    def.param_type = PF_Param_BUTTON;
+    def.flags      = PF_ParamFlag_SUPERVISE | PF_ParamFlag_CANNOT_TIME_VARY | PF_ParamFlag_CANNOT_INTERP;
+    PF_STRCPY(def.PF_DEF_NAME, "Build");
+    def.u.button_d.u.namesptr = smooth_core_build_id();  // static C string; lifetime OK
+    PF_ADD_PARAM(in_data, -1, &def);
+
     // パラメータ数をセット //
     out_data->num_params = PARAM_NUM;
 
-    
+
     return PF_Err_NONE;
 }
 
