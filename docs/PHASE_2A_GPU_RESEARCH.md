@@ -1,7 +1,7 @@
 # Phase 2-A: GPU 対応 調査ノート
 
 開始日: 2026-04-23
-最終改訂: 2026-04-23(review round 4 反映)
+最終改訂: 2026-04-23(review round 5 反映)
 対象: smooth プラグインの GPU レンダリング対応(Phase 2-B MFR 済み、タグ `v1.5.1` リリース済の上に載せる形)
 
 **現行リポジトリのバージョン文字列基準**:
@@ -13,6 +13,7 @@
 
 - **2026-04-23 round 1 review 反映**: GPU selector を `PF_Cmd_SMART_RENDER_GPU` 前提に統一、CPU fallback 経路を legacy `PF_Cmd_RENDER` ではなく SmartRender 化後の `PF_Cmd_SMART_RENDER`(CPU)に修正、CUDA context push/pop 方針を「サンプル準拠で省略、spike で検証」に後退、once-fallen-always-fall を sequence_data 単位に一本化、Metal `waitUntilCompleted` を commit-only に統一、FLOAT_COLOR_AWARE flag を smooth の ToDo に明示追加、DX12 ステージ表矛盾修正、range UI 値域を実コードに合わせて訂正、進捗表を更新、参考実装を `SDK_Invert_ProcAmp` に確定(GP/EMP は blit hook で別物)、`.claude/` 非公開メモ依存を本文に繰り込み、GetDeviceCount の project-level 設定反映の断定を仮説化、newBufferWithLength NG の表現を「フレーム本体のみ」に限定。
 - **2026-04-23 round 2 review 反映**: once-fallen-always-fall の保存設計を **sequence_data 直接書き込みから 2 層分離に変更**(sequence_data には UUID のみ、fallen flag は plugin-global `DashMap<UUID, AtomicBool>`)、理由は SDK の render 時 sequence_data read-only 契約(AE_Effect.h L926)と `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER` の span-boundary-discard 仕様が本用途と不整合のため。永続化自己矛盾(save/load 後の再試行可否)も 2 層分離で解消。CUDA context push/pop を Item 6 側でも「spike 検証、default は SDK 準拠で省略」に統一。GetDeviceCount 由来の判定を結論部でも「第一候補 + spike 実測確認」に揃える。Item 6 §6.3 差分表の sequence_data セル、§5.8 sequence_data 節を新設計に書き直し。冒頭プラットフォーム順序節を現結論(Metal + CUDA、DX12 defer)に合わせて書き直し、当初案だった wgpu/Vulkan 抽象化も議論終了済みである旨を明記。
+- **2026-04-23 round 5 review 反映**: §4.6 once-fallen-always-fall の **scope 記述を「per-effect-instance」から「per SETUP/RESETUP 区間」に修正**。round 3 で RESETUP ごとに UUID を再生成する設計に切り替えた結果、fallen 状態は実質 SETUP/RESETUP 区間の寿命でしか sticky ではなくなったが、§4.6 ヘッダ(line 630)、原則文(line 637)、動機説明(line 648)、要件表(line 688)で「そのエフェクトインスタンスの以降」「セッション全体」「セッション/span をまたいで sticky」という旧 scope 表現が残っていた。(1) ヘッダの括弧内 scope を `per-effect-instance / sequence レベル` から `per SETUP/RESETUP 区間` に差し替え。(2) 原則文を「その SETUP/RESETUP 区間の以降のレンダーを CPU 経路に固定」に修正。(3) `"effect instance 全寿命で sticky" ではなく "SETUP/RESETUP 区間で sticky"` と明示する段落を追加、単一 Render Queue 書き出し = 同一区間内完結の前提 + in_data 変更での GPU 再試行が意図挙動である旨を記述。(4) `SLOWER flag` 比較文の「セッション全体で CPU 固定」を「少なくともバッチ書き出し 1 回の中では CPU 固定」に縮減、(5) 要件表の `セッション/span をまたいで sticky` 行を `span-of-frames 境界をまたいで sticky(バッチ書き出し 1 回の中で CPU 固定)` に書き直し、`プロジェクト再オープンでリトライ可能` 行を新 UUID 再生成ロジックと整合する表現に更新、新規行 `user が params を変えた後に GPU 再試行` を追加して in_data 変更時の意図挙動を明示。
 - **2026-04-23 round 4 review 反映**: SEQUENCE_RESETUP / SEQUENCE_SETDOWN の thread-affinity 記述を修正。round 3 で §4.6 に「main-thread 系 selector のみで書き込む」「SETDOWN の selector は main thread」という表現が残っていたが、SDK AE_Effect.h L1123 は RESETUP が either thread で発生する旨を明記、L1140 の SETDOWN 記述に thread 保証は無い。main-thread 前提で lock 無し書き込みを設計すると AE が render thread で RESETUP/SETDOWN を発行した際に race を起こすため、表現を「render 以外の lifecycle selector で書く、ただし thread-affinity は前提しない。副作用(GPU_FALLEN insert/remove、pipeline HashMap 更新等)は thread-safe 構造で扱う」に修正(§4.6 の書き込み範囲説明、SEQUENCE_SETDOWN 動作フロー bullet、§4.6 要件表の read-only 契約行の 3 箇所)。SETUP のみ GET_FLATTENED_SEQUENCE_DATA 有効時に UI thread 保証(L1123)であることを併記。
 - **2026-04-23 round 3 review 反映**: (1) **SEQUENCE_RESETUP で UUID を必ず再生成する方針に修正**。SDK AE_Effect.h L1094-L1113 の通り RESETUP は save/load・duplicate(複製元と複製先の両方)・in_data 変更で呼ばれ、plugin から duplicate を判別できない。以前の「flattened から UUID 復元」案では複製元と複製先が同一 UUID を共有し `GPU_FALLEN` 干渉と片側 SEQUENCE_SETDOWN による他方の sticky 状態消去が起きるため、RESETUP で常に新 UUID を振り直す形に統一。save/load 越しは `GPU_FALLEN` がプロセス境界で消えるので新 UUID でも fresh retry という意図通りの挙動になる。(2) **`PF_EffectSequenceDataSuite1` の骨子コードを実 API に訂正**。SDK ヘッダ AE_GeneralPlug.h L5713-L5718 の通り suite は `PF_GetConstSequenceData(PF_ProgPtr, PF_ConstHandle*)` 一本で、checkout/checkin ペアは存在しない。round 2 で書いていた `CheckoutConstSequenceData` / `CheckinSequenceData` 名の骨子をそのまま書くとコンパイル通らないので、`PF_ConstHandle` 受け取り → 1 段 dereference → struct cast に書き直し。(3) **§4.8 SmartRender パイプライン図の "sequence_data の gpu_fallen セット" 表記を修正**(round 2 で 2 層分離に移行したのに 1 箇所旧設計のまま残っていた)、"plugin-global DashMap<UUID, AtomicBool>(GPU_FALLEN)に fallen セット" に訂正。(4) **`SmoothSequenceData` の ABI を 2 × u64(`instance_uuid_hi`/`instance_uuid_lo`)に本 doc 全域で統一**、§4.6 冒頭で `instance_uuid: u128` になっていた箇所を §6.5 と揃えた(C 側 align と C⇄Rust FFI 互換のため 2 × u64 を採用)。
 
@@ -627,14 +628,16 @@ AE の MFR は **最大同時 frame 数 = AE の RenderThreadExecutor 設定**(P
 - `SMOOTH_GPU_MAX_CONCURRENT_FRAMES=4` 相当のソフト制限(atomic counter、超過時 fallback)
 - VRAM 上限のデフォルトは「frame 1 枚分 × 4」= 1.6 GB、超えたら fallback
 
-### 4.6 Fallback policy: once-fallen-always-fall(per-effect-instance / sequence レベル)
+### 4.6 Fallback policy: once-fallen-always-fall(per SETUP/RESETUP 区間)
 
-**背景**(以前は private memo 参照だったのを本文化): Phase 2-B 設計時から「GPU 失敗時はセッション内 CPU 固定」を原則として決めていた。根拠は:
+**背景**(以前は private memo 参照だったのを本文化): Phase 2-B 設計時から「GPU 失敗時は同一バッチ書き出し内で CPU 固定」を原則として決めていた。根拠は:
 - バッチ書き出し中に急に GPU が落ちて CPU に切り替わると、fallback 周辺フレームの bit-identical 性が担保できない(boundary residual が切り替わり点で出る)
 - user が結果を見た時に「一部のフレームだけ色が違う」を招く
 - CPU/GPU 混在 render は output のコンテンツ品質保証が難しい
 
-**原則**: 1 回でも GPU render 失敗(OOM、shader error、driver timeout 等)が発生したら、**そのエフェクトインスタンスの以降のレンダーを CPU 経路に固定**する。
+**原則**: 1 回でも GPU render 失敗(OOM、shader error、driver timeout 等)が発生したら、**その SETUP/RESETUP 区間の以降のレンダーを CPU 経路に固定**する。
+
+**"effect instance 全寿命で sticky" ではなく "SETUP/RESETUP 区間で sticky"** である理由: 後述(§4.6 動作フロー)の通り SDK 制約により `SEQUENCE_RESETUP` で UUID を再生成する設計を取るため、RESETUP 契機(save/load、duplicate、in_data 変更)で `GPU_FALLEN` lookup が miss に戻り、実質的に fallen 状態はリセットされる。ただし**単一の Render Queue 書き出し実行中に user が params を触ることは通常ない**ため、1 回のバッチ書き出しは同一 SETUP/RESETUP 区間内で完結する想定。その区間内で boundary residual artifact を避ける、という元々の保証が実装レベルで成立している。「ユーザーが設定を変えた」後に GPU 再試行になる挙動は、意図しない sticky 継続よりも好ましい(in_data 変更により VRAM フットプリントや paramter shape が変わって GPU 可能性が復活するケースがあるため)。
 
 #### ❗ sequence_data への直接書き込み設計は不可(SDK 制約)
 
@@ -645,7 +648,7 @@ AE_Effect.h L926-L930 に明記:
 さらに SEQUENCE_DATA 書き込みを可能にする opt-in flag `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER`(L1010)も、docstring に:
 > Note that changes to sequence_data will be discarded regularly, currently after each span of frames is rendered such as single RAM Preview or Render Queue export.
 
-「span of frames の境界で discard」= バッチ書き出し中の途中で GPU が落ちたフラグが、次の書き出し span で消える。**once-fallen-always-fall の本来の狙い(そのセッション全体で CPU 固定)と挙動が合わない**。また、常時 `SLOWER` flag を立てるのは MFR 並列度低下のコストが割に合わない。
+「span of frames の境界で discard」= バッチ書き出し中の途中で GPU が落ちたフラグが、次の書き出し span で消える。**once-fallen-always-fall の本来の狙い(少なくともバッチ書き出し 1 回の中では CPU 固定を維持する)と挙動が合わない**。また、常時 `SLOWER` flag を立てるのは MFR 並列度低下のコストが割に合わない。
 
 #### 採用設計: plugin-global HashMap + sequence_data に UUID のみ格納
 
@@ -685,8 +688,9 @@ AE_Effect.h L926-L930 に明記:
 | sequence_data render 時 read-only 契約の遵守 | ✓(書き込みは render 以外の lifecycle selector のみ、thread-affinity は前提しない) |
 | `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER` 不要 | ✓(MFR 並列度を失わない) |
 | per-effect-instance の独立性(他インスタンスに波及しない) | ✓(RESETUP 時 UUID 再生成により duplicate 後も独立) |
-| セッション/span をまたいで sticky(バッチ書き出し全体で CPU 固定) | ✓(HashMap はプロセス生存中保持、SLOWER flag の "span 境界で discard" の影響なし) |
-| プロジェクト再オープンでリトライ可能 | ✓(HashMap はプロセス再起動でクリア、UUID 復元だけでは fallen 状態を引き継がない) |
+| span-of-frames 境界をまたいで sticky(バッチ書き出し 1 回の中で CPU 固定) | ✓(`DashMap` エントリはプロセス生存中 + UUID が変わらない間保持、SLOWER flag の "span 境界で discard" の影響なし) |
+| プロジェクト再オープンでリトライ可能 | ✓(`DashMap` はプロセス再起動でクリア、RESETUP で UUID も再生成) |
+| user が params を変えた後に GPU 再試行 | ✓(in_data 変更で RESETUP → 新 UUID → `GPU_FALLEN` miss で fresh retry) |
 | MFR 並列書き込み安全性 | ✓(`DashMap` 内部 shard + `AtomicBool` Relaxed store、`UUID` は stable key) |
 
 **plugin-global AtomicBool 案(round 1 で検討)は引き続き不採用**: 複数インスタンスに fallen が波及する問題は本設計(per-UUID)で解消、かつ SDK 制約も遵守できる形に進化。
