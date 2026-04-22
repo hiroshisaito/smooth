@@ -949,3 +949,57 @@ rust_core 0.1.0+902d0e2+dirty  ffi=0x00020003
 - 修正: `Effect.h` の宣言を `Effect.cpp` と同じ 6 引数シグネチャに更新。コメントで「この 2 つの宣言は必ず一致させること、不一致だと Missing Effect になる」と明記
 - シンボル確認: `nm smooth.plugin/.../smooth | grep EntryPoint` が `_EntryPointFunc`(C linkage、unmangle)を表示することを毎回確認すべき
 - **教訓(重要)**: AE プラグインのエントリ関数は `extern "C"` 下のシグネチャが `.h` と `.cpp` で**完全に一致**していなければならない。`DllExport`(macro)は linkage を決めないため、`extern "C"` が実効的 linkage を決定する
+
+### 2026-04-22 16:50 JST — Windows 側 Build-id UI 追従
+
+**背景**: Mac 側 commit `a47d468 feat(ui): surface build-id in Effect Controls to catch false-success builds` がマージされたので、Windows 側も同一 source から Rust + C++ をリビルドして追従。[docs/WINDOWS_BUILD_ID_INTEGRATION.md](docs/WINDOWS_BUILD_ID_INTEGRATION.md) の手順に従う。
+
+**Windows 側のソース変更**: **ゼロ**。今回のビルド ID 機能は:
+- `rust/smooth_core/build.rs`(新規、Mac 側で追加)
+- `rust/smooth_core/src/lib.rs`(FFI `smooth_core_build_id` 追加)
+- `Effect.cpp`(`PARAM_BUILD_INFO` button + About return_msg + `my_version` bump + 6 引数 EntryPointFunc)
+- `Effect.h`(EntryPointFunc シグネチャ 6 引数化)
+- `Pipl.r`(`AE_Effect_Version` 同期)
+
+すべて共有ソースのため `git pull` と clean rebuild で自動追従。`win/win.vcxproj` / `win/Pipl.r` / `win/BUILD_WINDOWS.md` / `rust/smooth_core/build-windows.bat` / `rust/smooth_core/.cargo/config.toml` は一切変更なし。
+
+**ビルド手順**:
+1. `git pull --ff-only origin master` で `a47d468` へ
+2. `rm -rf win/Release/ rust/smooth_core/target/x86_64-pc-windows-msvc/` — キャッシュ完全破棄(偽成功回避)
+3. `msbuild win\win.sln /p:Configuration=Release /p:Platform=x64`
+4. → `win/Release/x64/smooth.aex` 393,216 bytes
+
+**3 段検証**(docs/WINDOWS_BUILD_ID_INTEGRATION.md §4 に従う):
+
+| 検証 | コマンド | 結果 |
+| --- | --- | --- |
+| 4a. バイナリサイズ | `dir win\Release\x64\smooth.aex` | 393,216 bytes(Phase 2-D と同じ、新 FFI は lib 側のみで .aex サイズは同等) |
+| 4b. FFI シンボル | `dumpbin /symbols smooth_core.lib \| findstr smooth_core_` | **6 External**: `smooth_core_{build_id, preprocess_u16, preprocess_u8, process_row_range_u16, process_row_range_u8, version}` |
+| 4c. 埋め込み build-id | `findstr /c:"0.1.0+" smooth.aex` | `0.1.0+a47d468` 検出 |
+
+> **Windows 固有の知見**: doc の §4b は `dumpbin /symbols smooth.aex` を推奨しているが、release build + LTO (`WholeProgramOptimization=true`) では FFI シンボルが caller に inline 展開され PE シンボルテーブルには残らない(返値: 0 件)。**検証は Rust staticlib (.lib) 側で行う必要がある**。`.aex` 側は埋め込み文字列(4c)と unmangled `EntryPointFunc` export(§5)で証明する。この差異は doc 改訂対象。
+
+**§5 EntryPoint export 確認**: `dumpbin /exports smooth.aex | findstr EntryPoint` → `EntryPointFunc` at RVA `0x0002EC40`(マングル無し C linkage、期待通り)。
+
+**AE 2025 実機確認**(ユーザー目視、2026-04-22 16:57 JST):
+
+| 項目 | 結果 |
+| --- | --- |
+| version mismatch エラー | なし |
+| Missing Effect エラー | なし |
+| Effect Controls に `Build: 0.1.0+a47d468` 表示 | **OK**(スクリーンショット) |
+| Build クリック → About ダイアログ開く | **OK** |
+| About に `smooth, v1.5.0` + `rust_core 0.1.0+a47d468  ffi=0x00020003` | **OK**(スクリーンショット) |
+| SHA 一致(`git rev-parse --short HEAD` = `a47d468`) | 一致 |
+| `+dirty` サフィックス | 付与なし(作業ツリークリーン) |
+
+**最終成果物**:
+
+| ファイル | サイズ | SHA256 |
+| --- | --- | --- |
+| `win/Release/x64/smooth.aex` | 393,216 bytes | `7C129EC618776D3327F65551F0A6686BF3EA3A994D9619CF27AFCEA83D9676C2` |
+| `win/release/smooth.Win.1.5.0.AE2025.x64.zip` | 200,070 bytes | `D4EBDF5F47091FB7989D964E3EB5AF66C20F6D62CF899C25BF8321B29D9AD5E4` |
+
+Phase 2-D v1.5.0 Win バイナリを更新(旧 `24FEFCFA...D01F36D1` は build-id 機能なし、偽成功チェックだけの版。新 SHA は `smooth_core_build_id()` + `PARAM_BUILD_INFO` button 付き)。
+
+**今後の運用**: 偽成功チェックは「AE で Effect Controls の `Build:` キャプションが `git rev-parse --short HEAD` と一致するか」が最短の 1 段確認。dumpbin / findstr はビルド直後の CI 的自動検証に回す。
