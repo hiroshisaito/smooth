@@ -1,7 +1,7 @@
 # Phase 2-A: GPU 対応 調査ノート
 
 開始日: 2026-04-23
-最終改訂: 2026-04-23(review round 1 反映)
+最終改訂: 2026-04-23(review round 3 反映)
 対象: smooth プラグインの GPU レンダリング対応(Phase 2-B MFR 済み、タグ `v1.5.1` リリース済の上に載せる形)
 
 **現行リポジトリのバージョン文字列基準**:
@@ -13,6 +13,7 @@
 
 - **2026-04-23 round 1 review 反映**: GPU selector を `PF_Cmd_SMART_RENDER_GPU` 前提に統一、CPU fallback 経路を legacy `PF_Cmd_RENDER` ではなく SmartRender 化後の `PF_Cmd_SMART_RENDER`(CPU)に修正、CUDA context push/pop 方針を「サンプル準拠で省略、spike で検証」に後退、once-fallen-always-fall を sequence_data 単位に一本化、Metal `waitUntilCompleted` を commit-only に統一、FLOAT_COLOR_AWARE flag を smooth の ToDo に明示追加、DX12 ステージ表矛盾修正、range UI 値域を実コードに合わせて訂正、進捗表を更新、参考実装を `SDK_Invert_ProcAmp` に確定(GP/EMP は blit hook で別物)、`.claude/` 非公開メモ依存を本文に繰り込み、GetDeviceCount の project-level 設定反映の断定を仮説化、newBufferWithLength NG の表現を「フレーム本体のみ」に限定。
 - **2026-04-23 round 2 review 反映**: once-fallen-always-fall の保存設計を **sequence_data 直接書き込みから 2 層分離に変更**(sequence_data には UUID のみ、fallen flag は plugin-global `DashMap<UUID, AtomicBool>`)、理由は SDK の render 時 sequence_data read-only 契約(AE_Effect.h L926)と `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER` の span-boundary-discard 仕様が本用途と不整合のため。永続化自己矛盾(save/load 後の再試行可否)も 2 層分離で解消。CUDA context push/pop を Item 6 側でも「spike 検証、default は SDK 準拠で省略」に統一。GetDeviceCount 由来の判定を結論部でも「第一候補 + spike 実測確認」に揃える。Item 6 §6.3 差分表の sequence_data セル、§5.8 sequence_data 節を新設計に書き直し。冒頭プラットフォーム順序節を現結論(Metal + CUDA、DX12 defer)に合わせて書き直し、当初案だった wgpu/Vulkan 抽象化も議論終了済みである旨を明記。
+- **2026-04-23 round 3 review 反映**: (1) **SEQUENCE_RESETUP で UUID を必ず再生成する方針に修正**。SDK AE_Effect.h L1094-L1113 の通り RESETUP は save/load・duplicate(複製元と複製先の両方)・in_data 変更で呼ばれ、plugin から duplicate を判別できない。以前の「flattened から UUID 復元」案では複製元と複製先が同一 UUID を共有し `GPU_FALLEN` 干渉と片側 SEQUENCE_SETDOWN による他方の sticky 状態消去が起きるため、RESETUP で常に新 UUID を振り直す形に統一。save/load 越しは `GPU_FALLEN` がプロセス境界で消えるので新 UUID でも fresh retry という意図通りの挙動になる。(2) **`PF_EffectSequenceDataSuite1` の骨子コードを実 API に訂正**。SDK ヘッダ AE_GeneralPlug.h L5713-L5718 の通り suite は `PF_GetConstSequenceData(PF_ProgPtr, PF_ConstHandle*)` 一本で、checkout/checkin ペアは存在しない。round 2 で書いていた `CheckoutConstSequenceData` / `CheckinSequenceData` 名の骨子をそのまま書くとコンパイル通らないので、`PF_ConstHandle` 受け取り → 1 段 dereference → struct cast に書き直し。(3) **§4.8 SmartRender パイプライン図の "sequence_data の gpu_fallen セット" 表記を修正**(round 2 で 2 層分離に移行したのに 1 箇所旧設計のまま残っていた)、"plugin-global DashMap<UUID, AtomicBool>(GPU_FALLEN)に fallen セット" に訂正。(4) **`SmoothSequenceData` の ABI を 2 × u64(`instance_uuid_hi`/`instance_uuid_lo`)に本 doc 全域で統一**、§4.6 冒頭で `instance_uuid: u128` になっていた箇所を §6.5 と揃えた(C 側 align と C⇄Rust FFI 互換のため 2 × u64 を採用)。
 
 ## スコープ確定
 
@@ -649,15 +650,16 @@ AE_Effect.h L926-L930 に明記:
 
 **保存構造(2 層分離)**:
 
-1. **sequence_data(read-only during render、stable per instance)**: エフェクトインスタンスの一意識別子だけを持つ
+1. **sequence_data(read-only during render、per-instance unique)**: エフェクトインスタンスの一意識別子だけを持つ
    ```rust
    #[repr(C)]
    struct SmoothSequenceData {
-       version: u32,       // schema change 検知用
-       instance_uuid: u128, // SEQUENCE_SETUP 時に生成、project save/load でも stable
+       version: u32,          // schema change 検知用
+       instance_uuid_hi: u64, // u128 を 2 × u64 に分割(C 側 align と FFI 互換のため、本 doc 全域で統一)
+       instance_uuid_lo: u64,
    }
    ```
-   SEQUENCE_FLATTEN / SEQUENCE_RESETUP / GET_FLATTENED_SEQUENCE_DATA を実装して save/load / duplicate に対応。**書き込むのは SEQUENCE_SETUP / RESETUP / CHANGED 時のみ、render 時は read-only でアクセス**(`PF_EffectSequenceDataSuite::CheckoutSequenceData` 経由)。
+   SEQUENCE_FLATTEN / SEQUENCE_RESETUP / GET_FLATTENED_SEQUENCE_DATA を実装して save/load / duplicate に対応。**書き込みは SEQUENCE_SETUP / RESETUP / CHANGED 等の main-thread 系 selector のみ、render 時は read-only でアクセス**(`PF_EffectSequenceDataSuite1::PF_GetConstSequenceData` 経由、`PF_ConstHandle` を受け取って dereference)。
 
 2. **plugin-global HashMap(in-memory、プロセス生存期間のみ)**: fallen flag を保持
    ```rust
@@ -668,12 +670,12 @@ AE_Effect.h L926-L930 に明記:
 
 **動作フロー**:
 
-- `SEQUENCE_SETUP`: UUID を新規生成、`seq.instance_uuid = new_uuid()`。`GPU_FALLEN` にはエントリを作らない(absence = not-fallen)
-- `SEQUENCE_RESETUP`(project open / duplicate): flattened data から UUID を復元。`GPU_FALLEN` に該当エントリなし → 暗黙 not-fallen → **再オープンで自動リトライ**(Medium 1 の自己矛盾が解消)
-- `SMART_RENDER_GPU` 入口: sequence_data(read-only)から UUID 取得、`GPU_FALLEN.get(&uuid)` で fallen 判定
+- `SEQUENCE_SETUP`: UUID を新規生成、`seq.instance_uuid_{hi,lo} = split(new_uuid_v4())`。`GPU_FALLEN` にはエントリを作らない(absence = not-fallen)
+- `SEQUENCE_RESETUP`(save/load 後、duplicate 後、in_data 変更後のいずれでも呼ばれる): **flattened data の UUID は参照せず、常に新 UUID を再生成して上書き**する。根拠は SDK AE_Effect.h L1094-L1099 / L1112-L1113 —「RESETUP は (1) save/load 後、(2) duplicate 後(複製元と複製先の両方で呼ばれる)、(3) in_data 変更後」の 3 経路で発生し、plugin には duplicate かどうかの判別情報が来ない。もし flattened UUID をそのまま復元すると複製元と複製先が同一 UUID を共有し、`GPU_FALLEN` エントリと `SEQUENCE_SETDOWN` の `remove(uuid)` が意図せず干渉する(片方の setdown が相手の sticky 状態を消す)。再生成方式なら duplicate 時に両者が独立した UUID を持ち、かつ `GPU_FALLEN` miss で **自動的に fresh retry** になる(save/load / duplicate / in_data 変更のいずれでも一貫した挙動、Medium 1 の自己矛盾が解消)。
+- `SMART_RENDER_GPU` 入口: sequence_data(read-only、`PF_GetConstSequenceData` 経由)から UUID 取得、`GPU_FALLEN.get(&uuid)` で fallen 判定
   - fallen の場合: CPU 経路実行、`PF_Err_NONE` return
   - そうでない場合: GPU 試行 → 失敗時 `GPU_FALLEN.entry(uuid).or_insert(AtomicBool::new(false)).store(true, Relaxed)` → CPU fallback → `PF_Err_NONE` return
-- `SEQUENCE_SETDOWN`: sequence_data(read-only OK、selector は main thread)から UUID 取得して `GPU_FALLEN.remove(&uuid)` で掃除
+- `SEQUENCE_SETDOWN`: sequence_data(read-only OK、selector は main thread)から UUID 取得して `GPU_FALLEN.remove(&uuid)` で掃除。RESETUP で UUID が再生成されているので、duplicate 後は複製元と複製先の setdown が別 key を触り衝突しない。
 
 **この設計で得られるもの**:
 
@@ -681,7 +683,7 @@ AE_Effect.h L926-L930 に明記:
 |---|---|
 | sequence_data render 時 read-only 契約の遵守 | ✓(書き込みは main-thread 系 selector でのみ) |
 | `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER` 不要 | ✓(MFR 並列度を失わない) |
-| per-effect-instance の独立性(他インスタンスに波及しない) | ✓(UUID で分離) |
+| per-effect-instance の独立性(他インスタンスに波及しない) | ✓(RESETUP 時 UUID 再生成により duplicate 後も独立) |
 | セッション/span をまたいで sticky(バッチ書き出し全体で CPU 固定) | ✓(HashMap はプロセス生存中保持、SLOWER flag の "span 境界で discard" の影響なし) |
 | プロジェクト再オープンでリトライ可能 | ✓(HashMap はプロセス再起動でクリア、UUID 復元だけでは fallen 状態を引き継がない) |
 | MFR 並列書き込み安全性 | ✓(`DashMap` 内部 shard + `AtomicBool` Relaxed store、`UUID` は stable key) |
@@ -719,7 +721,7 @@ PF_Cmd_SMART_RENDER         // CPU SmartRender(GPU 不能 / user opt-out / once-
 PF_Cmd_SMART_RENDER_GPU     // GPU SmartRender(AE が GPU device 込みで呼んでくる)
   |-- framework 別分岐(Metal / CUDA)
   |-- AllocateDeviceMemory + kernel dispatch + DisposeGPUWorld
-  |-- GPU 失敗時は sequence_data の gpu_fallen セット + CPU path 実行 + PF_Err_NONE 返却
+  |-- GPU 失敗時は plugin-global DashMap<UUID, AtomicBool>(GPU_FALLEN)に fallen セット + CPU path 実行 + PF_Err_NONE 返却
 
 PF_Cmd_RENDER                // legacy、SmartRender 非対応 AE 向けの後方互換のみ残す
 ```
@@ -970,7 +972,7 @@ Phase 2-A.3 で**sequence_data を復活させる**:
 
 | state 種別 | 保存先 | ライフタイム | 備考 |
 |---|---|---|---|
-| **instance UUID** | **sequence_data**(per-instance、AE lifecycle 管理、save/load 越しに stable) | project 生存期間(含 save/load) | SEQUENCE_SETUP で生成、SEQUENCE_FLATTEN / RESETUP で永続化 |
+| **instance UUID** | **sequence_data**(per-instance、AE lifecycle 管理) | 各 SETUP/RESETUP 区間 | **SEQUENCE_SETUP で生成、SEQUENCE_RESETUP では flattened 値を無視して必ず再生成**(duplicate で複製元と複製先が同一 UUID になるのを回避、save/load 越しは `GPU_FALLEN` がプロセス境界で消えるので新 UUID で問題ない) |
 | **compiled GPU pipeline**(MTLComputePipelineState / CUfunction) | **plugin-global `HashMap<device_index, Pipeline>`**(`dashmap` or `RwLock<HashMap>`) | プロセス生存期間 | 同プロセス内の全 instance で共有、メモリ節約 |
 | **GPU fallen flag** | **plugin-global `DashMap<UUID, AtomicBool>`** | プロセス生存期間 | §4.6 / §6.5 の 2 層分離設計、sequence_data に格納すると render 時 read-only 制約に抵触 |
 
@@ -1154,14 +1156,20 @@ SDK サンプルの CUDA は以下の build 手順:
 // → Phase 2-A.3 で以下の構造を復活、ただし中身は UUID のみ(fallen flag は含めない)
 
 struct SmoothSequenceData {
-    uint32_t version;        // 1 から開始、schema 変更時に bump
-    uint64_t instance_uuid_hi;
-    uint64_t instance_uuid_lo;  // u128 を 2 × u64 に分割(C 構造体の align 確実化)
+    uint32_t version;          // 1 から開始、schema 変更時に bump
+    uint64_t instance_uuid_hi; // §4.6 と統一(u128 を 2 × u64 に分割、C 構造体 align と FFI 互換)
+    uint64_t instance_uuid_lo;
 };
 
 // SEQUENCE_SETUP: UUID を新規生成、sequence_data に書き込む(render 前なので mutable OK)
-// SEQUENCE_RESETUP: flattened data から復元、UUID はそのまま保持(project 越しで stable)
-// SEQUENCE_FLATTEN: ほぼそのままコピー、AE が flatten 動作を呼ぶ
+// SEQUENCE_RESETUP: ★flattened data の UUID は読み捨てて必ず新 UUID を再生成する★
+//   - AE_Effect.h L1094-L1099 / L1112-L1113 の通り RESETUP は save/load・duplicate・in_data 変更
+//     の 3 経路で呼ばれ、plugin 側から duplicate かどうかは判別できない。flattened UUID を
+//     そのまま復元すると複製元と複製先が同一 UUID を共有し GPU_FALLEN と SETDOWN の remove が
+//     衝突するため、再生成方式で duplicate 安全性と "再オープン = fresh retry" を両立する。
+// SEQUENCE_FLATTEN: 構造体をそのままコピーして flat data を返す(UUID は保存されるが、
+//   RESETUP 側で無視されるので実質 placeholder。フィールドを空にしても良いが version 管理の
+//   ため struct layout は維持する)
 // GET_FLATTENED_SEQUENCE_DATA: SEQUENCE_FLATTEN と同じ構造を返す
 // SEQUENCE_SETDOWN: UUID を読み取り、Rust 側に GPU_FALLEN.remove(uuid) を通知
 ```
@@ -1219,13 +1227,22 @@ pub extern "C" fn smooth_core_sequence_setdown(uuid_hi: u64, uuid_lo: u64) {
 
 ```cpp
 // render 時の sequence_data アクセス(read-only、suite 経由)
-AEFX_SuiteScoper<PF_EffectSequenceDataSuite1> seqSuite(in_data, ...);
-const void* seq_ptr = nullptr;
-seqSuite->CheckoutConstSequenceData(in_data->effect_ref, &seq_ptr);
-const SmoothSequenceData* seq = reinterpret_cast<const SmoothSequenceData*>(seq_ptr);
+// 実 API は AE_GeneralPlug.h L5713-L5718: PF_EffectSequenceDataSuite1 は
+//   PF_GetConstSequenceData(PF_ProgPtr, PF_ConstHandle*) ただ 1 メソッド。
+//   PF_ConstHandle = const PF_ConstPtr* (= const (const void*)*) なので
+//   受け取ったら 1 段 dereference して void* を取り出す。checkout/checkin ペアは
+//   存在しないので注意(round 2 骨子に CheckoutSequenceData/CheckinSequenceData と
+//   書いていたが SDK には無く、round 3 で訂正)。
+AEFX_SuiteScoper<PF_EffectSequenceDataSuite1> seqSuite(
+    in_data, kPFEffectSequenceDataSuite, kPFEffectSequenceDataSuiteVersion1,
+    "Couldn't load sequence data suite");
+PF_ConstHandle seq_handle = nullptr;
+ERR(seqSuite->PF_GetConstSequenceData(in_data->effect_ref, &seq_handle));
+const SmoothSequenceData* seq =
+    reinterpret_cast<const SmoothSequenceData*>(*seq_handle);  // 1 段 deref
 uint64_t uuid_hi = seq->instance_uuid_hi;
 uint64_t uuid_lo = seq->instance_uuid_lo;
-seqSuite->CheckinSequenceData(in_data->effect_ref);
+// 解放は不要(handle の lifetime は AE 側が管理)
 
 // Rust 側に委譲
 int fallen = smooth_core_try_gpu_render(in_data, uuid_hi, uuid_lo, /* GPU args */);
@@ -1234,9 +1251,10 @@ int fallen = smooth_core_try_gpu_render(in_data, uuid_hi, uuid_lo, /* GPU args *
 return PF_Err_NONE;  // 常に成功返却、AE にフレーム失敗と認識させない
 ```
 
-**保存 / 永続化の扱い**(Medium 1 解消):
-- `instance_uuid` は sequence_data 経由で project save/load 越しに保持される
-- `gpu_fallen` flag は **HashMap(in-memory)のみ**、flattened data には含めない → プロセス再起動で完全クリア → user がプロジェクト再オープンすれば自動的に GPU retry される
+**保存 / 永続化の扱い**(Medium 1 解消 + round 3 duplicate 対応):
+- `instance_uuid` は **SETUP / RESETUP 区間のみの in-memory 識別子**として扱う。SEQUENCE_FLATTEN でバイト列に入ってディスクにも保存されるが、次の SEQUENCE_RESETUP 時に**必ず再生成して上書き**するので実質的に永続化されない
+- `gpu_fallen` flag は **DashMap(in-memory)のみ**、flattened data には含めない → プロセス再起動で完全クリア → user がプロジェクト再オープンすれば自動的に GPU retry される
+- duplicate(copy & paste / alt-drag): SDK は FLATTEN → 新 instance に RESETUP を発行。RESETUP で新 UUID が入るので複製元と複製先は独立な `GPU_FALLEN` key を持ち、互いの sticky 状態を踏まないし `SEQUENCE_SETDOWN` での remove も干渉しない
 - SEQUENCE_FLATTEN で「flat struct をそのままコピー」するのは `SmoothSequenceData`(UUID のみの軽い構造体)であって、fallen 状態ではない
 
 **user からのリセット方法**: 明示的リセット UI は v1.0 に入れない。AE を再起動 or プロジェクト再オープンで自動的にリセット。将来「Reset GPU state」ボタンの検討余地はあるが v1.0 scope 外。
