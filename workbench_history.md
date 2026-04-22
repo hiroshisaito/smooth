@@ -1152,3 +1152,39 @@ Phase 2-D v1.5.0 Win バイナリを更新(旧 `24FEFCFA...D01F36D1` は build-i
 **再ビルド非決定性の記録**: MSVC linker は PE header の timestamp / build GUID が非決定的で、同一ソース + 同一環境 + clean rebuild でも SHA256 が変わる。上表はユーザー目視検証を通過した 19:13 ビルドの SHA を固定値として記録(20:33 の再ビルドは `D8B46930F3A8A287366B8F0A2FEBB8C1DE304CDCC43E2F1D77274C3CA549F9AF` で挙動同一だが SHA が異なる)。再現性 CI が必要なら `/Brepro` linker flag 等での決定論化余地あり(将来課題)。
 
 **Windows Phase 2-B Step 4 クローズ**。CPU-only v1.5.0 リリース(MFR + Rust core + build-id UI)が Mac + Windows 両プラットフォームで揃った。次は Mac チームの Step 5(リリース zip / release notes / タグ確定)待ち。
+
+### 2026-04-22 21:00 JST — v1.5.0 配布ゴールド参照値(CI 基準点)
+
+Phase 2-B 完了時点の配布ゴールド SHA256 を横断参照用にまとめる。各プラットフォームの検証経緯は上の Step 3 / Step 4 エントリ参照。このセクションは CI パイプライン設計時に単独で見つけやすい位置にある「公式ゴールド」。
+
+| プラットフォーム | ファイル | サイズ | SHA256 | 検証 commit |
+| --- | --- | --- | --- | --- |
+| Windows | `win/Release/x64/smooth.aex` | 393,216 B | `825DA078FF3E18C2C305204706ED65AEF93738A397BCE6FED233593F1532C836` | `e2aeb8c` |
+| Windows | `win/release/smooth.Win.1.5.0.AE2025.x64.zip` | 200,072 B | `4D36B3415532AAD543375517CDF39FC30EDFD2BB387D705E2DFB18E3C8868CB7` | `e2aeb8c` |
+| Mac | `Mac/build/Release/smooth.plugin` バンドル | TBD | TBD | Step 5 で追記 |
+| Mac | `smooth.Mac.1.5.0.AE2025.universal.zip` | TBD | TBD | Step 5 で追記 |
+
+**Windows ビルド環境**(再現時参照):
+- Windows 10 Pro 19045.6456
+- VS2022 v143 (MSVC 19.44.35225) / Windows SDK 10.0.26100.0
+- Rust stable 1.95.0 target x86_64-pc-windows-msvc (`+crt-static`)
+
+**等価性検証手順**(SHA 不一致時、ビルド非決定性対策):
+
+同一ソース + 同一環境の clean rebuild でも MSVC linker の PE header timestamp / build GUID が変わり、Mac 側も codesign timestamp で同様の非決定性を持つ。固定 SHA を満たせない再ビルドでも以下 3 点で等価性確認可能:
+
+1. **Build caption 確認**: Effect Controls の `Build` 表示が `0.1.0+df07a80` であること
+2. **エントリポイント確認**:
+   - Windows: `dumpbin /exports smooth.aex | findstr EntryPoint` → `EntryPointFunc` 1 件 unmangled
+   - Mac: `nm smooth.plugin/Contents/MacOS/smooth | grep EntryPoint` → `_EntryPointFunc` 1 件 C linkage
+3. **3 段偽成功検証**(Phase 2-D で確立):
+   - `.aex` / `.plugin` サイズが既知ゴールドと一致(LTO 差で数 KB 振れる場合あり、±10% 以内なら許容)
+   - Rust staticlib の FFI シンボル数 = 6
+   - ELF/PE/Mach-O に `0.1.0+<SHA>` 文字列が埋め込まれている
+
+**ビルド決定論化の将来課題**:
+- Windows: `/Brepro` linker flag による timestamp 固定
+- Mac: codesign 時の `--timestamp=none` または TSA 応答の固定キャッシュ
+- Rust: `--remap-path-prefix` と固定 lockfile で path/metadata 差分も除去
+
+Phase 3 以降で CI パイプラインを組む際の検討事項として記録。
