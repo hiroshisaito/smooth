@@ -1102,3 +1102,53 @@ Phase 2-D v1.5.0 Win バイナリを更新(旧 `24FEFCFA...D01F36D1` は build-i
 - `KOJI_SMOOTH` が `Non-thread-safe effects used:` 側に一度も出ていないことが、Step 1 のスレッドセーフ監査が正しかった最終証明
 
 **Phase 2-B close 条件**: 満たした。次は Windows チーム同期 (Step 4) → CPU-only v1.5.0 リリース準備 (Step 5)。
+
+### 2026-04-22 19:13 JST — Phase 2-B Step 4: Windows 側 MFR 追従
+
+**背景**: Mac 側 Phase 2-B MFR 対応 (`42688f8` + `df07a80`) マージ後、Windows 側をクリーンリビルドで追従。Windows 固有ソース改変なし(flag 追加のみが共有ソース経由で反映)。
+
+**ビルド手順**:
+1. `git pull --ff-only origin master` で `df07a80` へ
+2. `rm -rf win/Release/ rust/smooth_core/target/x86_64-pc-windows-msvc/` で完全キャッシュ破棄
+3. `msbuild win\win.sln /p:Configuration=Release /p:Platform=x64` で再ビルド
+4. `win/Release/x64/smooth.aex` 393,216 bytes(MFR flag は PiPL / コメント差分のみなのでサイズ据え置き)
+
+**PiPL flag 同期検証**: `win/Pipl.rc` の `AE_Effect_Global_OutFlags_2` タグ `"2LGe"` の値が `142606352L` = `0x08800010` になっていることを確認。内訳:
+- bit 4 (`0x00000010`) = `I_AM_THREADSAFE`(legacy)
+- bit 23 (`0x00800000`) = `SUPPORTS_GET_FLATTENED_SEQUENCE_DATA`
+- bit 27 (`0x08000000`) = `SUPPORTS_THREADED_RENDERING`
+
+**3 段偽成功検証**: 全通過。`0.1.0+df07a80` 埋め込み、6 FFI シンボル(staticlib)、`EntryPointFunc` unmangled。
+
+**AE 2025 実機確認**(ユーザー目視):
+
+| # | 項目 | 結果 |
+|---|---|---|
+| 1 | 起動時 verification-failure ダイアログなし | PASS |
+| 2 | プロジェクト読込時も同上 | PASS |
+| 3 | エフェクトヘッダの黄色 ⚠️ アイコン | **訂正**: これは 32bpc 非対応マーク(smooth は 8/16bpc のみ)で MFR とは無関係、当初 FAIL 判定したが実質 PASS |
+| 4 | `Build: 0.1.0+df07a80` 表示 | PASS(スクリーンショット保存) |
+| 5 | レンダーログに `Thread-safe effects used: KOJI_SMOOTH` | 実質 PASS(後述) |
+| 6 | `Render threads used: N>2` | 実質 PASS(GUI プログレスバーで並列稼働観察) |
+| 7 | 基本挙動(range / line weight / white_option)の Phase 2-D golden 一致 | PASS |
+
+**Windows 固有の発見 — Multithreaded render report が GUI Render Queue ログに出ない**:
+- Mac 側 Step 3 で確認された `Multithreaded render report` ブロックは、Mac では標準 render log に含まれるが **Windows AE 25.6.5 の GUI render log (`Log = Plus Per Frame Info` 指定でも) には含まれない**
+- 実測: AfterFX.exe GUI Render Queue から出力した log file (`<output>_Log.txt`) は per-frame 時間と設定情報のみで `Thread-safe effects used:` 等のブロックは付かない
+- これが AE Windows の仕様(差分)か実装漏れかは不明
+- 代替稼働確認手段:
+  - **GUI Render Queue のプログレスバーで複数フレーム同時進行を目視**(ユーザー実施、MFR 稼働確認済)
+  - **aerender.exe 経由で render → stdout に report 出力**(手順のみ確立、実行は未)
+- 項目 5/6 は「`Non-thread-safe effects used:` に smooth が落ちていない(=ネガ信号不在)+ GUI プログレスバー並列観察」で実質 PASS 判定
+- **推奨運用**: Windows 側 MFR 回帰テスト時は aerender.exe を使うと render report block が確実に stdout に出る。GUI render log は補助資料
+
+**配布成果物(最終 v1.5.0 Win、MFR 対応版)**:
+
+| ファイル | サイズ | SHA256 |
+| --- | --- | --- |
+| `win/Release/x64/smooth.aex` | 393,216 bytes | `825DA078FF3E18C2C305204706ED65AEF93738A397BCE6FED233593F1532C836` |
+| `win/release/smooth.Win.1.5.0.AE2025.x64.zip` | 200,072 bytes | `4D36B3415532AAD543375517CDF39FC30EDFD2BB387D705E2DFB18E3C8868CB7` |
+
+**再ビルド非決定性の記録**: MSVC linker は PE header の timestamp / build GUID が非決定的で、同一ソース + 同一環境 + clean rebuild でも SHA256 が変わる。上表はユーザー目視検証を通過した 19:13 ビルドの SHA を固定値として記録(20:33 の再ビルドは `D8B46930F3A8A287366B8F0A2FEBB8C1DE304CDCC43E2F1D77274C3CA549F9AF` で挙動同一だが SHA が異なる)。再現性 CI が必要なら `/Brepro` linker flag 等での決定論化余地あり(将来課題)。
+
+**Windows Phase 2-B Step 4 クローズ**。CPU-only v1.5.0 リリース(MFR + Rust core + build-id UI)が Mac + Windows 両プラットフォームで揃った。次は Mac チームの Step 5(リリース zip / release notes / タグ確定)待ち。
