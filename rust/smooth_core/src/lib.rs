@@ -12,6 +12,9 @@ mod up_mode;
 mod down_mode;
 mod link8;
 mod process;
+// Phase 2-A.3 Sub-stage B scaffold (RFC §6.1).
+// Trait + module tree only; real Metal/CUDA dispatch arrives in Sub-stage C/E.
+mod gpu;
 
 use preprocess::{Pixel8, Pixel16, SmoothBbox, pre_process};
 use types::{BlendingInfo, Cinfo, SmoothPixel};
