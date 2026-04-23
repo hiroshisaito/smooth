@@ -15,3 +15,6 @@
 /tests/test_white_option
 /rust/smooth_core/target/
 /rust/smooth_core/Cargo.lock
+
+# Phase 2-A Sub-stage A disposable PoC (lives at ../smooth-spike-poc/, symlinked)
+/spike-poc

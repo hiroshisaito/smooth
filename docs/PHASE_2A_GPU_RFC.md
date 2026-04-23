@@ -2,7 +2,7 @@
 
 ## 0. Status / 改訂履歴
 
-- **Status**: Under Review
+- **Status**: Draft
 - **前提 doc**: [`docs/PHASE_2A_GPU_RESEARCH.md`](PHASE_2A_GPU_RESEARCH.md) @ `66a139f`(review rounds 1-5 経由で確定)
 - **対象リリース**: v1.6.0(2-A.1 + 2-A.2 + 2-A.3 を合算して 1 本のリリースとして出荷、フォールバックで v1.5.2 / v1.6.0-32bpc-only もあり得る)
 - **前段リリース**: v1.5.1(MFR + build-id UI、CPU-only、`981a795`)
@@ -10,7 +10,8 @@
 | Rev | Date | 内容 |
 |---|---|---|
 | 0.1 | 2026-04-23 | 初版 Draft(研究 doc から設計決定を移送、spike 項目を独立章に集約、Step 粒度のタスク分解) |
-| 0.2 | 2026-04-23 | external review rounds 1-2 反映済み(文言整合 fix 17 件: manifest schema 統一、v1.5.2 fallback 文脈限定、§2.6 GPU error 返却方式を §4.4 Spike 依存に格下げ、CUDA 方針 cudarc 残存除去、§4 結論記録先を該当 Sub-stage に修正、broken references 修復 等)。Status を Draft → Under Review |
+| 0.2 | 2026-04-23 | external review rounds 1-2 反映済み(文言整合 fix 17 件)。Status: Draft → Under Review |
+| 0.3 | 2026-04-24 | Sub-stage A 部分観測を §4.1 / §4.3 / §4.4 / §4.5 に追記(PoC scenario A / D / E、Mac Intel / AE 25.6.5x3)。**§4.4 採用分岐確定 = (i) device→host→device + `PF_Err_NONE`**(AE は PF_Err retry 後 job abort、OOM は user-visible dialog でブロックするため (ii) は両方とも採用不可)。§4.1 (A) Serialize 成立、§4.5 scenario A のみ観測済(B / C は残件、Sub-stage B 以降で実施可) |
 
 ## 1. Summary
 
@@ -574,6 +575,12 @@ NO の場合は **§5.1.3 Gate 4(Sub-stage F 完了時)として扱い** §5.1 F
 
 **実施タイミング**: Sub-stage A、Sub-stage C の Mac Metal 本実装より前に結論必須。
 
+**実測結果**(2026-04-24、Sub-stage A scenario A、PoC: `smooth-spike-poc/SmoothSpike.plugin` Mac Intel / AE 25.6.5x3):
+- 観測 comp: 4K 32bpc、100 frames、Fractal Noise(Evolution time*360)+ SmoothSpike 適用、Render Queue 書き出し
+- **16 thread IDs が SRG_ENTER/SRG_EXIT を発行、99 frames 分の SRG 区間で thread 間時間 overlap 0 件**
+- 結論: **合格条件 (A) Serialize**。AE は同一 plugin instance への `SMART_RENDER_GPU` を per-device で直列化。本番実装で per-device mutex / per-thread pipeline pool 不要、SDK サンプル準拠の naturally-thread-safe 構造で OK
+- 代替設計 (C) 発動条件には該当しないため、§3.3.1 の「per-call buffer + per-device read-only pipeline」構造そのままで進行可
+
 ---
 
 ### 4.4 GPU 失敗時 fallback 実装方式 + VRAM OOM + `PF_Err` 時の Render Queue 挙動(優先度: 高)
@@ -610,6 +617,23 @@ NO の場合は **§5.1.3 Gate 4(Sub-stage F 完了時)として扱い** §5.1 F
 
 **実施タイミング**: Sub-stage A、Sub-stage C より前。**優先度は 4.1 より高い**(4.1 不合格でも per-thread pipeline で吸収可能だが、4.4 不合格は fallback policy そのものが崩れて §5.1 発動の可能性を招く)。
 
+**実測結果**(2026-04-24、Sub-stage A scenario D / E、Mac Intel / AE 25.6.5x3):
+
+- **Part 2 `PF_Err_INTERNAL_STRUCT_DAMAGED` 返却時の AE 挙動**(`SPIKE_FORCE_ERROR=render`、frame%10==3 で注入):
+  - frame 3 で注入 → AE が別 thread で **retry** → 再度失敗 → **job abort + エラーダイアログ "Error Code 512"**
+  - 残り frames は rendering 途中で停止
+  - → **(ii) `PF_Err` + 次 frame CPU 固定 方式は採用不可**(AE が retry 後 abort するため Sub-stage F Render Queue 完走要求と両立不能、§3.3.3 条件 6 の前提違反)
+
+- **Part 3 `PF_Err_OUT_OF_MEMORY` 返却時の AE 挙動**(`SPIKE_FORCE_ERROR=oom`):
+  - AE は OOM を **GPU 専用エラーとして特別扱い**、GPU Effects Error dialog を表示(code 19969 系)
+  - Dialog は「Ignore / Render Effects Using Software Only」の 2 択、**user 介入必須**
+  - Ignore 選択 → 同 frame retry → 再度 error dialog → batch render 進行不能
+  - → **OOM でも (ii) 系は採用不可**(user-visible dialog がブロック、batch / aerender.exe 無人運転と両立不能)
+
+- **Part 1 device→host→device の overhead**: 本 PoC で未実装、DPU patch(C)を追加して Sub-stage A 後半 or 本実装中に計測
+
+**採用分岐 確定**: **(i) device→host→device + `PF_Err_NONE` が唯一の有効 fallback 実装方式**。本番実装で MUST 実装。overhead は実測後に本節に追記。
+
 ---
 
 ### 4.5 Render Queue 書き出しが SETUP/RESETUP 区間で完結する前提検証(優先度: 高)
@@ -638,6 +662,12 @@ NO の場合は **§5.1.3 Gate 4(Sub-stage F 完了時)として扱い** §5.1 F
 - **代替 3**: sticky を「effect instance 全寿命」に強化し、mid-batch 再試行を諦める(研究 doc round 5 で不採用とした元設計への revert)。save/load 後の retry は失われるが batch 中の安全は確保
 
 **実施タイミング**: Sub-stage A。実装方針への影響は大きくない(4.1 / 4.4 ほどの根幹影響はない)が、不合格時に §2.3 確定事項の再議論(`SDK 契約上の制約` 枠での §2 運用ルール発動)が必要になるため、Sub-stage A で決着させる。
+
+**実測結果**(2026-04-24、Sub-stage A scenario A、Mac Intel / AE 25.6.5x3):
+- Render span 約 40 秒間で `SEQ_RESETUP` 発火回数 = **0** / `SEQ_SETUP` = 1(バッチ開始前のみ)
+- **シナリオ A(素)**: 現行 policy と整合、RESETUP は batch 内で fire しない
+- シナリオ B(auto-save)/ C(並行操作)の追加観測は Sub-stage A 残件として workbench_history に記録。Sub-stage B 以降でも実施可
+- 暫定結論: **(A) 完全合格の可能性が高い**が、B / C 観測後に最終確定
 
 ---
 
@@ -695,6 +725,12 @@ NO の場合は **§5.1.3 Gate 4(Sub-stage F 完了時)として扱い** §5.1 F
 - **代替 2**: 検出源としては代替 1 を使いつつ、GPU_DEVICE_SETUP 失敗時は **backend-level の usable state** を plugin-global static に false で記録(`static GPU_BACKEND_USABLE: AtomicBool`)。PreRender は既存の条件 (e)「DEVICE_SETUP 成功」をこの state から読むだけで、追加実装は state 1 個と SETUP/SETDOWN フックのみ。**GPU_FALLEN(per-instance DashMap)には触らない**(全 instance 事前 set は instance enumeration API がなく実装不能、混同しないこと)
 
 **実施タイミング**: Sub-stage A の後半 or Sub-stage D の前半。Sub-stage C の Mac Metal 実装で PoC 用に GetDeviceCount を log しておくと追加コストゼロで並行観測可能。
+
+**実測結果**(2026-04-24、Sub-stage A scenario A、Mac Intel / AE 25.6.5x3):
+- 通常設定(Project Settings = GPU)で `GetDeviceCount = 2`、両 device `framework=2`(Metal)、`compatibleB=1`
+- H1(Software Only 反映)/ H2(driver 不良反映)/ H3(multi-GPU pruning)の比較観測は未実施(optional scenario F に相当)
+- 暫定: **(A) を前提に本番実装を進める**(GetDeviceCount > 0 を単一検出源、Software Only 時 render が CPU に自動回る AE の挙動に依存)
+- 確実性を上げるには Sub-stage D で Project Settings = Software Only シナリオ F を 1 回実施するのが望ましい。§3.3.1 代替 2 の `GPU_BACKEND_USABLE` を使えば H1 false でも実装上は吸収可能
 
 ---
 
@@ -986,7 +1022,7 @@ pub trait GpuBackend {
   - `PF_Cmd_SEQUENCE_RESETUP` のトリガ 3 経路(save/load / duplicate / in_data 変更)と thread-affinity(AE_Effect.h L1094-1099 / L1112-1113 付近)
   - `PF_Cmd_SEQUENCE_SETUP` の `GET_FLATTENED_SEQUENCE_DATA` 有効時 UI thread 限定(AE_Effect.h L1123 付近)
   - `PF_Cmd_SEQUENCE_SETDOWN` の thread-affinity 未保証(AE_Effect.h L1140 付近、記述無しで読む)
-  - `PF_EffectSequenceDataSuite1::PF_GetConstSequenceData` の read-only 契約(API 宣言は `AE_GeneralPlug.h` L5713-L5718 付近、sequence_data の render 時 read-only 要件は `AE_Effect.h` L926-930 付近)
+  - `PF_EffectSequenceDataSuite1::PF_GetConstSequenceData` の read-only 契約(AE_Effect.h L926-930 付近 + AE_EffectSuites.h)
   - `PF_OutFlag2_MUTABLE_RENDER_SEQUENCE_DATA_SLOWER` の "span of frames 境界で discard" 仕様(AE_Effect.h L1010 付近)
 - `RELEASE_NOTES-v1.5.1.md`(Phase 2-B 完了時点の contract)
 - [`workbench_history.md`](../workbench_history.md)(実装 Step ログ、Phase 2-A 着手以降の進捗 + Phase 2-B 成果物)
