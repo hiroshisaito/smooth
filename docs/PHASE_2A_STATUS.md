@@ -30,7 +30,7 @@ Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の 
 ## Phase 2-A.2 32bpc + manifest 化(5 Steps)
 
 - ✅ **Step 1**: Rust `smooth_core` f32 domain 拡張(`SmoothScalar` trait 導入、`SmoothPixel::Scalar` 関連型、`Pixel32` 追加、`smooth_core_preprocess_f32` + `smooth_core_process_row_range_f32` FFI、cargo test 15/15 PASS、既存 8/16bpc regression 非劣化 14/14)
-- ✅ **Step 2**: Effect.cpp + Pipl.r `FLOAT_COLOR_AWARE` flag(GlobalSetup + Pipl.r flags2 = 0x08801410)、`detect_pixel_format()` ヘルパで `PF_GetPixelFormat` 取得 → 3 段 bpc dispatch(8/16/32)、`smoothing<>()` を `if constexpr (sizeof==16)` で `range_f32` ブランチ化、`KP_PIXEL128` placeholder 追加、Mac Universal build SUCCEEDED、cargo 15/15 + regression 14/14×{parallel,serial} 非劣化(32bpc 実機検証は Step 5 で実施)
+- ✅ **Step 2**: Effect.cpp + Pipl.r `FLOAT_COLOR_AWARE` flag(GlobalSetup + Pipl.r flags2 = 0x08801410)、`detect_pixel_format()` ヘルパで `PF_GetPixelFormat` 取得 → 3 段 bpc dispatch(8/16/32)、`smoothing<>()` を `if constexpr (sizeof==16)` で `range_f32` ブランチ化、`KP_PIXEL128` placeholder 追加、Mac Universal build SUCCEEDED、cargo 15/15 + regression 14/14×{parallel,serial} 非劣化、**Mac AE 2025 実機 3 点確認 PASS(8/16/32bpc Comp 全て ⚠️ 無し + クラッシュ無し、2026-05-03)**。pixel-perfect 32bpc 検証(goldens 比較)は Step 4 へ
 - [ ] **Step 3**: Test harness manifest migration、v1.4.0-ae2025 backfill manifest
 - [ ] **Step 4**: 32bpc goldens capture、GitHub Release artifact、fetch_goldens.sh
 - [ ] **Step 5**: Mac + Win cross-platform 32bpc 検証、§3.2.5 gate 全 YES
