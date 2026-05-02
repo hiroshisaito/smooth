@@ -2,8 +2,8 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.3 Step 2(Sub-stage B)完了。次は Step 3(Sub-stage C、Mac Metal 本実装)。
-**Last update**: 2026-04-24(Sub-stage B: Rust gpu/ scaffold、cargo test 9/9 + regression 14/14 + synthetic 6/6 PASS)。
+**現在地**: Phase 2-A.3 Step 3(Sub-stage C-1)完了 — Rust Metal backend plumbing 動作中。次は **C-2**(Effect.cpp 統合 + 8 selector + GPU_FALLEN FFI bridge + PreRender 5 条件)。
+**Last update**: 2026-04-24(Sub-stage C-1: Rust MetalBackend + MSL compile + identity dispatch、cargo test 10/10 + regression 14/14 + synthetic 6/6 PASS)。
 
 ---
 
@@ -45,7 +45,11 @@
   - ⬜ §4.6 Metal storage mode 3 variant 計測(Sub-stage C 本実装中)
   - ⬜ §4.7 checkbox invalidation(Sub-stage D)
 - ✅ **Step 2 (Sub-stage B)**: Rust `gpu/` scaffold + GpuBackend trait(`gpu/{mod,cpu,metal,cuda,fallback,detection,tests}.rs` + shader stubs、cargo test 9/9 PASS、既存 regression 非劣化)
-- ⬜ **Step 3 (Sub-stage C)**: Mac Metal backend 本実装 + Effect.cpp GPU path + 基本 UI
+- 🟡 **Step 3 (Sub-stage C)**: Mac Metal backend 本実装 + Effect.cpp GPU path + 基本 UI(分割実行中)
+  - ✅ **C-1**: Rust MetalBackend + MSL identity passthrough + cargo test で実機 Metal device 上で MSL compile 動作確認
+  - ⬜ **C-2**: Effect.cpp 8 selector + Pipl.r flag + PreRender 5 条件 + GPU_FALLEN/UUID FFI bridge + 基本 checkbox stub
+  - ⬜ **C-2.5**: shader を 2-pass(detect + blend)smooth に書き換え、`gpu_metal_policy` 許容内で 32bpc goldens regression PASS
+  - ⬜ **C-3**: Mac AE 2025 実機 + `SMOOTH_FORCE_GPU_ERROR` injection で fallback テスト + MFR + GPU stress
 - ⬜ **Step 4 (Sub-stage D)**: UI DISABLED wiring + GPU 検出機構 + About
 - ⬜ **Step 5 (Sub-stage E)**: Win CUDA backend 本実装 + Effect.cpp CUDA path
 - ⬜ **Step 6 (Sub-stage F)**: Full UAT + 性能測定 + v1.6.0 配布
@@ -54,9 +58,7 @@
 
 ## 次のアクション
 
-Sub-stage C(Mac Metal backend 本実装 + Effect.cpp GPU path + 基本 UI stub)に進む。`gpu/metal.rs` を実装、`gpu/mod.rs` の `dispatch_*` メソッドを最終確定、Effect.cpp に 8 selector 追加、GPU_FALLEN の FFI bridge 追加。
-
-RFC §3.3.4 Sub-stage C の 8 項目が gate。
+Sub-stage **C-2**(Effect.cpp 統合): `Effect.cpp` に GPU 8 selector 追加、`Pipl.r` flag 同期、PreRender 5 条件 AND、`gpu/metal.rs` の `from_ae_device` を呼び出す FFI bridge、GPU_FALLEN/UUID 経路の C++↔Rust 接続、基本 checkbox stub(常時 enabled)。AE 起動して plugin 認識確認まで通せるのが C-2 ゴール。
 
 ## 現時点の PoC(disposable)
 

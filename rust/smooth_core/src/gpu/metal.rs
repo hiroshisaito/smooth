@@ -1,33 +1,184 @@
-// Mac Metal backend — stub for Sub-stage B. Real `metal-rs` / `objc2-metal`
-// bindings, MSL library load, and compute pipeline wiring land in Sub-stage C.
+// Mac Metal backend (Sub-stage C-1: plumbing only — identity dispatch).
 //
-// Compiled only on macOS. Present here so the module tree, `GpuBackend` trait
-// impl, and dispatch glue are in place before Sub-stage C's Metal code arrives.
+// Real 2-pass smooth (detect + blend) lands in Sub-stage C-2 once this
+// plumbing has been validated end-to-end. The shader currently runs an
+// identity pass-through so we can verify:
+//   - device pointer wrap from AE's PF_GPUDeviceInfo round-trips
+//   - MSL `newLibraryWithSource` compile path works
+//   - compute pipeline + command buffer + commit reach the GPU and return
+//   - finish_frame consumes ctx without leaking command buffers
+//
+// RFC §3.3.6 invariants enforced here:
+//   - commandBuffer.commit only — no waitUntilCompleted (AE synchronises)
+//   - per-call command buffer / encoder lives in FrameContext, not on &self
+//   - &self holds only the read-only library + pipeline (built at SETUP)
 
 use super::{FrameContext, GpuBackend, GpuError};
 
+use std::ffi::c_void;
+
+use metal::{
+    CommandBufferRef, CommandQueue, ComputePipelineState, Device, Library, MTLSize,
+};
+use objc::rc::autoreleasepool;
+
+/// Inline MSL source for the Sub-stage C-1 identity kernel. Sub-stage C-2
+/// replaces this with the 2-pass detect + blend implementation.
+const SMOOTH_MSL: &str = include_str!("shaders/smooth.metal");
+
+/// Per-device read-only state. Created once in `from_ae_device()` (called
+/// from Effect.cpp's GPU_DEVICE_SETUP), reused for the device's lifetime.
 pub struct MetalBackend {
-    // Placeholder; Sub-stage C will add: device, command_queue (AE-provided,
-    // non-owning), pipeline (built in GPU_DEVICE_SETUP from embedded MSL).
+    device: Device,
+    queue: CommandQueue,
+    pipeline_passthrough: ComputePipelineState,
+    // Sub-stage C-2 will add: pipeline_detect, pipeline_blend.
 }
 
+unsafe impl Send for MetalBackend {}
+unsafe impl Sync for MetalBackend {}
+
 impl MetalBackend {
-    /// Stubbed out — Sub-stage C wires this to AE's `PF_GPUDeviceInfo` via
-    /// FFI from Effect.cpp's GPU_DEVICE_SETUP handler.
-    pub fn from_ae_device(_device_ptr: *mut std::ffi::c_void,
-                          _queue_ptr: *mut std::ffi::c_void)
-        -> Result<Self, GpuError>
-    {
-        Err(GpuError::NotAvailable)
+    /// Wrap AE-provided device + command queue raw pointers. Both pointers
+    /// are owned by AE; we hold non-owning references via metal-rs's
+    /// `Device` / `CommandQueue` (which use Objective-C ARC to retain the
+    /// underlying objects for our lifetime).
+    ///
+    /// # Safety
+    /// `device_ptr` must point to a valid `id<MTLDevice>` for the lifetime
+    /// of the returned `MetalBackend`. `queue_ptr` likewise for
+    /// `id<MTLCommandQueue>`. AE's contract guarantees this for the span
+    /// between `GPU_DEVICE_SETUP` and `GPU_DEVICE_SETDOWN`.
+    pub unsafe fn from_ae_device(
+        device_ptr: *mut c_void,
+        queue_ptr: *mut c_void,
+    ) -> Result<Self, GpuError> {
+        if device_ptr.is_null() || queue_ptr.is_null() {
+            return Err(GpuError::NotAvailable);
+        }
+        // metal-rs's `Device` / `CommandQueue` wrap the raw Objective-C ids
+        // and retain them on construction.
+        let device: Device =
+            std::mem::transmute::<*mut c_void, &metal::DeviceRef>(device_ptr).to_owned();
+        let queue: CommandQueue =
+            std::mem::transmute::<*mut c_void, &metal::CommandQueueRef>(queue_ptr).to_owned();
+
+        autoreleasepool(|| {
+            let library: Library = device
+                .new_library_with_source(SMOOTH_MSL, &metal::CompileOptions::new())
+                .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
+            let function = library
+                .get_function("smooth_passthrough", None)
+                .map_err(|e| GpuError::DeviceSetup(format!("get fn smooth_passthrough: {e}")))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|e| GpuError::DeviceSetup(format!("pipeline: {e}")))?;
+
+            Ok(MetalBackend {
+                device,
+                queue,
+                pipeline_passthrough: pipeline,
+            })
+        })
+    }
+
+    /// Construct a MetalBackend from the system default device. Test-only
+    /// path so unit tests can run on the development host without AE.
+    #[cfg(test)]
+    pub fn for_test() -> Result<Self, GpuError> {
+        let device = Device::system_default().ok_or(GpuError::NotAvailable)?;
+        let queue = device.new_command_queue();
+        autoreleasepool(|| {
+            let library = device
+                .new_library_with_source(SMOOTH_MSL, &metal::CompileOptions::new())
+                .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
+            let function = library
+                .get_function("smooth_passthrough", None)
+                .map_err(|e| GpuError::DeviceSetup(format!("get fn: {e}")))?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(|e| GpuError::DeviceSetup(format!("pipeline: {e}")))?;
+            Ok(MetalBackend {
+                device,
+                queue,
+                pipeline_passthrough: pipeline,
+            })
+        })
+    }
+
+    /// Sub-stage C-1 dispatch: identity passthrough. Both buffers must hold
+    /// `width * height` BGRA128 (4×f32) pixels. `src_pitch_pixels` /
+    /// `dst_pitch_pixels` are pitches in **pixels**, not bytes (matches
+    /// MSL kernel signature; matches what AE provides via
+    /// `rowbytes / 16`).
+    ///
+    /// Sub-stage C-2 will add `dispatch_smooth` for the real algorithm.
+    pub fn dispatch_passthrough(
+        &self,
+        ctx: &mut FrameContext,
+        src_buffer_ptr: *mut c_void,
+        dst_buffer_ptr: *mut c_void,
+        src_pitch_pixels: u32,
+        dst_pitch_pixels: u32,
+        width: u32,
+        height: u32,
+    ) -> Result<(), GpuError> {
+        if src_buffer_ptr.is_null() || dst_buffer_ptr.is_null() {
+            return Err(GpuError::Dispatch("null buffer".into()));
+        }
+        if width == 0 || height == 0 {
+            return Err(GpuError::Dispatch("zero extent".into()));
+        }
+        // FrameContext is unused for now; will hold per-call MTLBuffer
+        // wrappers + intermediate allocations in Sub-stage C-2.
+        let _ = &ctx.scratch;
+
+        autoreleasepool(|| -> Result<(), GpuError> {
+            let cb: &CommandBufferRef = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pipeline_passthrough);
+
+            // Bind src / dst buffers from raw pointers (AE-owned MTLBuffer).
+            let src = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(src_buffer_ptr)
+            };
+            let dst = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buffer_ptr)
+            };
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &width as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
+
+            let group = MTLSize::new(16, 16, 1);
+            let groups = MTLSize::new(
+                ((width + 15) / 16) as u64,
+                ((height + 15) / 16) as u64,
+                1,
+            );
+            enc.dispatch_thread_groups(groups, group);
+            enc.end_encoding();
+            cb.commit();
+            // RFC §3.3.6: NO waitUntilCompleted. AE handles synchronisation.
+
+            // Surface command-buffer-level errors that surfaced before commit.
+            // We can't poll status without waiting; AE will report any
+            // GPU-side faults via SDK callbacks.
+            Ok(())
+        })
     }
 }
 
 impl GpuBackend for MetalBackend {
     fn begin_frame(&self) -> Result<FrameContext, GpuError> {
-        Err(GpuError::NotAvailable)
+        Ok(FrameContext::default())
     }
     fn finish_frame(&self, _ctx: FrameContext) -> Result<(), GpuError> {
-        Err(GpuError::NotAvailable)
+        // The command buffer was committed inside dispatch_*. AE owns post-
+        // commit synchronisation; nothing to do here for Sub-stage C-1.
+        Ok(())
     }
     fn name(&self) -> &'static str { "metal" }
 }

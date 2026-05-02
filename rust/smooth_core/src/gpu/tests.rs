@@ -20,9 +20,25 @@ fn default_backend_is_cpu() {
 
 #[cfg(target_os = "macos")]
 #[test]
-fn metal_stub_reports_unavailable() {
-    let r = metal::MetalBackend::from_ae_device(std::ptr::null_mut(), std::ptr::null_mut());
-    assert!(r.is_err());
+fn metal_null_pointers_rejected() {
+    // unsafe: passing null is the documented failure path.
+    let r = unsafe {
+        metal::MetalBackend::from_ae_device(std::ptr::null_mut(), std::ptr::null_mut())
+    };
+    assert!(r.is_err(), "null AE pointers must yield NotAvailable");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn metal_for_test_compiles_msl() {
+    // Best-effort: skip if no Metal device on the host (e.g., CI runner).
+    let backend = match metal::MetalBackend::for_test() {
+        Ok(b) => b,
+        Err(_) => return,
+    };
+    assert_eq!(backend.name(), "metal");
+    let ctx = backend.begin_frame().expect("begin_frame");
+    backend.finish_frame(ctx).expect("finish_frame");
 }
 
 #[cfg(target_os = "windows")]

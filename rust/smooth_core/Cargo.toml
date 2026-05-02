@@ -9,10 +9,16 @@ crate-type = ["staticlib"]
 
 [dependencies]
 rayon     = "1"
-# GPU scaffold (Sub-stage B). Real Metal / CUDA crates come in Sub-stage C/E.
+# GPU scaffold (Sub-stage B / C). Real Metal crate added below for macOS.
 dashmap   = "6"
 once_cell = "1"
 thiserror = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# Sub-stage C: Metal backend (real bindings).
+metal = "0.27"
+objc  = "0.2"
+foreign-types = "0.5"
 
 [profile.release]
 opt-level   = 3
