@@ -1,0 +1,274 @@
+# Phase 2-A.2 Step 3: backfill manifest for the v1.4.0-ae2025 goldens.
+#
+# Schema is documented in docs/PHASE_2A_GPU_RFC.md §3.2.6. Format is TOML
+# (parseable from Python 3.11+ via stdlib `tomllib`).
+#
+# The .raw fixture files referenced below are NOT committed to git
+# (.gitignore keeps them out — see RFC §3.2.5 sizing rationale). Use
+# tests/fetch_goldens.sh to populate this directory or to verify SHA256
+# of locally-staged files. The artifact_url field is empty until Step 4
+# uploads tar.zst to a GitHub Release; until then, fetch_goldens.sh runs
+# only the integrity-check half of its job.
+
+schema_version = 1
+
+[suite]
+name = "v1.4.0-ae2025"
+description = "smooth-mod v1.4.0 8/16bpc reference goldens captured on Mac AE 2025."
+capture_source_platform = "macOS / AE 2025 (25.6_61 SDK)"
+capture_date = "2026-04-21"
+smooth_version = "1.4.0"
+ae_version = "25.6"
+sdk_version = "25.6_61"
+artifact_url = ""      # Step 4 fills this with the GitHub Release asset URL.
+artifact_sha256 = ""   # Step 4 fills this with the tar.zst SHA256.
+
+# Mac CPU reference: bit-identical except where overridden per-frame.
+[suite.mac_reference_policy]
+kind = "identical"
+
+# Mac <-> Win cross-platform tolerance for 8/16bpc integer domain.
+# This policy mirrors the historical hardcoded rule in regression_test.cpp
+# (`diff < 0.01% && max_abs <= 32`). Step 4+ harness will read this from
+# the manifest instead of hardcoding it.
+[suite.cross_platform_policy]
+kind = "near-id"
+metric = "byte_abs"
+max_abs = 32
+max_diff_pct = 0.01
+
+[[frames]]
+n = 0
+width  = 64
+height = 64
+bpc    = 8
+rowbytes = 256
+range  = 10
+line_weight = 0.5
+white  = false
+in_file  = "frame_0000_in.raw"
+out_file = "frame_0000_out.raw"
+in_sha256  = "0200ce4f2821aa80ccdfd3cda7b87fe25fd3348078a1b9e2065632490e4a53d9"
+out_sha256 = "3a3de5337ab5fe8713117284075956d692b287b69cf16c082dcc8d1ff87a9aca"
+in_size  = 16448
+out_size = 16448
+
+[[frames]]
+n = 10
+width  = 64
+height = 64
+bpc    = 8
+rowbytes = 256
+range  = 10
+line_weight = 0.71
+white  = false
+in_file  = "frame_0010_in.raw"
+out_file = "frame_0010_out.raw"
+in_sha256  = "5c39f2c9939da4c0dc53412a2cf225e324ed8a2ba79c2f0b78ba438c9af4a769"
+out_sha256 = "ba45553f644204db02b8560b74ddded0520e40c6ad27c322049b152689376dcf"
+in_size  = 16448
+out_size = 16448
+
+[[frames]]
+n = 47
+width  = 64
+height = 64
+bpc    = 8
+rowbytes = 256
+range  = 10
+line_weight = 0.73
+white  = true
+in_file  = "frame_0047_in.raw"
+out_file = "frame_0047_out.raw"
+in_sha256  = "686430c943c27383366361c1f9fe53f72ce8316fd109e79ab4fb84b975601615"
+out_sha256 = "6264738422f3af83a9984181721fcf32f6e73fd27dc462622854307563c362f0"
+in_size  = 16448
+out_size = 16448
+
+[[frames]]
+n = 50
+width  = 64
+height = 64
+bpc    = 8
+rowbytes = 256
+range  = 57
+line_weight = 0.73
+white  = false
+in_file  = "frame_0050_in.raw"
+out_file = "frame_0050_out.raw"
+in_sha256  = "49365374d33d2e131928af23406fca8df7611ef4a8eb094e04a5e7283e08e362"
+out_sha256 = "5f9563a7c98429987630ef762668e26e0f45b4565146387bccc79cf70cdf5978"
+in_size  = 16448
+out_size = 16448
+
+[[frames]]
+n = 100
+width  = 64
+height = 64
+bpc    = 8
+rowbytes = 256
+range  = 27
+line_weight = 0.73
+white  = false
+in_file  = "frame_0100_in.raw"
+out_file = "frame_0100_out.raw"
+in_sha256  = "b20c46c12c0e0420a4771ec22f0fb5773020c091b3ce594c88031a53fe428e57"
+out_sha256 = "d40650a5bb7447abeb43744c627aea638e7d9dcac25512317438d397ad77e5e1"
+in_size  = 16448
+out_size = 16448
+
+[[frames]]
+n = 135
+width  = 2512
+height = 1412
+bpc    = 8
+rowbytes = 10048
+range  = 10
+line_weight = 0.5
+white  = false
+in_file  = "frame_0135_in.raw"
+out_file = "frame_0135_out.raw"
+in_sha256  = "b272ed61d3d186c10b56d1ee2f42f28ccfce2ffeb6a6c0fa0f15a32724c5063a"
+out_sha256 = "bb7ad7f9c8aa1fa10a2993892c3ea1abedf7211285fcdf86c014cf17905c640a"
+in_size  = 14187840
+out_size = 14187840
+
+# frame 135 — Phase 1 baseline NEAR-ID continuity exception.
+# Observed in regression: 30/14187776 bytes diff, max_abs=23 (Phase 1
+# rayon strip-parallel boundary residual, intentionally preserved).
+# Headroom set to max_abs=32 / max_diff_pct=0.01 to match the
+# historical hardcoded threshold; tightening would risk false fails.
+[frames.policy_overrides.mac_reference_policy]
+kind = "near-id"
+metric = "byte_abs"
+max_abs = 32
+max_diff_pct = 0.01
+
+[[frames]]
+n = 200
+width  = 3840
+height = 2160
+bpc    = 8
+rowbytes = 15360
+range  = 12
+line_weight = 0.535057
+white  = false
+in_file  = "frame_0200_in.raw"
+out_file = "frame_0200_out.raw"
+in_sha256  = "df218fc7d816340e3fa8e42de9d0a7d21422282a7207d1e5809d65d3c47881d8"
+out_sha256 = "345efc5b5e1eb9b3df511879fabe9af4bf0ba299823dfed5f159932964078d96"
+in_size  = 33177664
+out_size = 33177664
+
+[[frames]]
+n = 500
+width  = 3840
+height = 2160
+bpc    = 16
+rowbytes = 30720
+range  = 2278
+line_weight = 0.641954
+white  = false
+in_file  = "frame_0500_in.raw"
+out_file = "frame_0500_out.raw"
+in_sha256  = "286a2649553f7bf6f002c475f2b9ad7e76e7d56adc1e3d63e003b8b482ab9a84"
+out_sha256 = "30714ad214e997eb22b7b0580cb837b43e407451cb2e09eeaca6a19609b76c61"
+in_size  = 66355264
+out_size = 66355264
+
+[[frames]]
+n = 700
+width  = 3840
+height = 2160
+bpc    = 16
+rowbytes = 30720
+range  = 3061
+line_weight = 0.756897
+white  = false
+in_file  = "frame_0700_in.raw"
+out_file = "frame_0700_out.raw"
+in_sha256  = "7f82add73863f1c1126f847e07280063c3bfd926b7d388e5bf61a33710feb46a"
+out_sha256 = "75ad66038a715460bb3cd054866507cf8d4d3e47262f18994ff79a6e8fb1aae5"
+in_size  = 66355264
+out_size = 66355264
+
+[[frames]]
+n = 1000
+width  = 1920
+height = 1080
+bpc    = 16
+rowbytes = 15360
+range  = 2410
+line_weight = 0.504023
+white  = false
+in_file  = "frame_1000_in.raw"
+out_file = "frame_1000_out.raw"
+in_sha256  = "5889b72d0ebfda43af75672037f0ebbf11c570571b48e96ef4924ba02de7d584"
+out_sha256 = "b5aafb5579b845b05b94844e592698e5b9b3d5ace5d3d28ee9401ab3b1758c0c"
+in_size  = 16588864
+out_size = 16588864
+
+[[frames]]
+n = 1300
+width  = 1920
+height = 1080
+bpc    = 16
+rowbytes = 15360
+range  = 5731
+line_weight = 0.516172
+white  = false
+in_file  = "frame_1300_in.raw"
+out_file = "frame_1300_out.raw"
+in_sha256  = "6300a2e68de260613b9efbabeadcdd17b2ac9f819def36ffa59bc55cd504eeeb"
+out_sha256 = "06eb57157bb972131892515a84ea1d0e468c45f39f468175e86c9eac08a2d3c7"
+in_size  = 16588864
+out_size = 16588864
+
+[[frames]]
+n = 1500
+width  = 1920
+height = 1080
+bpc    = 16
+rowbytes = 15360
+range  = 7931
+line_weight = 0.524218
+white  = false
+in_file  = "frame_1500_in.raw"
+out_file = "frame_1500_out.raw"
+in_sha256  = "34a13facf1e27c0caa93f65688243d79e2721ba6072b95f42927bb45fab1ef28"
+out_sha256 = "437c0fa2d78fef69b0c57990ab5111e53c0eedb6a77b7e83d85a82586f813189"
+in_size  = 16588864
+out_size = 16588864
+
+[[frames]]
+n = 1700
+width  = 1920
+height = 1080
+bpc    = 16
+rowbytes = 15360
+range  = 10131
+line_weight = 0.532264
+white  = false
+in_file  = "frame_1700_in.raw"
+out_file = "frame_1700_out.raw"
+in_sha256  = "88c6527cc6aa4b5721e5e45e6230d8addd3fe29b300ef7c3764b62dfc03f83f2"
+out_sha256 = "06892b42b73cd50f9c45a9564b56cf8819c7f8509e7cc1d4634b2d7a083c4100"
+in_size  = 16588864
+out_size = 16588864
+
+[[frames]]
+n = 1767
+width  = 1920
+height = 1080
+bpc    = 16
+rowbytes = 15360
+range  = 10867
+line_weight = 0.53496
+white  = false
+in_file  = "frame_1767_in.raw"
+out_file = "frame_1767_out.raw"
+in_sha256  = "2b9d2f6277a4c7f0214cfa64aa070bb9b9aa6363276b1358ca177489c819c6f0"
+out_sha256 = "efb58f69a179011db718e3da12250a148300a76b0dff7fc8fee88cb422c31a8e"
+in_size  = 16588864
+out_size = 16588864
+

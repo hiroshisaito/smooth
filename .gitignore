@@ -10,9 +10,19 @@
 /Mac/release/
 /.claude/
 /tests/.venv/
-/tests/goldens/
 /tests/regression_test
 /tests/test_white_option
+
+# Phase 2-A.2 Step 3: goldens are NOT committed (502 MB+ per suite — see
+# docs/PHASE_2A_GPU_RFC.md §3.2.5 sizing rationale). Layout: keep the parent
+# tracked, ignore everything inside, then carve back out the per-suite
+# manifest files. The unignore order matters — Git does not descend into a
+# fully-ignored parent, so the parent + per-suite directories must be
+# explicitly unignored before the manifest pattern can take effect.
+!/tests/goldens/
+/tests/goldens/**
+!/tests/goldens/*/
+!/tests/goldens/*/manifest.toml
 /rust/smooth_core/target/
 /rust/smooth_core/Cargo.lock
 

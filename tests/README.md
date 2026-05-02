@@ -1,12 +1,15 @@
-# smooth-mod-v1.5.0 Regression & Benchmark Tests
+# smooth-mod Regression & Benchmark Tests
 
 ## Ingredients
 
 - `fixtures/*.png` — generated pixel-art test images (see `gen_test_images.py`)
-- `goldens/` — reference `.raw` dumps captured from baseline build
+- `goldens/<suite>/manifest.toml` — committed metadata + per-file SHA256 for each suite (e.g. `v1.4.0-ae2025`)
+- `goldens/<suite>/*.raw` — reference SMDP dumps; **not committed** (size); fetched via `fetch_goldens.sh` once Step 4 uploads tar.zst
 - `.venv/` — local Python env (Pillow only) — gitignored
 - `gen_test_images.py` — regenerate fixtures
 - `compare_raw.py` — pixel-diff two SMDP raw dumps (added on first use)
+- `fetch_goldens.sh` — manifest-driven SHA256 verifier + (Step 4+) artifact downloader
+- `run_regression.sh` — manifest-driven regression runner
 
 ## Baseline capture procedure (manual, one-off per baseline)
 
@@ -50,19 +53,23 @@
 
 7. Record the mapping (fixture → frame index) in `goldens/v1.4.0-ae2025/index.md`.
 
+8. Regenerate `manifest.toml` (per-frame SHA256 + SMDP header backfill). Inline Python OK; see commit `feat(phase-2a): Phase 2-A.2 Step 3` for the script body if you need the canonical version.
+
 ## Regression check (after modifications)
 
-- Re-run the bench build with the modified source
-- Same AE comp, same params, same order → new `/tmp/smooth_bench/` dumps
-- Diff against `goldens/v1.4.0-ae2025/`:
-
-  ```sh
-  python3 tests/compare_raw.py tests/goldens/v1.4.0-ae2025/frame_0000_out.raw /tmp/smooth_bench/frame_0000_out.raw
-  ```
-
+- Single command: `tests/run_regression.sh` (manifest-driven; iterates every suite under `tests/goldens/<suite>/manifest.toml`).
+  - Set `SMOOTH_PARALLEL=0` to test the serial path; `SMOOTH_PARALLEL=1` (default) tests the rayon parallel path.
+  - Verifies SHA256 of every fixture against the manifest before running, so a corrupted .raw is caught up front.
+- Want to spot-check one suite: `tests/run_regression.sh v1.4.0-ae2025`.
+- Want to verify integrity only (no build/run): `tests/fetch_goldens.sh [suite]`.
+- Manual single-frame diff: `python3 tests/compare_raw.py tests/goldens/v1.4.0-ae2025/frame_0000_out.raw /tmp/smooth_bench/frame_0000_out.raw`.
 - Timing comparison: compare `timing.log` line by line, expect only `ms=` to change.
 
 ## Raw file format (`SMDP`)
 
-64-byte header followed by `rowbytes * height` bytes of pixels (ARGB, 8 or 16 bpc).
+64-byte header followed by `rowbytes * height` bytes of pixels (ARGB, 8 / 16 / 32 bpc; 32bpc lands in Phase 2-A.2 Step 4).
 See `bench.h` `DumpHeader` for the exact layout.
+
+## Manifest schema (`tests/goldens/<suite>/manifest.toml`)
+
+Documented in `docs/PHASE_2A_GPU_RFC.md` §3.2.6. Two policy slots — `mac_reference_policy` (Mac CPU bit-for-bit) vs `cross_platform_policy` (Mac↔Win tolerance) — kept separate so a near-ID exception for one doesn't accidentally relax the other. Per-frame `policy_overrides` exists for cases like frame 135 (Phase 1 strip-parallel boundary residual). Future 32bpc suite adds an `f32_abs` metric variant.
