@@ -2,8 +2,11 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.3 Step 3(Sub-stage C-1)完了 — Rust Metal backend plumbing 動作中。次は **C-2**(Effect.cpp 統合 + 8 selector + GPU_FALLEN FFI bridge + PreRender 5 条件)。
-**Last update**: 2026-04-24(Sub-stage C-1: Rust MetalBackend + MSL compile + identity dispatch、cargo test 10/10 + regression 14/14 + synthetic 6/6 PASS)。
+**現在地**: Phase 2-A.1 Step 1 完了(local gate)— Effect.cpp + Pipl.r に SmartRender 経路追加、CPU regression 非劣化確認。次は **Phase 2-A.1 Step 2**(Mac + Win AE 2025 実機検証)。
+
+なお Phase 2-A.3 Sub-stage A / B / C-1 は先行で Rust 側のみ完了済(Effect.cpp 統合は 2-A.1 / 2-A.2 後に Sub-stage C-2 として実施)。
+
+**Last update**: 2026-05-03(2-A.1 Step 1: Effect.cpp に SmartPreRender / SmartRender 実装、smoothing<>() を SmartRenderInfo ベースに refactor、Pipl.r flags2 を 0x08800010 → 0x08800410 に同期)。
 
 ---
 
@@ -20,8 +23,8 @@
 
 ## Phase 2-A.1 SmartRender 経路追加(2 Steps)
 
-- [ ] **Step 1**: Effect.cpp + Pipl.r に SmartRender handlers + flag、local regression PASS
-- [ ] **Step 2**: Mac + Win AE 実機検証、§3.1.5 gate 全 YES
+- ✅ **Step 1**: Effect.cpp + Pipl.r に SmartRender handlers + `SUPPORTS_SMART_RENDER` flag(GlobalSetup + Pipl.r flags2 = 0x08800410)、`smoothing<>()` を SmartRenderInfo ベースに refactor、Mac universal build SUCCEEDED、cargo test 10/10、regression `SMOOTH_PARALLEL=1/0` 両方で 14/14 + synthetic 6/6 PASS
+- [ ] **Step 2**: Mac + Win AE 2025 実機検証(§3.1.4 Step 2-4)、debug-only instrumentation で SmartRender 経路到達確認、§3.1.5 gate 全 YES
 
 ## Phase 2-A.2 32bpc + manifest 化(5 Steps)
 
@@ -58,7 +61,14 @@
 
 ## 次のアクション
 
-Sub-stage **C-2**(Effect.cpp 統合): `Effect.cpp` に GPU 8 selector 追加、`Pipl.r` flag 同期、PreRender 5 条件 AND、`gpu/metal.rs` の `from_ae_device` を呼び出す FFI bridge、GPU_FALLEN/UUID 経路の C++↔Rust 接続、基本 checkbox stub(常時 enabled)。AE 起動して plugin 認識確認まで通せるのが C-2 ゴール。
+**Phase 2-A.1 Step 2**: Mac + Win AE 2025 実機検証。
+
+- Mac: `Mac/build/Release/smooth.plugin` を AE プラグインフォルダに配置、v1.5.1 UAT プロジェクトで 8bpc + 16bpc Render Queue 書き出し、Render log に Multithreaded render report が出ること、画質が v1.5.1 と視覚上無差別、SmartRender 経路が呼ばれることを debug-only instrumentation で確認(merge 前に削除)
+- Win: 同上、aerender.exe stdout で Thread-safe / Render threads used 行確認
+
+§3.1.5 gate 全 YES なら 2-A.1 close → Phase 2-A.2(32bpc + manifest 化)へ。
+
+その後の流れ: 2-A.2 → Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)。
 
 ## 現時点の PoC(disposable)
 

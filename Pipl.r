@@ -58,7 +58,12 @@ resource 'PiPL' (16000) {
 			0x2000800
 		},
 		AE_Effect_Global_OutFlags_2 {
-			0x08800010 /* I_AM_THREADSAFE (bit 4 = 0x10) | SUPPORTS_GET_FLATTENED_SEQUENCE_DATA (bit 23 = 0x00800000) | SUPPORTS_THREADED_RENDERING (bit 27 = 0x08000000); must match Effect.cpp GlobalSetup out_flags2 */
+			/* Phase 2-A.1: SUPPORTS_SMART_RENDER (bit 10 = 0x400) added.
+			   I_AM_THREADSAFE (bit 4 = 0x10) | SUPPORTS_SMART_RENDER (bit 10 = 0x400)
+			   | SUPPORTS_GET_FLATTENED_SEQUENCE_DATA (bit 23 = 0x00800000)
+			   | SUPPORTS_THREADED_RENDERING (bit 27 = 0x08000000)
+			   = 0x08800410. Must match Effect.cpp GlobalSetup out_flags2. */
+			0x08800410
 		},
 		/* [11] */
 		AE_Effect_Match_Name {

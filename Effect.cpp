@@ -37,6 +37,16 @@ enum
     PARAM_NUM,
 };
 
+// Phase 2-A.1: SmartRender が PreRender → Render の 2 段階になるため、
+// 非 layer params の値を PreRender 時点で snapshot してから Render に渡す。
+// pre_render_data は AE が delete_pre_render_data_func 経由で解放する。
+struct SmartRenderInfo
+{
+    double range;          // PARAM_RANGE.fs_d.value
+    double line_weight;    // PARAM_LINE_WEIGHT.fs_d.value
+    bool   white_option;   // PARAM_WHITE_OPTION.bd.value
+};
+
 //---------------------------------------------------------------------------//
 // プロトタイプ
 static PF_Err About (   PF_InData       *in_data,
@@ -68,6 +78,17 @@ static PF_Err PopDialog (PF_InData		*in_data,
 						 PF_OutData		*out_data,
 						 PF_ParamDef		*params[],
 						 PF_LayerDef		*output );
+
+// Phase 2-A.1: SmartRender 三本化(legacy PF_Cmd_RENDER は維持、追加で
+// PF_Cmd_SMART_PRE_RENDER / PF_Cmd_SMART_RENDER を実装)。GPU 経路
+// (PF_Cmd_SMART_RENDER_GPU)は Phase 2-A.3 で追加。
+static PF_Err SmartPreRender(PF_InData         *in_data,
+                             PF_OutData        *out_data,
+                             PF_PreRenderExtra *extraP);
+
+static PF_Err SmartRender(PF_InData            *in_data,
+                          PF_OutData           *out_data,
+                          PF_SmartRenderExtra  *extraP);
 
 
 //---------------------------------------------------------------------------//
@@ -292,11 +313,19 @@ PF_Err EntryPointFunc(    PF_Cmd          cmd,
                 break;
 
 
-            case PF_Cmd_RENDER:             // レンダリング
+            case PF_Cmd_RENDER:             // レンダリング(legacy、SmartRender 非対応 AE 向け)
                 err = Render(   in_data,
                                 out_data,
                                 params,
                                 output);
+                break;
+
+            case PF_Cmd_SMART_PRE_RENDER:   // Phase 2-A.1: SmartRender 入口
+                err = SmartPreRender(in_data, out_data, (PF_PreRenderExtra*)extra);
+                break;
+
+            case PF_Cmd_SMART_RENDER:       // Phase 2-A.1: CPU SmartRender
+                err = SmartRender(in_data, out_data, (PF_SmartRenderExtra*)extra);
                 break;
 
 			case PF_Cmd_DO_DIALOG:
@@ -407,9 +436,14 @@ static PF_Err GlobalSetup ( PF_InData       *in_data,
     //   failure の error dialog が出る)。本 plugin は sequence_data を使っていない
     //   ため、PF_Cmd_GET_FLATTENED_SEQUENCE_DATA ハンドラは未実装 = AE が NULL を
     //   受けて問題なし。
+    // PF_OutFlag2_SUPPORTS_SMART_RENDER (bit 10 = 0x400):
+    //   Phase 2-A.1 で追加。AE が SMART_PRE_RENDER / SMART_RENDER 経路で
+    //   plugin を呼ぶようになる。legacy PF_Cmd_RENDER は後方互換のため残置。
+    //   Pipl.r::AE_Effect_Global_OutFlags_2 と**常に同期**(現値 0x08800410)。
     out_data->out_flags2 |= PF_OutFlag2_I_AM_THREADSAFE
                           | PF_OutFlag2_SUPPORTS_THREADED_RENDERING
-                          | PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA;
+                          | PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA
+                          | PF_OutFlag2_SUPPORTS_SMART_RENDER;
 
     return PF_Err_NONE;
 }
@@ -506,13 +540,13 @@ static PF_Err ParamsSetup(  PF_InData       *in_data,
 // PackedPixelType	KP_PIXEL32,	KP_PIXEL64
 //---------------------------------------------------------------------------//
 template<typename PixelType, typename PackedPixelType>
-static PF_Err smoothing(PF_InData   *in_data,
-						PF_OutData  *out_data,
-                        PF_ParamDef *params[],
-						PF_LayerDef *input,
-						PF_LayerDef *output,
-						PixelType	*in_ptr,
-						PixelType	*out_ptr)
+static PF_Err smoothing(PF_InData               *in_data,
+						PF_OutData              *out_data,
+                        const SmartRenderInfo   *info,
+						PF_LayerDef             *input,
+						PF_LayerDef             *output,
+						PixelType	            *in_ptr,
+						PixelType	            *out_ptr)
 {
 	PF_Err	err;
 
@@ -526,11 +560,11 @@ static PF_Err smoothing(PF_InData   *in_data,
     // smooth_core::process() が preProcess → in_ptr in-place 改変 → out_ptr へ
     // memcpy の順でコピーを担うため、AE SDK レベルのコピーは不要。
 
-    // パラメータを core 形式へ変換
+    // パラメータを core 形式へ変換(SmartRenderInfo の raw slider 値ベース)
     smooth_core::Params core_params;
-    core_params.range        = (unsigned int)(params[PARAM_RANGE]->u.fs_d.value * (getMaxValue<PixelType>() * 4)) / 100;
-    core_params.line_weight  = (float)(params[PARAM_LINE_WEIGHT]->u.fs_d.value / 2.0 + 0.5);
-    core_params.white_option = params[PARAM_WHITE_OPTION]->u.bd.value ? true : false;
+    core_params.range        = (unsigned int)(info->range * (getMaxValue<PixelType>() * 4)) / 100;
+    core_params.line_weight  = (float)(info->line_weight / 2.0 + 0.5);
+    core_params.white_option = info->white_option;
 
     // AE SDK 非依存のコア処理を呼ぶ
     smooth_core::process<PixelType>(in_ptr, out_ptr,
@@ -548,11 +582,21 @@ static PF_Err smoothing(PF_InData   *in_data,
         input->rowbytes,
         in_ptr,
         out_ptr,
-        (uint32_t)((unsigned int)(params[PARAM_RANGE]->u.fs_d.value * (getMaxValue<PixelType>() * 4)) / 100),
-        (float)(params[PARAM_LINE_WEIGHT]->u.fs_d.value / 2.0 + 0.5),
-        params[PARAM_WHITE_OPTION]->u.bd.value ? 1 : 0);
+        (uint32_t)((unsigned int)(info->range * (getMaxValue<PixelType>() * 4)) / 100),
+        (float)(info->line_weight / 2.0 + 0.5),
+        info->white_option ? 1 : 0);
 
 	return err;
+}
+
+// PARAM_RANGE / PARAM_LINE_WEIGHT / PARAM_WHITE_OPTION を SmartRenderInfo に
+// snapshot するユーティリティ。Render(legacy)は params[] から、
+// SmartRender は pre_render_data 経由で値を取る形に統一する。
+static inline void params_to_smart_info(PF_ParamDef *params[], SmartRenderInfo *info)
+{
+    info->range        = params[PARAM_RANGE]->u.fs_d.value;
+    info->line_weight  = params[PARAM_LINE_WEIGHT]->u.fs_d.value;
+    info->white_option = params[PARAM_WHITE_OPTION]->u.bd.value ? true : false;
 }
 
 
@@ -571,6 +615,9 @@ static PF_Err Render (  PF_InData       *in_data,
 
 	PF_LayerDef *input  = &params[PARAM_INPUT]->u.ld;
 
+    SmartRenderInfo info;
+    params_to_smart_info(params, &info);
+
 	PF_Pixel16	*in_ptr16, *out_ptr16;
 	PF_GET_PIXEL_DATA16(output, NULL, &out_ptr16 );
 	PF_GET_PIXEL_DATA16(input, NULL, &in_ptr16 );
@@ -578,7 +625,7 @@ static PF_Err Render (  PF_InData       *in_data,
 	if( out_ptr16 != NULL && in_ptr16 != NULL )
 	{
 		// 16bpc or 32bpc
-		err = smoothing<PF_Pixel16, KP_PIXEL64>(in_data, out_data, params,
+		err = smoothing<PF_Pixel16, KP_PIXEL64>(in_data, out_data, &info,
 												input, output, in_ptr16, out_ptr16 );
 	}
 	else
@@ -587,14 +634,139 @@ static PF_Err Render (  PF_InData       *in_data,
 		PF_Pixel8	*in_ptr8, *out_ptr8;
 		PF_GET_PIXEL_DATA8(output, NULL, &out_ptr8 );
 		PF_GET_PIXEL_DATA8(input, NULL, &in_ptr8 );
-		
-		err = smoothing<PF_Pixel8, KP_PIXEL32>(in_data, out_data, params,
+
+		err = smoothing<PF_Pixel8, KP_PIXEL32>(in_data, out_data, &info,
 												input, output, in_ptr8, out_ptr8 );
 	}
 
 	return err;
 
 
+}
+
+
+//---------------------------------------------------------------------------//
+// Phase 2-A.1: SmartRender(CPU 経路)
+//
+// SmartRender は Render と違い 2 段階(PreRender → Render)。PreRender 時点で
+// (a) 非 layer params を checkout して pre_render_data に snapshot 保存
+// (b) input layer を checkout して result_rect / max_result_rect を返却
+// SmartRender 時に pre_render_data の snapshot + checkout 済 input/output
+// world を使って既存の smoothing<>() を呼ぶ。
+//
+// GPU 経路(PF_Cmd_SMART_RENDER_GPU)は Phase 2-A.3 で追加、PreRender で
+// PF_RenderOutputFlag_GPU_RENDER_POSSIBLE を立てる必要がある。Step 1 では
+// 立てない(CPU 専用、AE は SMART_RENDER だけ呼んでくる)。
+//---------------------------------------------------------------------------//
+
+// Smart_Utils.cpp::UnionLRect 同等。SDK util が build に含まれていないので
+// inline 化(空 rect を考慮した両端の min/max 取り)。
+static inline void union_lrect_inline(const PF_LRect *src, PF_LRect *dst)
+{
+    if (dst->left == dst->right || dst->top == dst->bottom) {
+        *dst = *src;
+        return;
+    }
+    if (src->left == src->right || src->top == src->bottom) return;
+    if (src->left   < dst->left)   dst->left   = src->left;
+    if (src->top    < dst->top)    dst->top    = src->top;
+    if (src->right  > dst->right)  dst->right  = src->right;
+    if (src->bottom > dst->bottom) dst->bottom = src->bottom;
+}
+
+static void DisposeSmartRenderInfo(void *infoPV)
+{
+    if (infoPV) free(infoPV);
+}
+
+static PF_Err SmartPreRender(PF_InData         *in_data,
+                             PF_OutData        *out_data,
+                             PF_PreRenderExtra *extraP)
+{
+    PF_Err err = PF_Err_NONE;
+    PF_CheckoutResult in_result;
+    PF_RenderRequest req = extraP->input->output_request;
+
+    SmartRenderInfo *info = (SmartRenderInfo*)malloc(sizeof(SmartRenderInfo));
+    if (!info) return PF_Err_OUT_OF_MEMORY;
+
+    PF_ParamDef cur_param;
+
+    err = PF_CHECKOUT_PARAM(in_data, PARAM_RANGE, in_data->current_time,
+                            in_data->time_step, in_data->time_scale, &cur_param);
+    if (err) { free(info); return err; }
+    info->range = cur_param.u.fs_d.value;
+
+    err = PF_CHECKOUT_PARAM(in_data, PARAM_LINE_WEIGHT, in_data->current_time,
+                            in_data->time_step, in_data->time_scale, &cur_param);
+    if (err) { free(info); return err; }
+    info->line_weight = cur_param.u.fs_d.value;
+
+    err = PF_CHECKOUT_PARAM(in_data, PARAM_WHITE_OPTION, in_data->current_time,
+                            in_data->time_step, in_data->time_scale, &cur_param);
+    if (err) { free(info); return err; }
+    info->white_option = cur_param.u.bd.value ? true : false;
+
+    extraP->output->pre_render_data = info;
+    extraP->output->delete_pre_render_data_func = DisposeSmartRenderInfo;
+
+    err = extraP->cb->checkout_layer(in_data->effect_ref,
+                                     PARAM_INPUT, PARAM_INPUT,
+                                     &req,
+                                     in_data->current_time,
+                                     in_data->time_step,
+                                     in_data->time_scale,
+                                     &in_result);
+    if (err) return err;
+
+    union_lrect_inline(&in_result.result_rect,     &extraP->output->result_rect);
+    union_lrect_inline(&in_result.max_result_rect, &extraP->output->max_result_rect);
+
+    return PF_Err_NONE;
+}
+
+static PF_Err SmartRender(PF_InData            *in_data,
+                          PF_OutData           *out_data,
+                          PF_SmartRenderExtra  *extraP)
+{
+    PF_Err err = PF_Err_NONE;
+    PF_EffectWorld *input_world  = NULL;
+    PF_EffectWorld *output_world = NULL;
+
+    SmartRenderInfo *info = (SmartRenderInfo*)extraP->input->pre_render_data;
+    if (!info) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+
+    err = extraP->cb->checkout_layer_pixels(in_data->effect_ref, PARAM_INPUT, &input_world);
+    if (err || !input_world) return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
+
+    err = extraP->cb->checkout_output(in_data->effect_ref, &output_world);
+    if (err || !output_world) {
+        extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
+        return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    // bpc 判定は legacy Render と同じパターン:PF_GET_PIXEL_DATA16 が NULL を
+    // 返すかで 8/16bpc を区別。SmartRender 経路でも PF_LayerDef === PF_EffectWorld
+    // typedef なので同 macro が使える。
+    PF_Pixel16 *in_ptr16, *out_ptr16;
+    PF_GET_PIXEL_DATA16(output_world, NULL, &out_ptr16);
+    PF_GET_PIXEL_DATA16(input_world,  NULL, &in_ptr16);
+
+    if (out_ptr16 != NULL && in_ptr16 != NULL) {
+        err = smoothing<PF_Pixel16, KP_PIXEL64>(in_data, out_data, info,
+                                                input_world, output_world,
+                                                in_ptr16, out_ptr16);
+    } else {
+        PF_Pixel8 *in_ptr8, *out_ptr8;
+        PF_GET_PIXEL_DATA8(output_world, NULL, &out_ptr8);
+        PF_GET_PIXEL_DATA8(input_world,  NULL, &in_ptr8);
+        err = smoothing<PF_Pixel8, KP_PIXEL32>(in_data, out_data, info,
+                                               input_world, output_world,
+                                               in_ptr8, out_ptr8);
+    }
+
+    extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
+    return err;
 }
 
 
