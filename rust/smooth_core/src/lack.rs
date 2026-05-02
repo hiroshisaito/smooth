@@ -2,7 +2,7 @@
 
 use crate::blend::blending_pixel_f;
 use crate::compare::{compare_pixel, compare_pixel_equal};
-use crate::types::{BlendingInfo, SmoothPixel, px_read, px_write};
+use crate::types::{BlendingInfo, SmoothPixel, SmoothScalar, px_read, px_write};
 
 /// Lack mode 01
 pub unsafe fn lack_mode_01_execute<P: SmoothPixel>(info: &mut BlendingInfo<P>) {
@@ -22,10 +22,10 @@ pub unsafe fn lack_mode_01_execute<P: SmoothPixel>(info: &mut BlendingInfo<P>) {
         let ref2 = px_read(in_ptr, info.in_target + width + 1);
 
         let mut ref_temp = src; // any P, fields overwritten below
-        ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red())   / 3);
-        ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()) / 3);
-        ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue())  / 3);
-        ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()) / 3);
+        ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red()).div_by_int(3));
+        ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()).div_by_int(3));
+        ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue()).div_by_int(3));
+        ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()).div_by_int(3));
 
         let mut out_px = px_read(info.out_ptr, info.out_target);
         blending_pixel_f(&src, &ref_temp, &mut out_px, 0.5);
@@ -51,10 +51,10 @@ pub unsafe fn lack_mode_02_execute<P: SmoothPixel>(info: &mut BlendingInfo<P>) {
         let ref2 = px_read(in_ptr, info.in_target - width + 1);
 
         let mut ref_temp = src;
-        ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red())   / 3);
-        ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()) / 3);
-        ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue())  / 3);
-        ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()) / 3);
+        ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red()).div_by_int(3));
+        ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()).div_by_int(3));
+        ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue()).div_by_int(3));
+        ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()).div_by_int(3));
 
         let mut out_px = px_read(info.out_ptr, info.out_target);
         blending_pixel_f(&src, &ref_temp, &mut out_px, 0.5);
@@ -109,10 +109,10 @@ pub unsafe fn lack_mode_0304_execute<P: SmoothPixel>(info: &mut BlendingInfo<P>)
             let ref2 = px_read(in_ptr, info.in_target + width - 1);
 
             let mut ref_temp = src;
-            ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red())   / 3);
-            ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()) / 3);
-            ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue())  / 3);
-            ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()) / 3);
+            ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red()).div_by_int(3));
+            ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()).div_by_int(3));
+            ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue()).div_by_int(3));
+            ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()).div_by_int(3));
 
             let mut out_px = px_read(info.out_ptr, info.out_target);
             blending_pixel_f(&src, &ref_temp, &mut out_px, 0.5);
@@ -158,10 +158,10 @@ pub unsafe fn lack_mode_0304_execute<P: SmoothPixel>(info: &mut BlendingInfo<P>)
             let ref2 = px_read(in_ptr, info.in_target - width - 1);
 
             let mut ref_temp = src;
-            ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red())   / 3);
-            ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()) / 3);
-            ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue())  / 3);
-            ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()) / 3);
+            ref_temp.set_red(  (ref0.red()   + ref1.red()   + ref2.red()).div_by_int(3));
+            ref_temp.set_green((ref0.green() + ref1.green() + ref2.green()).div_by_int(3));
+            ref_temp.set_blue( (ref0.blue()  + ref1.blue()  + ref2.blue()).div_by_int(3));
+            ref_temp.set_alpha((ref0.alpha() + ref1.alpha() + ref2.alpha()).div_by_int(3));
 
             let mut out_px = px_read(info.out_ptr, info.out_target);
             blending_pixel_f(&src, &ref_temp, &mut out_px, 0.5);

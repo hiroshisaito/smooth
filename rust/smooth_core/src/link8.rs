@@ -2,7 +2,7 @@
 
 use crate::blend::{blending_pixel_f, blend_line};
 use crate::compare::{compare_pixel, compare_pixel_equal};
-use crate::types::{BlendingInfo, SmoothPixel, px_read, px_write};
+use crate::types::{BlendingInfo, SmoothPixel, SmoothScalar, px_read, px_write};
 
 const MAX_LENGTH: usize = 128;
 
@@ -273,10 +273,10 @@ unsafe fn link8_execute<P: SmoothPixel>(
                 let p0 = temp_pixel[0][i as usize];
                 let p1 = temp_pixel[1][i as usize];
                 let mut out = px_read(info.out_ptr, out_off);
-                out.set_red(  (p0.red()   + p1.red())   / 2);
-                out.set_green((p0.green() + p1.green()) / 2);
-                out.set_blue( (p0.blue()  + p1.blue())  / 2);
-                out.set_alpha((p0.alpha() + p1.alpha()) / 2);
+                out.set_red(  (p0.red()   + p1.red()  ).div_by_int(2));
+                out.set_green((p0.green() + p1.green()).div_by_int(2));
+                out.set_blue( (p0.blue()  + p1.blue() ).div_by_int(2));
+                out.set_alpha((p0.alpha() + p1.alpha()).div_by_int(2));
                 px_write(info.out_ptr, out_off, out);
             } else if i < len0 && inside_flg[0] {
                 let a = px_read(info.in_ptr, in_target + i as i64 * next_pixel_step_in as i64);
@@ -422,7 +422,7 @@ pub unsafe fn link8_square_execute<P: SmoothPixel>(info: &mut BlendingInfo<P>) {
     {
         let mut temp_pixel: [P; 4] = [px_read(info.in_ptr, in_target); 4];
         let ref_tbl: [i64; 4] = [-iw64 - 1, -iw64 + 1, iw64 + 1, iw64 - 1];
-        let mut sum_color: [u32; 4] = [0, 0, 0, 0];
+        let mut sum_color: [P::Scalar; 4] = [<P::Scalar as SmoothScalar>::zero(); 4];
 
         for i in 0..4 {
             temp_pixel[i] = px_read(info.in_ptr, in_target);
@@ -438,10 +438,10 @@ pub unsafe fn link8_square_execute<P: SmoothPixel>(info: &mut BlendingInfo<P>) {
         }
 
         let mut out = px_read(info.out_ptr, out_target);
-        out.set_red(  sum_color[0] / 4);
-        out.set_green(sum_color[1] / 4);
-        out.set_blue( sum_color[2] / 4);
-        out.set_alpha(sum_color[3] / 4);
+        out.set_red(  sum_color[0].div_by_int(4));
+        out.set_green(sum_color[1].div_by_int(4));
+        out.set_blue( sum_color[2].div_by_int(4));
+        out.set_alpha(sum_color[3].div_by_int(4));
         px_write(info.out_ptr, out_target, out);
     }
 

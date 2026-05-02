@@ -2,11 +2,11 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.1 close 直前。Step 1 + Step 2(Mac 実機)PASS。Win 実機は Win build 環境で別途。次は **Phase 2-A.2**(32bpc + manifest 化)。
+**現在地**: Phase 2-A.2 Step 1 完了 — Rust `smooth_core` の f32 domain 拡張(`SmoothScalar` trait 抽象 + `Pixel32` + 既存 `<P: SmoothPixel>` ジェネリックそのまま 32bpc 対応)。次は **Phase 2-A.2 Step 2**(Effect.cpp に PF_PixelFloat 分岐追加、`FLOAT_COLOR_AWARE` flag 同期)。
 
-なお Phase 2-A.3 Sub-stage A / B / C-1 は先行で Rust 側のみ完了済(Effect.cpp 統合は 2-A.2 後に Sub-stage C-2 として実施)。
+Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の Effect.cpp 統合(Sub-stage C-2)は 2-A.2 完了後。
 
-**Last update**: 2026-05-03(2-A.1 Step 2 Mac 実機 PASS: AE 2025 上で SmartRender 経路稼働、Render Queue 724 frames 完走、MFR 16 threads + KOJI_SMOOTH thread-safe、I_WRITE_INPUT_BUFFER 撤去 + scratch 化で verifier failure 解消)。
+**Last update**: 2026-05-03(2-A.2 Step 1: SmoothScalar trait 導入 + Pixel32 追加、cargo test 15/15 + 既存 regression 14/14 PASS、overbright/NaN/subnormal 防御 unit tests 追加)。
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## Phase 2-A.2 32bpc + manifest 化(5 Steps)
 
-- [ ] **Step 1**: Rust `smooth_core` f32 domain 拡張、cargo test PASS
+- ✅ **Step 1**: Rust `smooth_core` f32 domain 拡張(`SmoothScalar` trait 導入、`SmoothPixel::Scalar` 関連型、`Pixel32` 追加、`smooth_core_preprocess_f32` + `smooth_core_process_row_range_f32` FFI、cargo test 15/15 PASS、既存 8/16bpc regression 非劣化 14/14)
 - [ ] **Step 2**: Effect.cpp + Pipl.r に FLOAT_COLOR_AWARE、32bpc regression PASS
 - [ ] **Step 3**: Test harness manifest migration、v1.4.0-ae2025 backfill manifest
 - [ ] **Step 4**: 32bpc goldens capture、GitHub Release artifact、fetch_goldens.sh
@@ -62,9 +62,9 @@
 
 ## 次のアクション
 
-**Phase 2-A.2 Step 1**(Rust f32 domain 拡張): `smooth_core` の `SmoothPixel` trait と関連 module を `f32` 対応に拡張、`cargo test` で 32bpc unit test を含めて全 PASS。
+**Phase 2-A.2 Step 2**(Effect.cpp + Pipl.r 32bpc 統合): `SmartRender()` の bpc switch に `PF_PixelFloat` ケース追加、`smoothing<Pixel32, ...>` インスタンス化 → Rust 側 f32 FFI を呼ぶ。GlobalSetup + Pipl.r `out_flags2` に `PF_OutFlag2_FLOAT_COLOR_AWARE` (bit 12) を OR。
 
-その後の流れ: 2-A.2 Step 2-5 → Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)→ Sub-stage D / E / F。
+その後の流れ: 2-A.2 Step 3(test harness manifest migration)→ Step 4(32bpc goldens capture)→ Step 5(Mac/Win cross-platform 検証)→ Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)→ Sub-stage D / E / F。
 
 Win build は外部の Win 環境で 2-A.1 + 2-A.2 まとめて実施(Phase 2-A.2 close 後 / もしくは Phase 2-A.3 着手前のチェックポイントで)。
 

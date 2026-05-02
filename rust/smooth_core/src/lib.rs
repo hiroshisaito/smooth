@@ -16,7 +16,7 @@ mod process;
 // Trait + module tree only; real Metal/CUDA dispatch arrives in Sub-stage C/E.
 mod gpu;
 
-use preprocess::{Pixel8, Pixel16, SmoothBbox, pre_process};
+use preprocess::{Pixel8, Pixel16, Pixel32, SmoothBbox, pre_process};
 use types::{BlendingInfo, Cinfo, SmoothPixel};
 use process::process_row_range;
 
@@ -69,6 +69,18 @@ pub unsafe extern "C" fn smooth_core_preprocess_u16(
     preprocess_impl(in_ptr, rowbytes, height, is_white_trans, bbox_out);
 }
 
+/// Phase 2-A.2 Step 1: 32bpc (PF_PixelFloat) preprocess entry point.
+#[no_mangle]
+pub unsafe extern "C" fn smooth_core_preprocess_f32(
+    in_ptr: *mut Pixel32,
+    rowbytes: i32,
+    height: i32,
+    is_white_trans: i32,
+    bbox_out: *mut SmoothBbox,
+) {
+    preprocess_impl(in_ptr, rowbytes, height, is_white_trans, bbox_out);
+}
+
 #[inline]
 unsafe fn preprocess_impl<P: SmoothPixel>(
     in_ptr: *mut P,
@@ -105,12 +117,57 @@ pub struct RowRangeArgs {
 
 #[no_mangle]
 pub unsafe extern "C" fn smooth_core_process_row_range_u8(args: *const RowRangeArgs) {
-    run_row_range::<Pixel8>(&*args);
+    let a = &*args;
+    run_row_range::<Pixel8>(a, a.range);
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn smooth_core_process_row_range_u16(args: *const RowRangeArgs) {
-    run_row_range::<Pixel16>(&*args);
+    let a = &*args;
+    run_row_range::<Pixel16>(a, a.range);
+}
+
+/// Phase 2-A.2 Step 1: 32bpc (PF_PixelFloat) entry point. Mirrors u8/u16
+/// FFI but passes `range` as f32 (raw slider value × max_value=1.0 already
+/// applied on the C++ side).
+#[repr(C)]
+pub struct RowRangeArgsF32 {
+    pub in_ptr:        *mut u8,
+    pub out_ptr:       *mut u8,
+    pub width:         i32,
+    pub logical_width: i32,
+    pub height:        i32,
+    pub rowbytes:      i32,
+    pub range:         f32,      // f32 instead of u32 for 32bpc
+    pub line_weight:   f32,
+    pub j_start:       i32,
+    pub j_end:         i32,
+    pub i_start:       i32,
+    pub i_end:         i32,
+    pub parallel:      i32,
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn smooth_core_process_row_range_f32(args: *const RowRangeArgsF32) {
+    let a = &*args;
+    // Reuse the same shape; only `range` differs in scalar type. Build a
+    // `RowRangeArgs` view for the shared fields and pass `range` separately.
+    let shared = RowRangeArgs {
+        in_ptr: a.in_ptr,
+        out_ptr: a.out_ptr,
+        width: a.width,
+        logical_width: a.logical_width,
+        height: a.height,
+        rowbytes: a.rowbytes,
+        range: 0,            // unused for f32 path; the second arg below carries the real value
+        line_weight: a.line_weight,
+        j_start: a.j_start,
+        j_end: a.j_end,
+        i_start: a.i_start,
+        i_end: a.i_end,
+        parallel: a.parallel,
+    };
+    run_row_range::<Pixel32>(&shared, a.range);
 }
 
 /// Wrapper that lets the in/out pixel buffer pointers cross thread boundaries
@@ -153,7 +210,7 @@ unsafe impl<P> Send for SharedBuf<P> {}
 unsafe impl<P> Sync for SharedBuf<P> {}
 
 #[inline]
-unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs) {
+unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs, range: P::Scalar) {
     // Snapshot plain-value fields and wrap the raw pointers in SharedBuf so the
     // parallel closure stays Send + Sync with the contract made explicit.
     let j_start       = a.j_start;
@@ -164,7 +221,6 @@ unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs) {
     let logical_width = a.logical_width;
     let height        = a.height;
     let rowbytes      = a.rowbytes;
-    let range         = a.range;
     let line_weight   = a.line_weight;
     let buf: SharedBuf<P> = SharedBuf {
         in_ptr:  a.in_ptr  as *mut P,

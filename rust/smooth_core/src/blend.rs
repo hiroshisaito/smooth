@@ -1,29 +1,37 @@
 // BlendingPixelf / Blendingf / BlendLine — ported from util.h/util.cpp.
+//
+// Phase 2-A.2 Step 1: scalar-generic. The blend formula
+//     output = (target * alpha + ref * (max - alpha)) / max
+// reduces cleanly to either:
+//   - integer fixed-point math (u32, max = 0xFF/0x8000) for u8/u16, or
+//   - clean float math (f32, max = 1.0) for 32bpc PF_PixelFloat,
+// without per-domain branching.
 
-use crate::types::{BlendingInfo, SmoothPixel, px_read, px_write};
+use crate::types::{BlendingInfo, SmoothPixel, SmoothScalar, px_read, px_write};
 
 /// BlendingPixelf: blend `target` and `ref` by ratio, write to `output`.
 /// Matches util.h::BlendingPixelf semantics for AE's ARGB pre-multiplied alpha case split.
 #[inline(always)]
 pub fn blending_pixel_f<P: SmoothPixel>(target_pixel: &P, ref_pixel: &P, output_pixel: &mut P, ratio: f32) {
     let max_value = P::max_value();
-    let alpha   = (max_value as f32 * ratio) as u32;
+    let alpha   = <P::Scalar as SmoothScalar>::from_ratio_with_max(ratio, max_value);
     let r_alpha = max_value - alpha;
 
     let tp_alpha = target_pixel.alpha();
     let rp_alpha = ref_pixel.alpha();
+    let zero     = <P::Scalar as SmoothScalar>::zero();
 
     if tp_alpha == max_value && rp_alpha == max_value {
         output_pixel.set_alpha(max_value);
         output_pixel.set_red(  ((target_pixel.red()   * alpha) + (ref_pixel.red()   * r_alpha)) / max_value);
         output_pixel.set_green(((target_pixel.green() * alpha) + (ref_pixel.green() * r_alpha)) / max_value);
         output_pixel.set_blue( ((target_pixel.blue()  * alpha) + (ref_pixel.blue()  * r_alpha)) / max_value);
-    } else if tp_alpha == 0 {
+    } else if tp_alpha == zero {
         output_pixel.set_alpha(((tp_alpha * alpha) + (rp_alpha * r_alpha)) / max_value);
         output_pixel.set_red(  ref_pixel.red());
         output_pixel.set_green(ref_pixel.green());
         output_pixel.set_blue( ref_pixel.blue());
-    } else if rp_alpha == 0 {
+    } else if rp_alpha == zero {
         output_pixel.set_alpha(((tp_alpha * alpha) + (rp_alpha * r_alpha)) / max_value);
         output_pixel.set_red(  target_pixel.red());
         output_pixel.set_green(target_pixel.green());
