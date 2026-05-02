@@ -421,8 +421,15 @@ static PF_Err GlobalSetup ( PF_InData       *in_data,
     // build=1: Build 表示パラメータ(PARAM_BUILD_INFO)追加
     out_data->my_version    = PF_VERSION(2,0,0,1,0);
 
-	// input buffer を加工します
-    out_data->out_flags  |= PF_OutFlag_I_WRITE_INPUT_BUFFER | PF_OutFlag_DEEP_COLOR_AWARE;
+    // PF_OutFlag_I_WRITE_INPUT_BUFFER は **撤去**: AE 2025 の verifier が
+    //   "{plugin with PF_OutFlag2_SUPPORTS_SMART_RENDER cannot set
+    //   PF_OutFlag_I_WRITE_INPUT_BUFFER}" を出して GLOBAL_SETUP 直後に
+    //   internal verification failure dialog → render 経路で SIGSEGV を起こす
+    //   ことを Phase 2-A.1 Step 2 実機検証で確認(2026-05-03、AE 25.6.5x3)。
+    //   SmartRender 採用時は input buffer を read-only として扱う必要があり、
+    //   smooth_core::process() が要求する writable in_ptr は smoothing<>()
+    //   内部で scratch buffer を allocate して提供する形に変更。
+    out_data->out_flags  |= PF_OutFlag_DEEP_COLOR_AWARE;
     // PF_OutFlag2_I_AM_THREADSAFE: legacy (SDK で "unused" とされる互換シグナル、維持)
     // PF_OutFlag2_SUPPORTS_THREADED_RENDERING (bit 27 = 0x08000000):
     //   Multi-Frame Rendering 対応。Render セレクタが複数スレッドから同時に呼ばれる。
@@ -548,17 +555,21 @@ static PF_Err smoothing(PF_InData               *in_data,
 						PixelType	            *in_ptr,
 						PixelType	            *out_ptr)
 {
-	PF_Err	err;
+	PF_Err	err = PF_Err_NONE;
 
     BEGIN_PROFILE();
     SMOOTH_BENCH_TIMER_BEGIN();
 
-    err = PF_Err_NONE;
-
-    // 以前は PF_COPY(input, output) をここで実行していたが、white_option 時に
-    // 内部の白ピクセルが out に反映されないバグの原因となっていた。
-    // smooth_core::process() が preProcess → in_ptr in-place 改変 → out_ptr へ
-    // memcpy の順でコピーを担うため、AE SDK レベルのコピーは不要。
+    // smooth_core::process() の契約は「in_ptr / out_ptr は独立した writable
+    // バッファ」かつ「preProcess が in_ptr を in-place 改変する」。AE 2025 の
+    // SmartRender 経路では PF_OutFlag_I_WRITE_INPUT_BUFFER が許可されない
+    // ため、AE 提供の input buffer は read-only として扱う必要がある。
+    // ここで scratch を確保して input pixels をコピーし、smooth_core には
+    // scratch を in_ptr として渡す。出費は rowbytes*height bytes / call。
+    const size_t scratch_bytes = (size_t)input->rowbytes * (size_t)input->height;
+    PixelType *scratch = (PixelType*)malloc(scratch_bytes);
+    if (!scratch) return PF_Err_OUT_OF_MEMORY;
+    memcpy(scratch, in_ptr, scratch_bytes);
 
     // パラメータを core 形式へ変換(SmartRenderInfo の raw slider 値ベース)
     smooth_core::Params core_params;
@@ -566,8 +577,8 @@ static PF_Err smoothing(PF_InData               *in_data,
     core_params.line_weight  = (float)(info->line_weight / 2.0 + 0.5);
     core_params.white_option = info->white_option;
 
-    // AE SDK 非依存のコア処理を呼ぶ
-    smooth_core::process<PixelType>(in_ptr, out_ptr,
+    // AE SDK 非依存のコア処理を呼ぶ(scratch を in、out_ptr を out)
+    smooth_core::process<PixelType>(scratch, out_ptr,
                                     input->width, input->height, input->rowbytes,
                                     core_params);
 
@@ -580,12 +591,13 @@ static PF_Err smoothing(PF_InData               *in_data,
         GET_HEIGHT(input),
         (int)(sizeof(PixelType) * 8 / 4),           // bpc: Pixel8 -> 8, Pixel16 -> 16 (div by 4 channels)
         input->rowbytes,
-        in_ptr,
+        scratch,                                    // pre/post-preProcess snapshot は scratch 側
         out_ptr,
         (uint32_t)((unsigned int)(info->range * (getMaxValue<PixelType>() * 4)) / 100),
         (float)(info->line_weight / 2.0 + 0.5),
         info->white_option ? 1 : 0);
 
+    free(scratch);
 	return err;
 }
 

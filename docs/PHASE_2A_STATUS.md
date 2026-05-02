@@ -2,11 +2,11 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.1 Step 1 完了(local gate)— Effect.cpp + Pipl.r に SmartRender 経路追加、CPU regression 非劣化確認。次は **Phase 2-A.1 Step 2**(Mac + Win AE 2025 実機検証)。
+**現在地**: Phase 2-A.1 close 直前。Step 1 + Step 2(Mac 実機)PASS。Win 実機は Win build 環境で別途。次は **Phase 2-A.2**(32bpc + manifest 化)。
 
-なお Phase 2-A.3 Sub-stage A / B / C-1 は先行で Rust 側のみ完了済(Effect.cpp 統合は 2-A.1 / 2-A.2 後に Sub-stage C-2 として実施)。
+なお Phase 2-A.3 Sub-stage A / B / C-1 は先行で Rust 側のみ完了済(Effect.cpp 統合は 2-A.2 後に Sub-stage C-2 として実施)。
 
-**Last update**: 2026-05-03(2-A.1 Step 1: Effect.cpp に SmartPreRender / SmartRender 実装、smoothing<>() を SmartRenderInfo ベースに refactor、Pipl.r flags2 を 0x08800010 → 0x08800410 に同期)。
+**Last update**: 2026-05-03(2-A.1 Step 2 Mac 実機 PASS: AE 2025 上で SmartRender 経路稼働、Render Queue 724 frames 完走、MFR 16 threads + KOJI_SMOOTH thread-safe、I_WRITE_INPUT_BUFFER 撤去 + scratch 化で verifier failure 解消)。
 
 ---
 
@@ -24,7 +24,8 @@
 ## Phase 2-A.1 SmartRender 経路追加(2 Steps)
 
 - ✅ **Step 1**: Effect.cpp + Pipl.r に SmartRender handlers + `SUPPORTS_SMART_RENDER` flag(GlobalSetup + Pipl.r flags2 = 0x08800410)、`smoothing<>()` を SmartRenderInfo ベースに refactor、Mac universal build SUCCEEDED、cargo test 10/10、regression `SMOOTH_PARALLEL=1/0` 両方で 14/14 + synthetic 6/6 PASS
-- [ ] **Step 2**: Mac + Win AE 2025 実機検証(§3.1.4 Step 2-4)、debug-only instrumentation で SmartRender 経路到達確認、§3.1.5 gate 全 YES
+- 🟡 **Step 2**: Mac AE 2025 実機 PASS(§3.1.4 Step 2-4 完了: SmartRender 経路稼働、Render Queue 724 frames 完走、MFR 16 threads engaged、KOJI_SMOOTH thread-safe)、I_WRITE_INPUT_BUFFER 撤去 + scratch 化の 2 番目の修正で verifier failure 解消。**Win 実機検証は別 build 環境で実施予定**(本 commit は Mac side のみ close)
+  - **Follow-up メモ**: preview/cache pass で `FrameTask threw 517` × 3 観測(time 69600 / 594400 / 595200)。pre_render_data null の edge case が原因と推定、Render Queue 本体には影響なし。Phase 2-A.2 進行中 or 別 issue で対処
 
 ## Phase 2-A.2 32bpc + manifest 化(5 Steps)
 
@@ -61,14 +62,11 @@
 
 ## 次のアクション
 
-**Phase 2-A.1 Step 2**: Mac + Win AE 2025 実機検証。
+**Phase 2-A.2 Step 1**(Rust f32 domain 拡張): `smooth_core` の `SmoothPixel` trait と関連 module を `f32` 対応に拡張、`cargo test` で 32bpc unit test を含めて全 PASS。
 
-- Mac: `Mac/build/Release/smooth.plugin` を AE プラグインフォルダに配置、v1.5.1 UAT プロジェクトで 8bpc + 16bpc Render Queue 書き出し、Render log に Multithreaded render report が出ること、画質が v1.5.1 と視覚上無差別、SmartRender 経路が呼ばれることを debug-only instrumentation で確認(merge 前に削除)
-- Win: 同上、aerender.exe stdout で Thread-safe / Render threads used 行確認
+その後の流れ: 2-A.2 Step 2-5 → Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)→ Sub-stage D / E / F。
 
-§3.1.5 gate 全 YES なら 2-A.1 close → Phase 2-A.2(32bpc + manifest 化)へ。
-
-その後の流れ: 2-A.2 → Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)。
+Win build は外部の Win 環境で 2-A.1 + 2-A.2 まとめて実施(Phase 2-A.2 close 後 / もしくは Phase 2-A.3 着手前のチェックポイントで)。
 
 ## 現時点の PoC(disposable)
 

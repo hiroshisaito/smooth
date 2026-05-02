@@ -55,7 +55,15 @@ resource 'PiPL' (16000) {
 		},
 		/* [10] */
 		AE_Effect_Global_OutFlags {
-			0x2000800
+			/* Phase 2-A.1: PF_OutFlag_I_WRITE_INPUT_BUFFER (bit 11 = 0x800)
+			   removed because AE 2025 forbids it together with
+			   PF_OutFlag2_SUPPORTS_SMART_RENDER (verifier failure +
+			   render-thread SIGSEGV observed on 2026-05-03).
+			   Remaining: PF_OutFlag_DEEP_COLOR_AWARE (bit 25) only.
+			   smoothing<>() now allocates its own scratch buffer for the
+			   in-place preProcess step. Must match Effect.cpp GlobalSetup
+			   out_flags. */
+			0x2000000
 		},
 		AE_Effect_Global_OutFlags_2 {
 			/* Phase 2-A.1: SUPPORTS_SMART_RENDER (bit 10 = 0x400) added.
