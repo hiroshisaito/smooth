@@ -26,12 +26,14 @@
 namespace smooth_core {
 
 struct Params {
-    unsigned int range;        // 同色判定しきい値 (bpc 依存スケール済)
+    unsigned int range;        // 同色判定しきい値 (8/16bpc: bpc 依存スケール済 u32)
+    float        range_f32;    // 同上 32bpc 版 (AE 0..1 domain × 4 channels の f32 sum)
     float        line_weight;  // 0.5..1.0
     bool         white_option; // 白抜き実施
 };
 
-// Phase 2-C Step 2: preProcess は Rust FFI に委譲。
+// Phase 2-C Step 2 + Phase 2-A.2 Step 1: preProcess は Rust FFI に委譲。
+// 16 byte = 32bpc (PF_PixelFloat、Phase 2-A.2 で追加)、8 byte = 16bpc、4 byte = 8bpc。
 template <typename PixelType>
 inline void preProcess(PixelType* in_ptr, int rowbytes, int height,
                        int* out_top, int* out_left, int* out_right, int* out_bottom,
@@ -41,9 +43,13 @@ inline void preProcess(PixelType* in_ptr, int rowbytes, int height,
         smooth_core_preprocess_u8(reinterpret_cast<void*>(in_ptr),
                                   rowbytes, height,
                                   is_white_trans ? 1 : 0, &bbox);
-    } else {
-        static_assert(sizeof(PixelType) == 8, "preProcess only supports 8bpc (4B) or 16bpc (8B) pixels");
+    } else if constexpr (sizeof(PixelType) == 8) {
         smooth_core_preprocess_u16(reinterpret_cast<void*>(in_ptr),
+                                   rowbytes, height,
+                                   is_white_trans ? 1 : 0, &bbox);
+    } else {
+        static_assert(sizeof(PixelType) == 16, "preProcess only supports 4B (u8) / 8B (u16) / 16B (f32) pixels");
+        smooth_core_preprocess_f32(reinterpret_cast<void*>(in_ptr),
                                    rowbytes, height,
                                    is_white_trans ? 1 : 0, &bbox);
     }
@@ -53,33 +59,51 @@ inline void preProcess(PixelType* in_ptr, int rowbytes, int height,
     *out_bottom = bbox.bottom;
 }
 
-// Phase 2-C Step 3: process_row_range は Rust 実装(FFI 1 本)。
-// Step 4: 並列化も Rust 側(rayon)に移設。SMOOTH_PARALLEL マクロが args.parallel に反映される。
+// Phase 2-C Step 3 + Phase 2-A.2 Step 1: process_row_range は Rust 実装(FFI 1 本)。
+// 32bpc は別 args struct (`smooth_row_range_args_f32_t`) で `range` を f32 として渡す。
 template <typename PixelType>
 inline void invoke_row_range_ffi(PixelType* in_ptr, PixelType* out_ptr,
                                  int width, int logical_width, int height, int rowbytes,
-                                 unsigned int range, float line_weight,
+                                 unsigned int range_u32, float range_f32, float line_weight,
                                  int j_start, int j_end, int i_start, int i_end) {
-    smooth_row_range_args_t args;
-    args.in_ptr        = reinterpret_cast<void*>(in_ptr);
-    args.out_ptr       = reinterpret_cast<void*>(out_ptr);
-    args.width         = width;
-    args.logical_width = logical_width;
-    args.height        = height;
-    args.rowbytes      = rowbytes;
-    args.range         = range;
-    args.line_weight   = line_weight;
-    args.j_start       = j_start;
-    args.j_end         = j_end;
-    args.i_start       = i_start;
-    args.i_end         = i_end;
-    args.parallel      = SMOOTH_PARALLEL ? 1 : 0;
-
-    if constexpr (sizeof(PixelType) == 4) {
-        smooth_core_process_row_range_u8(&args);
+    if constexpr (sizeof(PixelType) == 16) {
+        smooth_row_range_args_f32_t args;
+        args.in_ptr        = reinterpret_cast<void*>(in_ptr);
+        args.out_ptr       = reinterpret_cast<void*>(out_ptr);
+        args.width         = width;
+        args.logical_width = logical_width;
+        args.height        = height;
+        args.rowbytes      = rowbytes;
+        args.range         = range_f32;
+        args.line_weight   = line_weight;
+        args.j_start       = j_start;
+        args.j_end         = j_end;
+        args.i_start       = i_start;
+        args.i_end         = i_end;
+        args.parallel      = SMOOTH_PARALLEL ? 1 : 0;
+        smooth_core_process_row_range_f32(&args);
     } else {
-        static_assert(sizeof(PixelType) == 8, "row_range supports 8bpc (4B) or 16bpc (8B) only");
-        smooth_core_process_row_range_u16(&args);
+        smooth_row_range_args_t args;
+        args.in_ptr        = reinterpret_cast<void*>(in_ptr);
+        args.out_ptr       = reinterpret_cast<void*>(out_ptr);
+        args.width         = width;
+        args.logical_width = logical_width;
+        args.height        = height;
+        args.rowbytes      = rowbytes;
+        args.range         = range_u32;
+        args.line_weight   = line_weight;
+        args.j_start       = j_start;
+        args.j_end         = j_end;
+        args.i_start       = i_start;
+        args.i_end         = i_end;
+        args.parallel      = SMOOTH_PARALLEL ? 1 : 0;
+
+        if constexpr (sizeof(PixelType) == 4) {
+            smooth_core_process_row_range_u8(&args);
+        } else {
+            static_assert(sizeof(PixelType) == 8, "row_range supports 4B (u8) / 8B (u16) / 16B (f32) only");
+            smooth_core_process_row_range_u16(&args);
+        }
     }
 }
 
@@ -126,7 +150,7 @@ inline void process(PixelType* in_ptr, PixelType* out_ptr,
     // SMOOTH_PARALLEL マクロで切替(回帰テストが SMOOTH_PARALLEL=0 をシリアル比較に使う)。
     invoke_row_range_ffi<PixelType>(in_ptr, out_ptr,
                                      in_width, logical_width, height, rowbytes,
-                                     p.range, p.line_weight,
+                                     p.range, p.range_f32, p.line_weight,
                                      eh_top, eh_bottom, eh_left, eh_right);
 }
 

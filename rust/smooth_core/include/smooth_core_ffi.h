@@ -94,6 +94,12 @@ void smooth_core_preprocess_u8 (void *in_ptr, int32_t rowbytes, int32_t height,
 void smooth_core_preprocess_u16(void *in_ptr, int32_t rowbytes, int32_t height,
                                 int32_t is_white_trans, smooth_bbox_t *bbox_out);
 
+/* Phase 2-A.2 Step 1: 32bpc (PF_PixelFloat) variant. Same contract as the
+ * u8/u16 entries except the buffer is interpreted as { f32 alpha, red,
+ * green, blue } (16 bytes per pixel). White key = (1.0, 1.0, 1.0, 1.0). */
+void smooth_core_preprocess_f32(void *in_ptr, int32_t rowbytes, int32_t height,
+                                int32_t is_white_trans, smooth_bbox_t *bbox_out);
+
 /* Step 3: process_row_range.
  *
  * One call performs the full scan + blend pass for rows [j_start, j_end) x
@@ -136,6 +142,27 @@ typedef struct {
 
 void smooth_core_process_row_range_u8 (const smooth_row_range_args_t *args);
 void smooth_core_process_row_range_u16(const smooth_row_range_args_t *args);
+
+/* Phase 2-A.2 Step 1: 32bpc variant. Identical to smooth_row_range_args_t
+ * except `range` is f32 (in AE's 0.0..1.0 domain, scaled by max_value=1.0
+ * already on the C++ side via Params::range_f32). */
+typedef struct {
+    void    *in_ptr;
+    void    *out_ptr;
+    int32_t  width;
+    int32_t  logical_width;
+    int32_t  height;
+    int32_t  rowbytes;
+    float    range;          /* f32 instead of u32 */
+    float    line_weight;
+    int32_t  j_start;
+    int32_t  j_end;
+    int32_t  i_start;
+    int32_t  i_end;
+    int32_t  parallel;
+} smooth_row_range_args_f32_t;
+
+void smooth_core_process_row_range_f32(const smooth_row_range_args_f32_t *args);
 
 #ifdef __cplusplus
 }

@@ -66,12 +66,18 @@ resource 'PiPL' (16000) {
 			0x2000000
 		},
 		AE_Effect_Global_OutFlags_2 {
-			/* Phase 2-A.1: SUPPORTS_SMART_RENDER (bit 10 = 0x400) added.
+			/* Phase 2-A.2: FLOAT_COLOR_AWARE (bit 12 = 0x1000) added so AE
+			   delivers PF_PixelFloat (32bpc) buffers via SmartRender for the
+			   Pixel32 path. The flag is doc-ed as "may require
+			   SUPPORTS_SMART_RENDER", which we already set. SmartRender path
+			   dispatches to smoothing<PF_PixelFloat,KP_PIXEL128> when
+			   PF_GetPixelFormat returns PF_PixelFormat_ARGB128.
 			   I_AM_THREADSAFE (bit 4 = 0x10) | SUPPORTS_SMART_RENDER (bit 10 = 0x400)
+			   | FLOAT_COLOR_AWARE (bit 12 = 0x1000)
 			   | SUPPORTS_GET_FLATTENED_SEQUENCE_DATA (bit 23 = 0x00800000)
 			   | SUPPORTS_THREADED_RENDERING (bit 27 = 0x08000000)
-			   = 0x08800410. Must match Effect.cpp GlobalSetup out_flags2. */
-			0x08800410
+			   = 0x08801410. Must match Effect.cpp GlobalSetup out_flags2. */
+			0x08801410
 		},
 		/* [11] */
 		AE_Effect_Match_Name {

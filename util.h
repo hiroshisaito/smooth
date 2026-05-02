@@ -144,12 +144,20 @@ void EndProfileLap(int index);
 
 
 
-typedef unsigned long		KP_PIXEL32;	// 8bbit per channel
+typedef unsigned long		KP_PIXEL32;	// 8bit per channel
 typedef unsigned long long	KP_PIXEL64;	// 16bit per channel
+// Phase 2-A.2 Step 2: KP_PIXEL128 is just a 16-byte tag type used for
+// `smoothing<PF_PixelFloat, KP_PIXEL128>` template instantiation. The 32bpc
+// path computes range as f32 (Params::range_f32) and never packs a u128.
+struct KP_PIXEL128 { uint64_t lo, hi; };
 
 template<typename PixelType> static inline unsigned int getMaxValue() { return ~0; }
 template <> inline unsigned int getMaxValue<PF_Pixel16>(){ return 0x8000; }
 template <> inline unsigned int getMaxValue<PF_Pixel8>()	{ return 0xff; }
+// PF_PixelFloat: max channel value is 1.0 in AE's 0..1 float domain. We return
+// the integer 1 here just to satisfy the int-returning template signature; the
+// 32bpc smoothing<>() path uses Params::range_f32 instead of the u32 range.
+template <> inline unsigned int getMaxValue<PF_PixelFloat>(){ return 1; }
 
 
 

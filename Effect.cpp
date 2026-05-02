@@ -6,6 +6,8 @@
 #include "AEConfig.h"
 #include "AE_Effect.h"
 #include "AE_EffectCB.h"
+#include "AE_EffectCBSuites.h"   // Phase 2-A.2: PF_WorldSuite2 / kPFWorldSuite for PF_GetPixelFormat (32bpc detection)
+#include "SPBasic.h"             // SPBasicSuite (in_data->pica_basicP) AcquireSuite/ReleaseSuite
 #include "AE_Macros.h"
 
 #include "Param_Utils.h"
@@ -446,11 +448,19 @@ static PF_Err GlobalSetup ( PF_InData       *in_data,
     // PF_OutFlag2_SUPPORTS_SMART_RENDER (bit 10 = 0x400):
     //   Phase 2-A.1 で追加。AE が SMART_PRE_RENDER / SMART_RENDER 経路で
     //   plugin を呼ぶようになる。legacy PF_Cmd_RENDER は後方互換のため残置。
-    //   Pipl.r::AE_Effect_Global_OutFlags_2 と**常に同期**(現値 0x08800410)。
+    // PF_OutFlag2_FLOAT_COLOR_AWARE (bit 12 = 0x1000):
+    //   Phase 2-A.2 で追加。32bpc(PF_PixelFloat、ARGB128)プロジェクトでも
+    //   AE がこの effect に PF_Cmd_SMART_RENDER を発行するようになる。
+    //   未指定時は Composition 32bpc で「effect が黄色三角」となり 8/16bpc
+    //   へのダウングレード or skip となる。SmartRender / Render は内部で
+    //   PF_GetPixelFormat による format 分岐を行い、ARGB128 は
+    //   smoothing<PF_PixelFloat, KP_PIXEL128>() に dispatch する。
+    //   Pipl.r::AE_Effect_Global_OutFlags_2 と**常に同期**(現値 0x08801410)。
     out_data->out_flags2 |= PF_OutFlag2_I_AM_THREADSAFE
                           | PF_OutFlag2_SUPPORTS_THREADED_RENDERING
                           | PF_OutFlag2_SUPPORTS_GET_FLATTENED_SEQUENCE_DATA
-                          | PF_OutFlag2_SUPPORTS_SMART_RENDER;
+                          | PF_OutFlag2_SUPPORTS_SMART_RENDER
+                          | PF_OutFlag2_FLOAT_COLOR_AWARE;
 
     return PF_Err_NONE;
 }
@@ -571,9 +581,18 @@ static PF_Err smoothing(PF_InData               *in_data,
     if (!scratch) return PF_Err_OUT_OF_MEMORY;
     memcpy(scratch, in_ptr, scratch_bytes);
 
-    // パラメータを core 形式へ変換(SmartRenderInfo の raw slider 値ベース)
+    // パラメータを core 形式へ変換(SmartRenderInfo の raw slider 値ベース)。
+    // 8/16bpc は max_value=0xFF/0x8000 の整数 domain で u32 sum しきい値を渡し、
+    // 32bpc は max_value=1.0 の f32 domain で f32 sum しきい値を渡す。
+    // Phase 2-A.2 Step 2 で f32 path を追加(Params::range_f32)。
     smooth_core::Params core_params;
-    core_params.range        = (unsigned int)(info->range * (getMaxValue<PixelType>() * 4)) / 100;
+    if constexpr (sizeof(PixelType) == 16) {
+        core_params.range     = 0;  // unused on 32bpc path
+        core_params.range_f32 = (float)(info->range * 4.0 / 100.0);  // max=1.0, 4 channels
+    } else {
+        core_params.range     = (unsigned int)(info->range * (getMaxValue<PixelType>() * 4)) / 100;
+        core_params.range_f32 = 0.0f;
+    }
     core_params.line_weight  = (float)(info->line_weight / 2.0 + 0.5);
     core_params.white_option = info->white_option;
 
@@ -589,12 +608,12 @@ static PF_Err smoothing(PF_InData               *in_data,
     SMOOTH_BENCH_CAPTURE(
         GET_WIDTH(input),
         GET_HEIGHT(input),
-        (int)(sizeof(PixelType) * 8 / 4),           // bpc: Pixel8 -> 8, Pixel16 -> 16 (div by 4 channels)
+        (int)(sizeof(PixelType) * 8 / 4),           // bpc: Pixel8->8, Pixel16->16, PF_PixelFloat->32
         input->rowbytes,
         scratch,                                    // pre/post-preProcess snapshot は scratch 側
         out_ptr,
-        (uint32_t)((unsigned int)(info->range * (getMaxValue<PixelType>() * 4)) / 100),
-        (float)(info->line_weight / 2.0 + 0.5),
+        core_params.range,                          // bench は u32 range のみ記録(32bpc は 0)
+        core_params.line_weight,
         info->white_option ? 1 : 0);
 
     free(scratch);
@@ -609,6 +628,23 @@ static inline void params_to_smart_info(PF_ParamDef *params[], SmartRenderInfo *
     info->range        = params[PARAM_RANGE]->u.fs_d.value;
     info->line_weight  = params[PARAM_LINE_WEIGHT]->u.fs_d.value;
     info->white_option = params[PARAM_WHITE_OPTION]->u.bd.value ? true : false;
+}
+
+// Phase 2-A.2 Step 2: PF_GET_PIXEL_DATA macros には 32bpc 版が無いため、
+// PF_WorldSuite2::PF_GetPixelFormat で format を取得して 8/16/32bpc を分岐する。
+// suite が取得できない or 取得失敗時は INVALID を返し、呼び出し側は legacy
+// pixel pointer の null チェック(8 vs 16)へ fallback する。
+static inline PF_PixelFormat detect_pixel_format(PF_InData *in_data, PF_EffectWorld *world)
+{
+    if (!in_data || !in_data->pica_basicP || !world) return PF_PixelFormat_INVALID;
+    PF_WorldSuite2 *wsP = NULL;
+    PF_PixelFormat fmt  = PF_PixelFormat_INVALID;
+    if (in_data->pica_basicP->AcquireSuite(kPFWorldSuite, kPFWorldSuiteVersion2,
+                                           (const void**)&wsP) == 0 && wsP) {
+        wsP->PF_GetPixelFormat(world, &fmt);
+        in_data->pica_basicP->ReleaseSuite(kPFWorldSuite, kPFWorldSuiteVersion2);
+    }
+    return fmt;
 }
 
 
@@ -630,13 +666,25 @@ static PF_Err Render (  PF_InData       *in_data,
     SmartRenderInfo info;
     params_to_smart_info(params, &info);
 
+    // Phase 2-A.2 Step 2: 32bpc(PF_PixelFloat / ARGB128)を含む 3 段分岐。
+    // 既存の "PF_GET_PIXEL_DATA16 が NULL なら 8bpc" 推定では 32bpc を 8bpc と
+    // 誤判定してしまうため、PF_GetPixelFormat で明示的に判別する。
+    const PF_PixelFormat fmt = detect_pixel_format(in_data, input);
+    if (fmt == PF_PixelFormat_ARGB128) {
+        err = smoothing<PF_PixelFloat, KP_PIXEL128>(in_data, out_data, &info,
+                                                    input, output,
+                                                    (PF_PixelFloat*)input->data,
+                                                    (PF_PixelFloat*)output->data);
+        return err;
+    }
+
 	PF_Pixel16	*in_ptr16, *out_ptr16;
 	PF_GET_PIXEL_DATA16(output, NULL, &out_ptr16 );
 	PF_GET_PIXEL_DATA16(input, NULL, &in_ptr16 );
 
 	if( out_ptr16 != NULL && in_ptr16 != NULL )
 	{
-		// 16bpc or 32bpc
+		// 16bpc
 		err = smoothing<PF_Pixel16, KP_PIXEL64>(in_data, out_data, &info,
 												input, output, in_ptr16, out_ptr16 );
 	}
@@ -757,24 +805,32 @@ static PF_Err SmartRender(PF_InData            *in_data,
         return err ? err : PF_Err_INTERNAL_STRUCT_DAMAGED;
     }
 
-    // bpc 判定は legacy Render と同じパターン:PF_GET_PIXEL_DATA16 が NULL を
-    // 返すかで 8/16bpc を区別。SmartRender 経路でも PF_LayerDef === PF_EffectWorld
-    // typedef なので同 macro が使える。
-    PF_Pixel16 *in_ptr16, *out_ptr16;
-    PF_GET_PIXEL_DATA16(output_world, NULL, &out_ptr16);
-    PF_GET_PIXEL_DATA16(input_world,  NULL, &in_ptr16);
-
-    if (out_ptr16 != NULL && in_ptr16 != NULL) {
-        err = smoothing<PF_Pixel16, KP_PIXEL64>(in_data, out_data, info,
-                                                input_world, output_world,
-                                                in_ptr16, out_ptr16);
+    // Phase 2-A.2 Step 2: bpc 判定は PF_GetPixelFormat 結果を優先。
+    // PF_GET_PIXEL_DATA16 / DATA8 は 32bpc 時に両方 NULL を返してしまうため、
+    // ARGB128 を最初にハンドルしてから 16/8bpc に分岐する。
+    const PF_PixelFormat fmt = detect_pixel_format(in_data, input_world);
+    if (fmt == PF_PixelFormat_ARGB128) {
+        err = smoothing<PF_PixelFloat, KP_PIXEL128>(in_data, out_data, info,
+                                                    input_world, output_world,
+                                                    (PF_PixelFloat*)input_world->data,
+                                                    (PF_PixelFloat*)output_world->data);
     } else {
-        PF_Pixel8 *in_ptr8, *out_ptr8;
-        PF_GET_PIXEL_DATA8(output_world, NULL, &out_ptr8);
-        PF_GET_PIXEL_DATA8(input_world,  NULL, &in_ptr8);
-        err = smoothing<PF_Pixel8, KP_PIXEL32>(in_data, out_data, info,
-                                               input_world, output_world,
-                                               in_ptr8, out_ptr8);
+        PF_Pixel16 *in_ptr16, *out_ptr16;
+        PF_GET_PIXEL_DATA16(output_world, NULL, &out_ptr16);
+        PF_GET_PIXEL_DATA16(input_world,  NULL, &in_ptr16);
+
+        if (out_ptr16 != NULL && in_ptr16 != NULL) {
+            err = smoothing<PF_Pixel16, KP_PIXEL64>(in_data, out_data, info,
+                                                    input_world, output_world,
+                                                    in_ptr16, out_ptr16);
+        } else {
+            PF_Pixel8 *in_ptr8, *out_ptr8;
+            PF_GET_PIXEL_DATA8(output_world, NULL, &out_ptr8);
+            PF_GET_PIXEL_DATA8(input_world,  NULL, &in_ptr8);
+            err = smoothing<PF_Pixel8, KP_PIXEL32>(in_data, out_data, info,
+                                                   input_world, output_world,
+                                                   in_ptr8, out_ptr8);
+        }
     }
 
     extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);

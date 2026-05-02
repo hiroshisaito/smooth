@@ -2,11 +2,11 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.2 Step 1 完了 — Rust `smooth_core` の f32 domain 拡張(`SmoothScalar` trait 抽象 + `Pixel32` + 既存 `<P: SmoothPixel>` ジェネリックそのまま 32bpc 対応)。次は **Phase 2-A.2 Step 2**(Effect.cpp に PF_PixelFloat 分岐追加、`FLOAT_COLOR_AWARE` flag 同期)。
+**現在地**: Phase 2-A.2 Step 2 完了 — Effect.cpp + Pipl.r に `PF_OutFlag2_FLOAT_COLOR_AWARE` を追加、`PF_GetPixelFormat` ベースの 3 段 bpc 分岐(8 / 16 / 32)で `smoothing<PF_PixelFloat, KP_PIXEL128>` への dispatch を実装、Mac Universal build SUCCEEDED + 既存 regression 非劣化。次は **Phase 2-A.2 Step 3**(test harness manifest migration)。
 
 Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の Effect.cpp 統合(Sub-stage C-2)は 2-A.2 完了後。
 
-**Last update**: 2026-05-03(2-A.2 Step 1: SmoothScalar trait 導入 + Pixel32 追加、cargo test 15/15 + 既存 regression 14/14 PASS、overbright/NaN/subnormal 防御 unit tests 追加)。
+**Last update**: 2026-05-03(2-A.2 Step 2: FLOAT_COLOR_AWARE flag + 32bpc dispatch、build SUCCEEDED + cargo 15/15 + regression 14/14×{parallel,serial} PASS。実機 32bpc 検証は Step 5 へ繰り延べ)。
 
 ---
 
@@ -30,7 +30,7 @@ Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の 
 ## Phase 2-A.2 32bpc + manifest 化(5 Steps)
 
 - ✅ **Step 1**: Rust `smooth_core` f32 domain 拡張(`SmoothScalar` trait 導入、`SmoothPixel::Scalar` 関連型、`Pixel32` 追加、`smooth_core_preprocess_f32` + `smooth_core_process_row_range_f32` FFI、cargo test 15/15 PASS、既存 8/16bpc regression 非劣化 14/14)
-- [ ] **Step 2**: Effect.cpp + Pipl.r に FLOAT_COLOR_AWARE、32bpc regression PASS
+- ✅ **Step 2**: Effect.cpp + Pipl.r `FLOAT_COLOR_AWARE` flag(GlobalSetup + Pipl.r flags2 = 0x08801410)、`detect_pixel_format()` ヘルパで `PF_GetPixelFormat` 取得 → 3 段 bpc dispatch(8/16/32)、`smoothing<>()` を `if constexpr (sizeof==16)` で `range_f32` ブランチ化、`KP_PIXEL128` placeholder 追加、Mac Universal build SUCCEEDED、cargo 15/15 + regression 14/14×{parallel,serial} 非劣化(32bpc 実機検証は Step 5 で実施)
 - [ ] **Step 3**: Test harness manifest migration、v1.4.0-ae2025 backfill manifest
 - [ ] **Step 4**: 32bpc goldens capture、GitHub Release artifact、fetch_goldens.sh
 - [ ] **Step 5**: Mac + Win cross-platform 32bpc 検証、§3.2.5 gate 全 YES
@@ -62,9 +62,9 @@ Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の 
 
 ## 次のアクション
 
-**Phase 2-A.2 Step 2**(Effect.cpp + Pipl.r 32bpc 統合): `SmartRender()` の bpc switch に `PF_PixelFloat` ケース追加、`smoothing<Pixel32, ...>` インスタンス化 → Rust 側 f32 FFI を呼ぶ。GlobalSetup + Pipl.r `out_flags2` に `PF_OutFlag2_FLOAT_COLOR_AWARE` (bit 12) を OR。
+**Phase 2-A.2 Step 3**(test harness manifest migration): `tests/goldens/v1.4.0-ae2025/` 配下のフレーム群を `goldens/manifest.toml` 形式に移行、`fetch_goldens.sh` で GitHub Release artifact から取得する仕掛けを追加。32bpc goldens は Step 4 で capture する前提で、Step 3 は 8/16bpc 既存 fixture の構造変更のみ(regression 14/14 維持)。
 
-その後の流れ: 2-A.2 Step 3(test harness manifest migration)→ Step 4(32bpc goldens capture)→ Step 5(Mac/Win cross-platform 検証)→ Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)→ Sub-stage D / E / F。
+その後の流れ: 2-A.2 Step 4(32bpc goldens capture)→ Step 5(Mac/Win cross-platform + 実機 32bpc 黄色三角解消検証)→ Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)→ Sub-stage D / E / F。
 
 Win build は外部の Win 環境で 2-A.1 + 2-A.2 まとめて実施(Phase 2-A.2 close 後 / もしくは Phase 2-A.3 着手前のチェックポイントで)。
 
