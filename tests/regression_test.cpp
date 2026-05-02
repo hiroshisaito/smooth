@@ -28,12 +28,14 @@
 #include "smooth_core.h"
 
 struct Dump {
+    uint32_t version = 1;
     uint32_t width = 0;
     uint32_t height = 0;
     uint32_t bpc = 0;
     uint32_t rowbytes = 0;
     uint32_t frame_n = 0;
-    uint32_t range = 0;
+    uint32_t range = 0;        // u32 sum threshold (8/16bpc); 0 on 32bpc
+    float    range_f32 = 0.0f; // f32 sum threshold (32bpc, v2 only)
     float    line_weight = 0.5f;
     uint32_t white = 0;
     std::vector<uint8_t> pixels;
@@ -57,6 +59,7 @@ static bool read_dump(const std::string& path, Dump& d) {
     uint8_t hdr[64];
     if (std::fread(hdr, 1, 64, f) != 64) { std::fclose(f); return false; }
     if (std::memcmp(hdr, "SMDP", 4) != 0) { std::fclose(f); return false; }
+    read_u32(hdr, 4,  d.version);
     read_u32(hdr, 8,  d.width);
     read_u32(hdr, 12, d.height);
     read_u32(hdr, 16, d.bpc);
@@ -65,6 +68,16 @@ static bool read_dump(const std::string& path, Dump& d) {
     read_u32(hdr, 32, d.range);
     read_f32(hdr, 36, d.line_weight);
     read_u32(hdr, 40, d.white);
+    if (d.version >= 2) {
+        // SMDP v2 parks the f32 range at offset 44 (formerly reserved[0]).
+        // 32bpc fixtures need this; 8/16bpc fixtures keep d.range and leave
+        // d.range_f32 = 0 (treated as unused by the dispatch below).
+        read_f32(hdr, 44, d.range_f32);
+    }
+    if (d.bpc == 32 && d.version < 2) {
+        std::fprintf(stderr, "32bpc fixture requires SMDP v2 header (got v%u)\n", d.version);
+        std::fclose(f); return false;
+    }
 
     const size_t nbytes = (size_t)d.rowbytes * (size_t)d.height;
     d.pixels.resize(nbytes);
@@ -102,6 +115,7 @@ int main(int argc, char** argv) {
 
     smooth_core::Params p;
     p.range        = in.range;
+    p.range_f32    = in.range_f32;  // SMDP v2 32bpc threshold (0 for 8/16bpc paths)
     p.line_weight  = in.line_weight;
     p.white_option = (in.white != 0);
 
@@ -123,6 +137,11 @@ int main(int argc, char** argv) {
             smooth_core::process<PF_Pixel16>(
                 reinterpret_cast<PF_Pixel16*>(in.pixels.data()),
                 reinterpret_cast<PF_Pixel16*>(out.data()),
+                (int)in.width, (int)in.height, (int)in.rowbytes, p);
+        } else if (in.bpc == 32) {
+            smooth_core::process<PF_PixelFloat>(
+                reinterpret_cast<PF_PixelFloat*>(in.pixels.data()),
+                reinterpret_cast<PF_PixelFloat*>(out.data()),
                 (int)in.width, (int)in.height, (int)in.rowbytes, p);
         } else {
             std::fprintf(stderr, "unsupported bpc=%u\n", in.bpc);
@@ -147,7 +166,9 @@ int main(int argc, char** argv) {
 
     size_t diffs = 0;
     int max_abs = 0;
-    const size_t pxsize = (in.bpc == 8) ? 4 : 8;
+    const size_t pxsize = (in.bpc == 8)  ? 4
+                        : (in.bpc == 16) ? 8
+                        :                  16;  // 32bpc PF_PixelFloat
     const size_t pixels_per_row = in.rowbytes / pxsize;
     int first_diff_count = 0;
     for (size_t i = 0; i < expected.pixels.size(); i++) {

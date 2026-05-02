@@ -73,3 +73,32 @@ See `bench.h` `DumpHeader` for the exact layout.
 ## Manifest schema (`tests/goldens/<suite>/manifest.toml`)
 
 Documented in `docs/PHASE_2A_GPU_RFC.md` §3.2.6. Two policy slots — `mac_reference_policy` (Mac CPU bit-for-bit) vs `cross_platform_policy` (Mac↔Win tolerance) — kept separate so a near-ID exception for one doesn't accidentally relax the other. Per-frame `policy_overrides` exists for cases like frame 135 (Phase 1 strip-parallel boundary residual). Future 32bpc suite adds an `f32_abs` metric variant.
+
+## SMDP file format
+
+64-byte header + raw pixels (ARGB, contiguous rows; rowbytes from header).
+
+- **v1**: 8/16bpc. `params_range` is the u32 sum threshold, `params_range_f32` slot is unused (read as 0).
+- **v2**: adds 32bpc support. `params_range` is 0 on 32bpc dumps; `params_range_f32` (offset 44) carries the f32 sum threshold = `slider × 4 / 100`. v1 readers can ignore the new field; v2 readers should consult `params_range_f32` only when `bpc == 32`. See `bench.h::DumpHeader` for the canonical layout.
+
+## 32bpc goldens capture (Phase 2-A.2 Step 4)
+
+Capture from AE 2025 32bpc projects via EXR export → `tests/capture_32bpc.py`:
+
+```sh
+# One-time: install OpenEXR + numpy into the existing tests/.venv
+tests/.venv/bin/pip install -r tests/requirements-capture.txt
+
+# Sanity check the SMDP encoder without touching AE
+tests/.venv/bin/python3 tests/capture_32bpc.py --self-test
+
+# Per-frame capture
+tests/.venv/bin/python3 tests/capture_32bpc.py \
+    --frame-n 200 \
+    --in-exr  /tmp/exr/input_0200.exr \
+    --out-exr /tmp/exr/output_0200.exr \
+    --range 12.0 --line-weight 0.5351 \
+    --output-dir tests/goldens/v1.6.0-32bpc/
+```
+
+The script's docstring documents the AE Render Queue setup (two passes — one with smooth bypassed, one with it applied — exporting to EXR float). After 14 frames are captured, regenerate `tests/goldens/v1.6.0-32bpc/manifest.toml` (same backfill flow as the v1.4.0 suite) and run `tests/run_regression.sh` — the harness already dispatches `bpc == 32` to `smooth_core::process<PF_PixelFloat>`.

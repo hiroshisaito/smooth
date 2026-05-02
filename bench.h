@@ -1,4 +1,4 @@
-// smooth-mod-v1.5.0 benchmarking / regression capture
+// smooth-mod benchmarking / regression capture
 // Header-only. Enable with -DSMOOTH_BENCH=1
 //
 // When enabled, instruments smoothing() to:
@@ -7,6 +7,14 @@
 //   - append timing + parameter log to /tmp/smooth_bench/timing.log
 //
 // Raw file layout: 64-byte SMDP header followed by rowbytes * height pixel bytes.
+//
+// SMDP versioning:
+//   v1 — original 8/16bpc layout. params_range is u32 sum threshold.
+//   v2 — adds params_range_f32 at reserved[0]. Used by 32bpc captures so the
+//        f32 range threshold (= raw slider × 4 channels × 1.0 / 100) survives
+//        the round trip; 8/16bpc captures may write 0.0 here. v1 readers
+//        ignore it; v2 readers should consult params_range_f32 when bpc==32.
+//        See tests/capture_32bpc.py for the reference EXR → SMDP encoder.
 
 #ifndef SMOOTH_BENCH_H_
 #define SMOOTH_BENCH_H_
@@ -35,17 +43,18 @@ namespace smooth_bench {
 
 struct DumpHeader {
     char     magic[4];             // "SMDP"
-    uint32_t version;              // 1
+    uint32_t version;              // 1 (8/16bpc) or 2 (8/16/32bpc with params_range_f32)
     uint32_t width;
     uint32_t height;
-    uint32_t bpc;                  // 8 or 16
+    uint32_t bpc;                  // 8, 16, or 32 (32bpc requires version >= 2)
     uint32_t rowbytes;             // bytes per row
     uint32_t channels;             // 4 (ARGB)
     uint32_t frame_n;
-    uint32_t params_range;
+    uint32_t params_range;         // u32 sum threshold for 8/16bpc; 0 for 32bpc
     float    params_line_weight;
     uint32_t params_white;
-    uint32_t reserved[5];
+    float    params_range_f32;     // v2: f32 sum threshold for 32bpc; 0.0 for 8/16bpc (or unused on v1)
+    uint32_t reserved[4];
 };
 static_assert(sizeof(DumpHeader) == 64, "DumpHeader must stay 64 bytes");
 

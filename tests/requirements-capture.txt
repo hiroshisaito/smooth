@@ -1,0 +1,11 @@
+# Phase 2-A.2 Step 4 capture rig — install into tests/.venv before running
+# tests/capture_32bpc.py against AE-exported EXR files.
+#
+#   tests/.venv/bin/pip install -r tests/requirements-capture.txt
+#
+# numpy is the array primitive for the RGBA -> ARGB reorder. OpenEXR is the
+# reference Python binding from the openexr project (PyPI). Versions are
+# pinned to spare future contributors a "works on my machine" debugging
+# session; bump in lockstep with a re-capture of the goldens, never silently.
+numpy>=2.0,<3.0
+OpenEXR>=3.2,<4.0

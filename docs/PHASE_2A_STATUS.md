@@ -2,7 +2,7 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.2 Step 3 完了 — `tests/goldens/v1.4.0-ae2025/manifest.toml`(schema v1)を backfill commit、`fetch_goldens.sh` で per-file SHA256 検証経路を追加、`run_regression.sh` を glob → manifest-driven へ refactor、`.gitignore` を「親 unignore → 中身 ignore → manifest だけ許可」3 段に修正。regression は SMOOTH_PARALLEL=1/0 双方で 14/14 + synthetic 6/6 PASS、frame 135 NEAR-ID 継続。次は **Phase 2-A.2 Step 4**(32bpc goldens capture + GitHub Release tar.zst upload)。
+**現在地**: Phase 2-A.2 Step 4a 完了 — SMDP v2 header(`params_range_f32` 追加)、`regression_test.cpp` 32bpc dispatch、`tests/capture_32bpc.py`(EXR → SMDP コンバーター、self-test PASS)、numpy + OpenEXR 依存 pin。次は **Phase 2-A.2 Step 4b**(Mac AE 2025 実機で 32bpc 14 frames capture → tar.zst → GitHub Release upload → manifest backfill)。
 
 Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の Effect.cpp 統合(Sub-stage C-2)は 2-A.2 完了後。
 
@@ -32,7 +32,9 @@ Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の 
 - ✅ **Step 1**: Rust `smooth_core` f32 domain 拡張(`SmoothScalar` trait 導入、`SmoothPixel::Scalar` 関連型、`Pixel32` 追加、`smooth_core_preprocess_f32` + `smooth_core_process_row_range_f32` FFI、cargo test 15/15 PASS、既存 8/16bpc regression 非劣化 14/14)
 - ✅ **Step 2**: Effect.cpp + Pipl.r `FLOAT_COLOR_AWARE` flag(GlobalSetup + Pipl.r flags2 = 0x08801410)、`detect_pixel_format()` ヘルパで `PF_GetPixelFormat` 取得 → 3 段 bpc dispatch(8/16/32)、`smoothing<>()` を `if constexpr (sizeof==16)` で `range_f32` ブランチ化、`KP_PIXEL128` placeholder 追加、Mac Universal build SUCCEEDED、cargo 15/15 + regression 14/14×{parallel,serial} 非劣化、**Mac AE 2025 実機 3 点確認 PASS(8/16/32bpc Comp 全て ⚠️ 無し + クラッシュ無し、2026-05-03)**。pixel-perfect 32bpc 検証(goldens 比較)は Step 4 へ
 - ✅ **Step 3**: Test harness manifest migration — schema v1 を `docs/PHASE_2A_GPU_RFC.md §3.2.6` に従い TOML で確定、`tests/goldens/v1.4.0-ae2025/manifest.toml` backfill(14 frames + suite-level mac_reference / cross_platform policy + frame 135 policy_overrides)、`tests/fetch_goldens.sh` で per-file SHA256 検証(artifact 未 upload 時は integrity check のみ実施)、`tests/run_regression.sh` を manifest-driven 化(glob 廃止)、`.gitignore` を 3 段パターンに更新(親 unignore → 中身 ignore → manifest だけ許可)。regression 14/14 SMOOTH_PARALLEL=1/0 両方 PASS。`artifact_url` は Step 4 で埋める placeholder のまま、harness の tolerance 判定は regression_test.cpp 内のハードコード `diff < 0.01% && max_abs <= 32` を継続(Step 4 で manifest 駆動に置換予定)
-- [ ] **Step 4**: 32bpc goldens capture、GitHub Release artifact、artifact_url backfill + fetch_goldens.sh download path 動作確認
+- 🟡 **Step 4**: 32bpc goldens capture
+  - ✅ **Step 4a (code only)**: SMDP v2 schema(`bench.h::DumpHeader.params_range_f32`)、`tests/regression_test.cpp` を 32bpc 対応(v2 header 読み取り + `smooth_core::process<PF_PixelFloat>` dispatch)、`tests/capture_32bpc.py`(EXR → SMDP v2 converter、self-test PASS)、`tests/requirements-capture.txt`(numpy + OpenEXR pin)、tests/README.md に capture 手順追記。Mac plugin Release rebuild SUCCEEDED(bench.h header layout change のみ、Release では `SMOOTH_BENCH=0` で no-op)。regression 14/14 SMOOTH_PARALLEL=1/0 両方 PASS、cargo 15/15 PASS
+  - ⬜ **Step 4b (real-device)**: Mac AE 2025 で 14 frames 32bpc capture(EXR pair 出力)→ `capture_32bpc.py` で SMDP 化 → `tests/goldens/v1.6.0-32bpc/manifest.toml` 作成 → tar.zst + GitHub Release upload → 両 manifest の `artifact_url` / `artifact_sha256` backfill → fetch_goldens.sh download path 動作確認 → harness の tolerance 判定を manifest 駆動化(regression_test.cpp ハードコード除去)
 - [ ] **Step 5**: Mac + Win cross-platform 32bpc 検証、§3.2.5 gate 全 YES
 
 ## Phase 2-A.3 GPU render + v1.6.0 出荷(6 Steps)
