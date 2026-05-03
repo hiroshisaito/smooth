@@ -62,6 +62,29 @@ struct SequenceData
     uint64_t uuid_hi;
 };
 
+// Phase 2-A.3 Sub-stage C-2 dispatch gate.
+//
+// C-2 wires up every selector AE needs (GPU_DEVICE_SETUP, SMART_RENDER_GPU,
+// 5-condition AND in PreRender, fault injection plumbing) but does NOT yet
+// implement the actual Metal kernel dispatch — that is C-2.5. While this
+// gate is 0:
+//   * SmartPreRender's 5-condition AND still runs for verification, but its
+//     `flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE` write is suppressed,
+//     so AE never issues SMART_RENDER_GPU.
+//   * SmartRenderGpu remains dispatchable (a future AE / driver could still
+//     reach it), but it stays guarded — see the function body.
+//
+// Why this matters: a 32bpc GPU comp delivers a *GPU world* (ARGB128 in
+// device memory). The CPU path's PF_GET_PIXEL_DATA16 / DATA8 macros raise
+// AE's "gpu effect world is not supported yet" verification error against
+// such a world, which crashes the host. Falling SMART_RENDER_GPU through to
+// SmartRender (the C-2 stub did this) walks straight into that trap. C-2.5
+// flips this to 1 once the Metal command-buffer path can actually consume
+// the GPU world via the GPU device suite.
+#ifndef SMOOTH_GPU_DISPATCH_READY
+#define SMOOTH_GPU_DISPATCH_READY 0
+#endif
+
 //---------------------------------------------------------------------------//
 // プロトタイプ
 static PF_Err About (   PF_InData       *in_data,
@@ -937,9 +960,18 @@ static PF_Err SmartPreRender(PF_InData         *in_data,
     const bool cond_d = (smooth_core_gpu_is_backend_usable() != 0);
     const bool cond_e = cond_d;  // C-2 stub: merged with (d) until Sub-stage D
 
-    if (cond_a && cond_b && cond_c && cond_d && cond_e) {
+    const bool all_conditions = (cond_a && cond_b && cond_c && cond_d && cond_e);
+#if SMOOTH_GPU_DISPATCH_READY
+    if (all_conditions) {
         extraP->output->flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE;
     }
+#else
+    // C-2 stub: 5-condition AND is computed for verification (a debug build
+    // could log `all_conditions` here), but the flag is intentionally not
+    // raised so AE never dispatches SMART_RENDER_GPU. See
+    // SMOOTH_GPU_DISPATCH_READY comment above SequenceData.
+    (void)all_conditions;
+#endif
 
     return PF_Err_NONE;
 }
@@ -1136,6 +1168,27 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
                              PF_OutData           *out_data,
                              PF_SmartRenderExtra  *extraP)
 {
+#if !SMOOTH_GPU_DISPATCH_READY
+    // C-2 stub guard. PreRender does not raise GPU_RENDER_POSSIBLE while
+    // this gate is 0, so AE should never reach this path. If it does (an
+    // older cached PreRender result, a future AE/driver behaviour change,
+    // or a manual test harness), refuse cleanly instead of falling through
+    // to SmartRender — the latter calls PF_GET_PIXEL_DATA{8,16} which AE
+    // verifies-and-aborts when handed a GPU world.
+    //
+    // PF_Err_INTERNAL_STRUCT_DAMAGED is the most truthful code we have
+    // here ("the plugin is in an inconsistent state for this dispatch");
+    // it stops the current frame without crashing the host. The Render
+    // Queue may flag the frame, but the user can re-render after toggling
+    // off the GPU checkbox. C-2.5 removes this guard and replaces the body
+    // with the real Metal path.
+    (void)in_data; (void)out_data; (void)extraP;
+    uint64_t uuid_lo, uuid_hi;
+    if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
+        smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
+    }
+    return PF_Err_INTERNAL_STRUCT_DAMAGED;
+#else
     PF_Err err = PF_Err_NONE;
 
     SmartRenderInfo *info = (SmartRenderInfo*)extraP->input->pre_render_data;
@@ -1148,22 +1201,25 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // Mark this instance fallen so subsequent PreRenders skip GPU. AE
         // will keep calling SMART_RENDER_GPU for in-flight frames in the
         // same PreRender batch until PreRender re-runs and clears the flag,
-        // so we still need to produce output — fall through to the CPU path.
+        // so we still need to produce output — go through the CPU path.
         uint64_t uuid_lo, uuid_hi;
         if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
             smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
         }
-        // Fall through to CPU SmartRender — RFC §4.4 採用 (i): device->host
-        // ->device + PF_Err_NONE so the Render Queue job does not abort.
-        return SmartRender(in_data, out_data, extraP);
+        // RFC §4.4 採用 (i): device->host->device + PF_Err_NONE so the
+        // Render Queue job does not abort. C-2.5 wires the actual download/
+        // upload via the GPU device suite; until then this is a placeholder.
+        return PF_Err_NONE;
     }
 
-    // C-2 stub: route to the CPU SmartRender. Sub-stage C-2.5 replaces this
-    // with Metal command-buffer dispatch over a 2-pass smooth shader. Until
-    // then GPU and CPU paths are observationally identical (modulo the path
-    // bookkeeping verified by debug instrumentation).
-    err = SmartRender(in_data, out_data, extraP);
-    return err;
+    // C-2.5: Metal command-buffer dispatch goes here. The GPU world handed
+    // to us by AE goes through the GPU device suite to obtain a writable
+    // CPU shadow (or, in the all-Metal path, stays on device through a
+    // 2-pass shader). The current empty body is a placeholder; SmartRender
+    // is NOT a valid fallback because it consumes GPU worlds via CPU
+    // pixel-data macros that AE rejects.
+    return PF_Err_NONE;
+#endif
 }
 
 //---------------------------------------------------------------------------//
