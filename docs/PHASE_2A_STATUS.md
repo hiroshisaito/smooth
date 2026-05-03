@@ -64,11 +64,40 @@ Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の 
 
 ---
 
+## Win 着手前 de-risking チェックポイント
+
+「macOS RC まで Win に着手しない」運用ポリシー(Hiroshi さん 2026-05-03 確認)を保ったまま、Win セッション当たりの不確実性を減らすためのチェックポイント。Mac 単独で完了できるものを前倒しで潰し、Win セッションは「設計を変えない実装作業」だけに切り詰める。詳細設計は [`docs/PHASE_2A_GPU_RFC.md §3.3.7`](PHASE_2A_GPU_RFC.md) を参照。
+
+### 前倒し可能タスク(GPU 不要、Win 機さえあればいつでも)
+
+| タスク | 内容 | 所要 | 効果 |
+|---|---|---|---|
+| **2-A.2 Step 5** | Win で `cargo build --release` + `tests/synthesize_32bpc_goldens.sh` 実行 → Mac committed manifest との f32 比較。AE 操作不要、CUDA 不要 | 1〜2 時間 | cross-platform 32bpc CPU の保証取得、Rust toolchain on Win 動作確認、`cross_platform_policy.f32_abs <= 1e-5` 内に収まるかの一次測定 |
+
+このタスクが PASS した時点で 2-A.2 Phase は正式クローズ、以降の Mac GPU 進行(Sub-stage C-2 / C-2.5 / C-3 / D)は Win-side のリスクから完全に独立する。
+
+### Sub-stage E 着手直前の "design-freeze review" commit(Mac 単独)
+
+Sub-stage C-3 完了 + Sub-stage D 完了後、E 着手の **直前に 1 commit はさむ運用**。レビュー対象は RFC §3.3.7 で固定された下記 4 項目:
+
+1. Rust `GpuBackend` trait surface(CUDA push/pop / async stream / OOM error variant が Metal command buffer / completion handler と同形に収まるか)
+2. Rust GPU FFI surface(C 側に露出する struct layout、`smooth_core_version()` で枝番判定可能か)
+3. `sequence_data` UUID layout + once-fallen-always-fall fallback policy(platform 中立)
+4. error model: `PF_Err` 戻し方、DPU host-process-upload 採用方針(§4.4 採用 (i))の実装位置と、シミュレートする `SMOOTH_FORCE_GPU_ERROR` の hook 点
+
+review 結果は同 commit の本文に「変更なし」または「以下を修正」で残し、Win セッション側は **その commit から先しか触らない** 規約とする。
+
+### Mac 進行中に集積する SDK 仕様ノート
+
+Sub-stage C-2 / C-3 / D で見つかる「PF_Err の戻し方」「PreRender 5 条件」「DPU ハンドラ呼び出し順序」「checkbox invalidation」等を、随時 [`docs/SUB_STAGE_E_HANDOVER.md`](SUB_STAGE_E_HANDOVER.md)(将来作成、初回は Sub-stage C-2 完了時)に追記する。Win セッション開始時はこのファイルが Sub-stage E の playbook として機能する。
+
+---
+
 ## 次のアクション
 
-**Phase 2-A.2 Step 5**(Mac/Win cross-platform + 実機 32bpc 検証): Win 環境で smooth_core を build → `tests/synthesize_32bpc_goldens.sh` 実行 → Mac の committed manifest と SHA256 比較。Mac↔Win f32 LSB 差分は manifest の `cross_platform_policy.f32_abs <= 1e-5` で許容範囲内に収まることを確認。実機 32bpc Comp の visual 確認は Step 2 で済(2026-05-03 PASS)。
+**Phase 2-A.2 Step 5**(Mac/Win cross-platform + 実機 32bpc 検証): Win 環境で smooth_core を build → `tests/synthesize_32bpc_goldens.sh` 実行 → Mac の committed manifest と SHA256 比較。Mac↔Win f32 LSB 差分は manifest の `cross_platform_policy.f32_abs <= 1e-5` で許容範囲内に収まることを確認。実機 32bpc Comp の visual 確認は Step 2 で済(2026-05-03 PASS)。**この task は GPU 着手前の de-risking として早期前倒し推奨**(上記「Win 着手前 de-risking チェックポイント」節参照)。
 
-その後の流れ: Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)→ Sub-stage D / E / F。
+その後の流れ: Sub-stage C-2(Effect.cpp の GPU 統合)→ C-2.5(2-pass shader)→ C-3(実機 + fallback test + MFR + GPU stress)→ Sub-stage D → **Sub-stage E pre-flight design-freeze review**(RFC §3.3.7、Mac 単独 1 commit)→ Sub-stage E(Win CUDA)→ Sub-stage F。
 
 Win build は外部の Win 環境で 2-A.1 + 2-A.2 まとめて実施(Phase 2-A.2 close 後 / もしくは Phase 2-A.3 着手前のチェックポイントで)。
 

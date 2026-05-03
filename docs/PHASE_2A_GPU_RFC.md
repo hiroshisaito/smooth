@@ -536,6 +536,41 @@ NO の場合は **§5.1.3 Gate 4(Sub-stage F 完了時)として扱い** §5.1 F
 - **GPU goldens の扱い**: `gpu_metal_policy` / `gpu_cuda_policy` はまず CPU reference に対する許容差で運用。もし Metal / CUDA 側の出力を **独立した goldens artifact** として固定する必要が出たら(例: GPU 実装の regression を CPU の regression から切り離したい場合)、`tests/goldens/v1.6.0-32bpc-gpu-metal/` 等を後付けで新設する拡張余地を manifest schema に残す。**v1.6.0 時点では独立 goldens は作らない**
 - **Phase 2-A.4 以降の拡張余地**: DX12 / AMD / Intel 対応は GpuBackend trait の backend 追加で対応、CPU/GPU 切替 UI(checkbox)も checkbox → popup 差し替えで互換性破壊なし(§2.5)。shader 抽象化は入れない方針(§2.2 確定事項、既存 2 backend への影響最小化優先)
 
+#### 3.3.7 Sub-stage E (Win CUDA) pre-flight design-freeze checkpoint
+
+**運用ポリシー**: 「macOS 側が RC 品質に到達するまで Win CUDA に着手しない」(Hiroshi さん 2026-05-03 確認)。Mac で発見される設計修正を Win に持ち込むコストは大きい(両 backend の rework + 2 platform 並行検証)ため、Sub-stage E を始める前に **Mac 単独で 1 commit "design-freeze review" を挟む** 運用を本 RFC で明記する。
+
+**チェックポイントの位置**: Sub-stage C-3 完了 + Sub-stage D 完了の直後、Sub-stage E 着手の直前。`Sub-stage C / D の Mac AE 2025 実機 PASS が前提条件`。
+
+**レビュー対象(全 4 項目、各項目 "変更なし" or "以下を修正" を commit body に明記)**:
+
+1. **Rust `GpuBackend` trait surface**:
+   - CUDA push/pop / async stream / driver-side OOM error variant が、既に Mac で確定した Metal command buffer / completion handler / `MTLCommandBufferStatusError` と **同形に収まるか** を机上検証
+   - 不整合がある場合は trait をここで修正(Sub-stage B で freeze した surface を解凍する唯一のタイミング)
+   - 検証手順: `gpu/cuda.rs` の stub を実装視点で 30 分眺め、CUDA 実装で必要となるが trait に無い hook を列挙(該当時は trait に追加 + Mac 側 `gpu/metal.rs` を no-op 追従)
+2. **Rust GPU FFI surface(C 側公開)**:
+   - C++ Effect.cpp が呼ぶ `smooth_core_gpu_*` の struct layout、enum 値(`GpuBackendKind`、`GpuFallbackReason` 等)を **Win build でもバイナリ互換** に保てるか確認
+   - `smooth_core_version()` の枝番(low 16 bit)が GPU FFI 追加で bump 済みか確認、Win 側 plugin が古い枝番を見て abort できる準備があるか確認
+3. **`sequence_data` UUID layout + once-fallen-always-fall fallback policy**:
+   - UUID layout(§2.4 で確定)+ DashMap `<u128, AtomicBool>` 2 層構造が **CUDA 例外経路でも同じセマンティクスで動く** ことを確認
+   - 特に CUDA `cuCtxSynchronize` / `cuStreamSynchronize` が返す `cudaError_t` を `GpuFallbackReason` にどう map するかをここで決定し、Mac 側の `MTLCommandBufferStatus` map と整合させる
+   - flattened sequence_data の `MERGE_FLATTENED_FUNCTIONS` 経路は Win でも同じ Rust deserialize 経路を通るので、Mac で動いていれば Win でも動く想定。それでも一度確認
+4. **Error model: `PF_Err` 戻し方 + DPU host-process-upload 採用方針(§4.4 採用 (i)) + `SMOOTH_FORCE_GPU_ERROR` hook 点**:
+   - Mac 側で実装した「GPU 失敗時に device→host download → CPU 処理 → host→device upload + `PF_Err_NONE` で完走」の制御フローが、CUDA 側でも同じ関数境界で発火するか確認
+   - error injection 用の `SMOOTH_FORCE_GPU_ERROR` env 変数(C-3 で実装予定)が CUDA path にも通るよう、Effect.cpp 側で platform 中立の hook 点に置かれているか確認
+
+**checkpoint の運用形式**:
+
+- Mac 単独、commit subject は `chore(phase-2a): Sub-stage E pre-flight design-freeze review` 程度
+- commit body にレビュー結果(4 項目それぞれ"変更なし"または具体修正)+ 修正の場合の差分概要
+- Sub-stage E 担当者(Win セッション側)は、この commit より前の沿革は `git log` 程度に流し読みで OK、**この commit 以降の差分しか触らない** 規約とする
+- review で trait/FFI/error model の修正が発生した場合は、その修正自体を Mac で 1 つ以上の前置 commit として落としてから design-freeze commit を打つ(design-freeze commit 自体は変更ゼロ + 結論のドキュメンテーションに専念)
+
+**前倒し de-risk(Sub-stage E 着手とは独立に Win 環境で消化可能)**:
+
+- **Phase 2-A.2 Step 5(Mac↔Win cross-platform 32bpc)** は GPU 不要、AE 不要、`cargo build --release` + `tests/synthesize_32bpc_goldens.sh` だけで完結する。Win セッションが取れる任意のタイミング(2-A.3 進行中でもよい)に消化することで、`cross_platform_policy.f32_abs <= 1e-5` が実測で成立するかを Sub-stage E 着手より前に把握できる。閾値超過時は §4 Spike 項目追加(平台間 f32 非決定性の原因特定)、ここで GPU 着手前に解決を図る
+- **`docs/SUB_STAGE_E_HANDOVER.md`(Sub-stage C-2 完了時に新規作成、随時更新)**: Mac 進行中に発見される SDK 仕様の落とし穴(`PF_Err` 戻し方、PreRender 5 条件、DPU ハンドラ呼び出し順序、checkbox invalidation 等)を蓄積。Win セッション開始時はこのファイルを Sub-stage E の playbook として使う
+
 ## 4. Spike 項目(実測で決着させる確認事項)
 
 研究 doc の実装時確認リスト(§4.10 / §5.3.1 / §5.10 / §6.8)を独立章に集約。各項目を `[背景 / 方法 / 合格条件 / 不合格時の代替設計 / 実施タイミング]` の 5 フィールドで揃える。
