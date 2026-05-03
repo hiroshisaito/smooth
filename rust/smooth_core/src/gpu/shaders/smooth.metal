@@ -53,6 +53,39 @@ inline bool fast_compare_pixel(float4 a, float4 b) {
     return any(a != b);
 }
 
+// ========================================================================
+// blending_pixel_f (port of blend.rs::blending_pixel_f for Pixel32/f32).
+//
+// CPU formula at max_value = 1.0:
+//   out.alpha = target.alpha * ratio + ref.alpha * (1 - ratio)
+//   out.rgb   = target.rgb   * ratio + ref.rgb   * (1 - ratio)
+// with two special cases for premultiplied-alpha edge values:
+//   - target.alpha == 0  →  copy ref.rgb (unblended)
+//   - ref.alpha    == 0  →  copy target.rgb (unblended)
+// The "both alpha == max" branch on the CPU is just a fast-path for the
+// general formula at max_value=1.0, so f32 collapses to two branches:
+// one of {target,ref}.alpha is zero, or neither is.
+//
+// Channel order is BGRA (target.x = blue, etc), but the lerp formula is
+// channel-symmetric so the result is layout-correct regardless of which
+// component is which.
+// ========================================================================
+inline float4 blending_pixel_f(float4 target, float4 ref, float ratio) {
+    const float r_alpha = 1.0f - ratio;
+    const float out_a = target.w * ratio + ref.w * r_alpha;
+    if (target.w == 0.0f) {
+        return float4(ref.x, ref.y, ref.z, out_a);
+    }
+    if (ref.w == 0.0f) {
+        return float4(target.x, target.y, target.z, out_a);
+    }
+    return float4(
+        target.x * ratio + ref.x * r_alpha,
+        target.y * ratio + ref.y * r_alpha,
+        target.z * ratio + ref.z * r_alpha,
+        out_a);
+}
+
 // C-1 plumbing kernel: identity copy src → dst. Kept for unit tests; the
 // production GPU path uses smooth_preprocess (below) instead.
 kernel void smooth_passthrough(
