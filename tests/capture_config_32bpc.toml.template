@@ -1,0 +1,141 @@
+# Phase 2-A.2 Step 4b template — fill the EXR paths after AE Render Queue
+# emits the 14-frame pair, then run:
+#
+#   tests/.venv/bin/python3 tests/capture_32bpc.py \
+#       --config tests/capture_config_32bpc.toml --verbose
+#
+# How to read this file:
+#   * `range`       is the raw PARAM_RANGE slider value (0..100, float).
+#                   The numbers below are reverse-derived from the v1.4.0
+#                   u32-range goldens (slider ≈ u32 * 100 / (max_value * 4)).
+#                   If you remember the original "nice" slider value used
+#                   in the v1.4.0 capture (e.g. 1.0 instead of 0.9804),
+#                   prefer the original — it produces a cleaner reference.
+#   * `line_weight` is the raw PARAM_LINE_WEIGHT slider value (0..1).
+#   * `white`       is the PARAM_WHITE_OPTION checkbox state.
+#   * `in_exr` / `out_exr` are paths under `exr_base_dir`, one per frame.
+#
+# The 14 frames here intentionally mirror the v1.4.0-ae2025 manifest so
+# both suites can later be compared on the same scenes (one capture in
+# the integer domain, one in f32).
+#
+# Copy this file to `tests/capture_config_32bpc.toml` (NOT committed) and
+# edit. The template itself stays committed as the canonical schema.
+
+# Where AE wrote the EXRs. Adjust to the actual Render Queue output dir.
+exr_base_dir = "/tmp/exr_32bpc"
+# Where SMDP fixtures get written. Stays the same — manifest.toml will
+# live in this directory.
+output_dir   = "tests/goldens/v1.6.0-32bpc"
+
+[[frames]]
+n = 0
+range  = 0.9804      # v1.4.0 u32_range=10 (8bpc); operator likely typed 1.0
+line_weight = 0.500000
+white  = false
+in_exr  = "input_0000.exr"
+out_exr = "output_0000.exr"
+
+[[frames]]
+n = 10
+range  = 0.9804
+line_weight = 0.710000
+white  = false
+in_exr  = "input_0010.exr"
+out_exr = "output_0010.exr"
+
+[[frames]]
+n = 47
+range  = 0.9804
+line_weight = 0.730000
+white  = true
+in_exr  = "input_0047.exr"
+out_exr = "output_0047.exr"
+
+[[frames]]
+n = 50
+range  = 5.5882
+line_weight = 0.730000
+white  = false
+in_exr  = "input_0050.exr"
+out_exr = "output_0050.exr"
+
+[[frames]]
+n = 100
+range  = 2.6471
+line_weight = 0.730000
+white  = false
+in_exr  = "input_0100.exr"
+out_exr = "output_0100.exr"
+
+[[frames]]
+n = 135
+range  = 0.9804
+line_weight = 0.500000
+white  = false
+in_exr  = "input_0135.exr"
+out_exr = "output_0135.exr"
+
+[[frames]]
+n = 200
+range  = 1.1765
+line_weight = 0.535057
+white  = false
+in_exr  = "input_0200.exr"
+out_exr = "output_0200.exr"
+
+[[frames]]
+n = 500
+range  = 1.7380     # v1.4.0 u32_range=2278 (16bpc, max=32768)
+line_weight = 0.641954
+white  = false
+in_exr  = "input_0500.exr"
+out_exr = "output_0500.exr"
+
+[[frames]]
+n = 700
+range  = 2.3354
+line_weight = 0.756897
+white  = false
+in_exr  = "input_0700.exr"
+out_exr = "output_0700.exr"
+
+[[frames]]
+n = 1000
+range  = 1.8387
+line_weight = 0.504023
+white  = false
+in_exr  = "input_1000.exr"
+out_exr = "output_1000.exr"
+
+[[frames]]
+n = 1300
+range  = 4.3724
+line_weight = 0.516172
+white  = false
+in_exr  = "input_1300.exr"
+out_exr = "output_1300.exr"
+
+[[frames]]
+n = 1500
+range  = 6.0509
+line_weight = 0.524218
+white  = false
+in_exr  = "input_1500.exr"
+out_exr = "output_1500.exr"
+
+[[frames]]
+n = 1700
+range  = 7.7293
+line_weight = 0.532264
+white  = false
+in_exr  = "input_1700.exr"
+out_exr = "output_1700.exr"
+
+[[frames]]
+n = 1767
+range  = 8.2909
+line_weight = 0.534960
+white  = false
+in_exr  = "input_1767.exr"
+out_exr = "output_1767.exr"

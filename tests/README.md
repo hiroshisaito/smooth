@@ -102,3 +102,5 @@ tests/.venv/bin/python3 tests/capture_32bpc.py \
 ```
 
 The script's docstring documents the AE Render Queue setup (two passes — one with smooth bypassed, one with it applied — exporting to EXR float). After 14 frames are captured, regenerate `tests/goldens/v1.6.0-32bpc/manifest.toml` (same backfill flow as the v1.4.0 suite) and run `tests/run_regression.sh` — the harness already dispatches `bpc == 32` to `smooth_core::process<PF_PixelFloat>`.
+
+Full step-by-step procedure with per-frame parameters and Render Queue settings: [`docs/CAPTURE_32BPC_RUNBOOK.md`](../docs/CAPTURE_32BPC_RUNBOOK.md). Pre-filled batch config: [`tests/capture_config_32bpc.toml.template`](capture_config_32bpc.toml.template) — copy to `tests/capture_config_32bpc.toml` (gitignored) before editing.

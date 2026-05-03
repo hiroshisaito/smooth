@@ -35,6 +35,7 @@ Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の 
 - 🟡 **Step 4**: 32bpc goldens capture
   - ✅ **Step 4a (code only)**: SMDP v2 schema(`bench.h::DumpHeader.params_range_f32`)、`tests/regression_test.cpp` を 32bpc 対応(v2 header 読み取り + `smooth_core::process<PF_PixelFloat>` dispatch)、`tests/capture_32bpc.py`(EXR → SMDP v2 converter、self-test PASS)、`tests/requirements-capture.txt`(numpy + OpenEXR pin)、tests/README.md に capture 手順追記。Mac plugin Release rebuild SUCCEEDED(bench.h header layout change のみ、Release では `SMOOTH_BENCH=0` で no-op)。regression 14/14 SMOOTH_PARALLEL=1/0 両方 PASS、cargo 15/15 PASS
   - ⬜ **Step 4b (real-device)**: Mac AE 2025 で 14 frames 32bpc capture(EXR pair 出力)→ `capture_32bpc.py` で SMDP 化 → `tests/goldens/v1.6.0-32bpc/manifest.toml` 作成 → tar.zst + GitHub Release upload → 両 manifest の `artifact_url` / `artifact_sha256` backfill → fetch_goldens.sh download path 動作確認 → harness の tolerance 判定を manifest 駆動化(regression_test.cpp ハードコード除去)
+    - 操作詳細: [`docs/CAPTURE_32BPC_RUNBOOK.md`](CAPTURE_32BPC_RUNBOOK.md)、frame 別パラメータ template: [`tests/capture_config_32bpc.toml.template`](../tests/capture_config_32bpc.toml.template)
 - [ ] **Step 5**: Mac + Win cross-platform 32bpc 検証、§3.2.5 gate 全 YES
 
 ## Phase 2-A.3 GPU render + v1.6.0 出荷(6 Steps)

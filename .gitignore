@@ -12,6 +12,10 @@
 /tests/.venv/
 /tests/regression_test
 /tests/test_white_option
+# Operator-edited copy of capture_config_32bpc.toml.template (carries
+# local EXR scratch dir paths; the template itself stays committed as
+# the canonical schema + 14-frame parameter seed).
+/tests/capture_config_32bpc.toml
 
 # Phase 2-A.2 Step 3: goldens are NOT committed (502 MB+ per suite — see
 # docs/PHASE_2A_GPU_RFC.md §3.2.5 sizing rationale). Layout: keep the parent
