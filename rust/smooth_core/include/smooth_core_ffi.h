@@ -164,6 +164,64 @@ typedef struct {
 
 void smooth_core_process_row_range_f32(const smooth_row_range_args_f32_t *args);
 
+/* ============================================================================
+ * Phase 2-A.3 Sub-stage C-2: GPU plumbing FFI
+ * ----------------------------------------------------------------------------
+ *
+ * The C++ Effect.cpp surface uses these for sequence_data UUID lifecycle,
+ * per-instance fallen state, plugin-global backend health, and dev-only
+ * fault injection. None of them touch the actual Metal / CUDA dispatch —
+ * those go through opaque FrameContext handles added in Sub-stage C-2.5 / E.
+ *
+ * UUID layout
+ * -----------
+ *   uuid_lo = bits 0..63   (little-endian Rust native)
+ *   uuid_hi = bits 64..127
+ *   reconstructed u128 = (((u128)uuid_hi) << 64) | (u128)uuid_lo
+ *
+ * The C++ side stores both halves in sequence_data. RFC §6.5: regenerate at
+ * every SEQUENCE_SETUP / SEQUENCE_RESETUP (never carry across save/load).
+ * ========================================================================== */
+
+/* Generate a fresh UUID v4. SAFETY: caller passes valid pointers to writable
+ * uint64_t storage. Both halves are written before return. */
+void smooth_core_gpu_uuid_new(uint64_t *out_lo, uint64_t *out_hi);
+
+/* Mark this instance as "GPU has failed at least once during the current
+ * SETUP/RESETUP span". Idempotent. Called from the GPU error handler in
+ * Effect.cpp's SMART_RENDER_GPU after the device->host->device fallback
+ * (RFC §4.4 採用 (i)). */
+void smooth_core_gpu_mark_fallen(uint64_t uuid_lo, uint64_t uuid_hi);
+
+/* Returns 1 if this instance has been marked fallen, 0 otherwise.
+ * SmartPreRender uses this in the 5-condition AND that gates the
+ * PF_RenderOutputFlag_GPU_RENDER_POSSIBLE flag. */
+int32_t smooth_core_gpu_is_fallen(uint64_t uuid_lo, uint64_t uuid_hi);
+
+/* Drop the fallen entry. Called from PF_Cmd_SEQUENCE_SETDOWN so the next
+ * SETUP/RESETUP starts with a clean state. */
+void smooth_core_gpu_forget(uint64_t uuid_lo, uint64_t uuid_hi);
+
+/* Plugin-global backend health flag (RFC §4.3). Set at PF_Cmd_GLOBAL_SETUP
+ * (Sub-stage D wires the real detection logic). `usable` is a boolean:
+ * 0 = false, anything else = true. */
+void smooth_core_gpu_set_backend_usable(int32_t usable);
+
+/* Returns 1 if the backend is usable on this system, 0 otherwise. */
+int32_t smooth_core_gpu_is_backend_usable(void);
+
+/* Dev-only fault injection. Reads env var SMOOTH_FORCE_GPU_ERROR and returns
+ * 1 if it equals the requested point, 0 otherwise. Cheap (one getenv per
+ * call); safe to leave in Release builds because the env var is normally
+ * unset.
+ *
+ * point codes:
+ *   1 = "setup"   fail at GPU_DEVICE_SETUP
+ *   2 = "render"  fail mid SMART_RENDER_GPU
+ *   3 = "oom"     simulate VRAM OOM during render allocation
+ */
+int32_t smooth_core_gpu_should_force_error(int32_t point);
+
 #ifdef __cplusplus
 }
 #endif

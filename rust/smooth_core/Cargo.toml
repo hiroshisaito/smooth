@@ -13,6 +13,10 @@ rayon     = "1"
 dashmap   = "6"
 once_cell = "1"
 thiserror = "1"
+# Sub-stage C-2: per-instance UUID generation for sequence_data
+# (RFC §6.5: v4 random, regenerate at every SETUP/RESETUP, never
+# carry across save/load).
+uuid      = { version = "1", features = ["v4"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # Sub-stage C: Metal backend (real bindings).

@@ -23,7 +23,10 @@ use process::process_row_range;
 #[no_mangle]
 pub extern "C" fn smooth_core_version() -> u32 {
     // 0x0002_0003: added smooth_core_build_id() (backwards compatible — old callers keep working).
-    0x0002_0003
+    // 0x0002_0004: added GPU plumbing FFI (uuid_new / fallen state / backend_usable
+    //              / force-error injection). Still backward compatible — old plugin
+    //              binaries that never call these symbols continue to load.
+    0x0002_0004
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -261,4 +264,147 @@ unsafe fn run_row_range<P: SmoothPixel>(a: &RowRangeArgs, range: P::Scalar) {
         // SAFETY: see SharedBuf doc comment for the concurrent-write contract.
         unsafe { process_row_range(&tmpl, start, end, i_start, i_end); }
     });
+}
+
+// ============================================================================
+// Phase 2-A.3 Sub-stage C-2: GPU plumbing FFI
+// ============================================================================
+//
+// All functions here are backend-neutral — the C++ Effect.cpp surface uses
+// them for sequence_data UUID lifecycle, per-instance fallen state, plugin-
+// global backend health, and dev-only fault injection. The actual Metal /
+// CUDA dispatch lives in `gpu/metal.rs` / `gpu/cuda.rs` and is not exposed
+// to C from this layer (Sub-stage C-2.5 / E will route through opaque
+// FrameContext handles instead, keeping the C surface minimal).
+
+/// Generate a fresh UUID v4 and return it split into two u64 halves so the
+/// C++ side can hand it across the FFI without depending on a uuid type.
+/// Convention: `out_lo` = low 64 bits, `out_hi` = high 64 bits, both little-
+/// endian as Rust native. The matching `(lo, hi) -> u128` reconstruction is
+/// `((hi as u128) << 64) | (lo as u128)`.
+///
+/// SAFETY: caller must pass valid pointers to writable u64 storage.
+#[no_mangle]
+pub unsafe extern "C" fn smooth_core_gpu_uuid_new(out_lo: *mut u64, out_hi: *mut u64) {
+    let id = uuid::Uuid::new_v4().as_u128();
+    *out_lo = id as u64;
+    *out_hi = (id >> 64) as u64;
+}
+
+#[inline]
+fn uuid_from_halves(lo: u64, hi: u64) -> u128 {
+    ((hi as u128) << 64) | (lo as u128)
+}
+
+/// Mark the per-instance UUID as having had at least one GPU failure during
+/// the current SETUP/RESETUP span. Called from Effect.cpp's GPU error handler
+/// (after the device→host→device fallback in §4.4 採用 (i)).
+#[no_mangle]
+pub extern "C" fn smooth_core_gpu_mark_fallen(uuid_lo: u64, uuid_hi: u64) {
+    gpu::fallback::mark_fallen(uuid_from_halves(uuid_lo, uuid_hi));
+}
+
+/// Read the fallen flag for a UUID. Effect.cpp's SmartPreRender uses this in
+/// the 5-condition AND that gates `PF_RenderOutputFlag_GPU_RENDER_POSSIBLE`.
+/// Returns 1 if fallen, 0 otherwise.
+#[no_mangle]
+pub extern "C" fn smooth_core_gpu_is_fallen(uuid_lo: u64, uuid_hi: u64) -> i32 {
+    if gpu::fallback::is_fallen(uuid_from_halves(uuid_lo, uuid_hi)) { 1 } else { 0 }
+}
+
+/// Drop the fallen entry for a UUID. Called from `PF_Cmd_SEQUENCE_SETDOWN` so
+/// project reopen (or any path that produces a new UUID) starts with a clean
+/// state.
+#[no_mangle]
+pub extern "C" fn smooth_core_gpu_forget(uuid_lo: u64, uuid_hi: u64) {
+    gpu::fallback::forget(uuid_from_halves(uuid_lo, uuid_hi));
+}
+
+/// Plugin-global backend health flag, set once at `PF_Cmd_GLOBAL_SETUP`
+/// (Sub-stage D will wire `set_backend_usable` to the §4.3 detection result).
+/// `usable` is treated as a boolean: 0 = false, anything else = true.
+#[no_mangle]
+pub extern "C" fn smooth_core_gpu_set_backend_usable(usable: i32) {
+    gpu::detection::set_backend_usable(usable != 0);
+}
+
+#[no_mangle]
+pub extern "C" fn smooth_core_gpu_is_backend_usable() -> i32 {
+    if gpu::detection::is_backend_usable() { 1 } else { 0 }
+}
+
+/// Dev-only fault injection. Reads env var `SMOOTH_FORCE_GPU_ERROR` and
+/// returns 1 if it equals the requested point, 0 otherwise. Used by
+/// Effect.cpp / future Rust GPU code to simulate failures without rebuilding
+/// the plugin. Cheap (one getenv per call); Release builds keep the call
+/// because the env var is normally unset and the function is a 100ns no-op.
+///
+/// `point` codes (kept as integers so the C side does not need a string
+/// literal contract):
+///   1 = "setup"   — fail at GPU_DEVICE_SETUP
+///   2 = "render"  — fail mid SMART_RENDER_GPU
+///   3 = "oom"     — simulate VRAM OOM during render allocation
+#[no_mangle]
+pub extern "C" fn smooth_core_gpu_should_force_error(point: i32) -> i32 {
+    let want = match point {
+        1 => "setup",
+        2 => "render",
+        3 => "oom",
+        _ => return 0,
+    };
+    match std::env::var("SMOOTH_FORCE_GPU_ERROR") {
+        Ok(v) if v == want => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod gpu_ffi_tests {
+    use super::*;
+
+    #[test]
+    fn uuid_round_trip() {
+        let mut lo: u64 = 0;
+        let mut hi: u64 = 0;
+        unsafe { smooth_core_gpu_uuid_new(&mut lo, &mut hi); }
+        let id = uuid_from_halves(lo, hi);
+        assert_ne!(id, 0);
+        // v4 sets the version nibble in the high half (bits 76..79 = 0x4).
+        // Our halves layout: hi = bits 64..127, so version is in hi bits 12..15.
+        let version = (hi >> 12) & 0xF;
+        assert_eq!(version, 4, "uuid v4 version nibble");
+    }
+
+    #[test]
+    fn fallen_lifecycle_via_ffi() {
+        let mut lo: u64 = 0;
+        let mut hi: u64 = 0;
+        unsafe { smooth_core_gpu_uuid_new(&mut lo, &mut hi); }
+        assert_eq!(smooth_core_gpu_is_fallen(lo, hi), 0);
+        smooth_core_gpu_mark_fallen(lo, hi);
+        assert_eq!(smooth_core_gpu_is_fallen(lo, hi), 1);
+        smooth_core_gpu_forget(lo, hi);
+        assert_eq!(smooth_core_gpu_is_fallen(lo, hi), 0);
+    }
+
+    #[test]
+    fn backend_usable_toggle_via_ffi() {
+        let prev = smooth_core_gpu_is_backend_usable();
+        smooth_core_gpu_set_backend_usable(1);
+        assert_eq!(smooth_core_gpu_is_backend_usable(), 1);
+        smooth_core_gpu_set_backend_usable(0);
+        assert_eq!(smooth_core_gpu_is_backend_usable(), 0);
+        smooth_core_gpu_set_backend_usable(prev);
+    }
+
+    #[test]
+    fn force_error_unset_returns_zero() {
+        // Test isolation: only assert when env var is absent. The harness may
+        // legitimately set it for a different test run.
+        if std::env::var_os("SMOOTH_FORCE_GPU_ERROR").is_none() {
+            assert_eq!(smooth_core_gpu_should_force_error(1), 0);
+            assert_eq!(smooth_core_gpu_should_force_error(2), 0);
+            assert_eq!(smooth_core_gpu_should_force_error(3), 0);
+        }
+    }
 }
