@@ -67,7 +67,7 @@
 
 ## Raw file format (`SMDP`)
 
-64-byte header followed by `rowbytes * height` bytes of pixels (ARGB, 8 / 16 / 32 bpc; 32bpc lands in Phase 2-A.2 Step 4).
+64-byte header followed by `rowbytes * height` bytes of pixels (ARGB, 8 / 16 / 32 bpc).
 See `bench.h` `DumpHeader` for the exact layout.
 
 ## Manifest schema (`tests/goldens/<suite>/manifest.toml`)
@@ -81,26 +81,22 @@ Documented in `docs/PHASE_2A_GPU_RFC.md` §3.2.6. Two policy slots — `mac_refe
 - **v1**: 8/16bpc. `params_range` is the u32 sum threshold, `params_range_f32` slot is unused (read as 0).
 - **v2**: adds 32bpc support. `params_range` is 0 on 32bpc dumps; `params_range_f32` (offset 44) carries the f32 sum threshold = `slider × 4 / 100`. v1 readers can ignore the new field; v2 readers should consult `params_range_f32` only when `bpc == 32`. See `bench.h::DumpHeader` for the canonical layout.
 
-## 32bpc goldens capture (Phase 2-A.2 Step 4)
+## 32bpc goldens capture (synthetic, Phase 2-A.2 Step 4 ✅)
 
-Capture from AE 2025 32bpc projects via EXR export → `tests/capture_32bpc.py`:
+Primary path: `tests/synthesize_32bpc_goldens.sh` derives `tests/goldens/v1.6.0-32bpc/` from the existing v1.4.0-ae2025 inputs by promoting pixels to f32 and running `smooth_core::process<PF_PixelFloat>` directly. No AE, no EXR, no GitHub Release upload — one shell command:
 
 ```sh
-# One-time: install OpenEXR + numpy into the existing tests/.venv
-tests/.venv/bin/pip install -r tests/requirements-capture.txt
-
-# Sanity check the SMDP encoder without touching AE
-tests/.venv/bin/python3 tests/capture_32bpc.py --self-test
-
-# Per-frame capture
-tests/.venv/bin/python3 tests/capture_32bpc.py \
-    --frame-n 200 \
-    --in-exr  /tmp/exr/input_0200.exr \
-    --out-exr /tmp/exr/output_0200.exr \
-    --range 12.0 --line-weight 0.5351 \
-    --output-dir tests/goldens/v1.6.0-32bpc/
+tests/synthesize_32bpc_goldens.sh
+tests/run_regression.sh   # 28/28 PASS expected
 ```
 
-The script's docstring documents the AE Render Queue setup (two passes — one with smooth bypassed, one with it applied — exporting to EXR float). After 14 frames are captured, regenerate `tests/goldens/v1.6.0-32bpc/manifest.toml` (same backfill flow as the v1.4.0 suite) and run `tests/run_regression.sh` — the harness already dispatches `bpc == 32` to `smooth_core::process<PF_PixelFloat>`.
+Why synthetic: see [`docs/CAPTURE_32BPC_RUNBOOK.md`](../docs/CAPTURE_32BPC_RUNBOOK.md). RFC §3.2.6 declares the CPU 32bpc implementation as the reference, so the suite's role is "does smooth_core stay deterministic across builds and platforms?" rather than "does it match an independent oracle?".
 
-Full step-by-step procedure with per-frame parameters and Render Queue settings: [`docs/CAPTURE_32BPC_RUNBOOK.md`](../docs/CAPTURE_32BPC_RUNBOOK.md). Pre-filled batch config: [`tests/capture_config_32bpc.toml.template`](capture_config_32bpc.toml.template) — copy to `tests/capture_config_32bpc.toml` (gitignored) before editing.
+### Alternative path: AE EXR import (HDR test material only)
+
+`tests/capture_32bpc.py` + `tests/requirements-capture.txt` + `tests/capture_config_32bpc.toml.template` import EXR pairs exported from AE Render Queue. Not part of the regression suite; useful only if a future task needs HDR / overbright source material that the synthetic path (which sees 0..1 inputs from u8/u16 promotion) cannot produce. Run the script's `--self-test` mode to verify the SMDP encoder without touching AE:
+
+```sh
+tests/.venv/bin/pip install -r tests/requirements-capture.txt
+tests/.venv/bin/python3 tests/capture_32bpc.py --self-test
+```
