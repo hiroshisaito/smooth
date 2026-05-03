@@ -18,7 +18,8 @@ use super::{FrameContext, GpuBackend, GpuError};
 use std::ffi::c_void;
 
 use metal::{
-    CommandBufferRef, CommandQueue, ComputePipelineState, Device, Library, MTLSize,
+    Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device, Library,
+    MTLResourceOptions, MTLSize,
 };
 use objc::rc::autoreleasepool;
 
@@ -49,7 +50,12 @@ pub struct MetalBackend {
     /// Sub-stage C-2.5b.1: preprocess (white-key strip + copy).
     /// Replaces passthrough as the production-path entry kernel.
     pipeline_preprocess: ComputePipelineState,
-    // Sub-stage C-2.5b.2 will add: pipeline_detect, pipeline_blend.
+    /// Sub-stage C-2.5b.2-prep1: detect (write per-pixel mode_flg byte to
+    /// an intermediate buffer for the blend pass to consume). Built and
+    /// unit-tested ahead of the blend pipeline; not wired into
+    /// SmartRenderGpu yet.
+    pipeline_detect: ComputePipelineState,
+    // Sub-stage C-2.5b.2-prep2 will add: pipeline_blend.
 }
 
 unsafe impl Send for MetalBackend {}
@@ -86,12 +92,14 @@ impl MetalBackend {
                 .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
             let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
             let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
+            let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
 
             Ok(MetalBackend {
                 device,
                 queue,
                 pipeline_passthrough,
                 pipeline_preprocess,
+                pipeline_detect,
             })
         })
     }
@@ -108,13 +116,85 @@ impl MetalBackend {
                 .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
             let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
             let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
+            let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
             Ok(MetalBackend {
                 device,
                 queue,
                 pipeline_passthrough,
                 pipeline_preprocess,
+                pipeline_detect,
             })
         })
+    }
+
+    /// Sub-stage C-2.5b.2-prep1: smooth_detect. Writes a per-pixel
+    /// `mode_flg` byte to a freshly-allocated MTLBuffer of size
+    /// `width * height` bytes; the buffer is returned so the caller can
+    /// pass it to the blend kernel (or, in current code, drop it after
+    /// inspection). The `src` buffer is the GPU input world (BGRA128);
+    /// `src_pitch_pixels` and `width`/`height`/`logical_width` mirror
+    /// what `process_row_range` would see on the CPU side.
+    ///
+    /// Returns the modes buffer on success so unit tests / future blend
+    /// dispatches can consume it. Caller drops the returned `Buffer` to
+    /// release.
+    pub fn dispatch_detect(
+        &self,
+        ctx: &mut FrameContext,
+        src_buffer_ptr: *mut c_void,
+        src_pitch_pixels: u32,
+        width: u32,
+        height: u32,
+        logical_width: u32,
+        range: f32,
+    ) -> Result<Buffer, GpuError> {
+        if src_buffer_ptr.is_null() {
+            return Err(GpuError::Dispatch("null src buffer".into()));
+        }
+        if width == 0 || height == 0 {
+            return Err(GpuError::Dispatch("zero extent".into()));
+        }
+        let _ = &ctx.scratch;
+        let modes_bytes = (width as u64) * (height as u64);
+        let modes_buf = self.device.new_buffer(
+            modes_bytes,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        autoreleasepool(|| -> Result<(), GpuError> {
+            let cb: &CommandBufferRef = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pipeline_detect);
+
+            let src = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(src_buffer_ptr)
+            };
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(&modes_buf), 0);
+            enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(3, 4, &width  as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
+            enc.set_bytes(6, 4, &range as *const f32 as *const c_void);
+
+            let group = MTLSize::new(16, 16, 1);
+            let groups = MTLSize::new(
+                ((width + 15) / 16) as u64,
+                ((height + 15) / 16) as u64,
+                1,
+            );
+            enc.dispatch_thread_groups(groups, group);
+            enc.end_encoding();
+            cb.commit();
+            // Wait for completion so callers (unit tests / future blend
+            // chain) can read the modes buffer back. Sub-stage C-2.5b.2-
+            // prep2's blend pass will replace this with a serial commit
+            // that lets Metal pipeline the two passes.
+            cb.wait_until_completed();
+            Ok(())
+        })?;
+
+        Ok(modes_buf)
     }
 
     /// Sub-stage C-2.5b.1: preprocess. Mirrors `pre_process` in
@@ -246,4 +326,110 @@ impl GpuBackend for MetalBackend {
         Ok(())
     }
     fn name(&self) -> &'static str { "metal" }
+}
+
+#[cfg(test)]
+mod detect_tests {
+    use super::*;
+    use foreign_types::ForeignType;
+
+    /// Build a 4×4 BGRA128 buffer where (1,1) is black and the rest is white,
+    /// run dispatch_detect on it twice (once with a tight range, once loose),
+    /// and verify the modes buffer matches what process_row_range's
+    /// per-pixel branch would have written.
+    #[test]
+    fn detect_marks_centre_as_edge_with_tight_range() {
+        // BGRA float4 layout — pick distinct B and W where every channel
+        // differs by 1.0 (delta_sum = 4.0) so a 0.1 tolerance catches them
+        // and a 5.0 tolerance absorbs them.
+        let w: [f32; 4] = [1.0, 1.0, 1.0, 1.0];  // BGRA all 1.0
+        let b: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
+        let mut pixels = vec![w; 16];
+        pixels[1 * 4 + 1] = b;  // (x=1, y=1) = black
+
+        let backend = MetalBackend::for_test().expect("Metal backend");
+
+        // Upload pixels to a Metal buffer.
+        let bytes_len = pixels.len() * 16;
+        let src = backend.device.new_buffer_with_data(
+            pixels.as_ptr() as *const _,
+            bytes_len as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+
+        let mut ctx = backend.begin_frame().unwrap();
+
+        // Tight range: delta of 4.0 must register as an edge.
+        let modes = backend
+            .dispatch_detect(
+                &mut ctx,
+                src.as_ptr() as *mut std::ffi::c_void,
+                /* src_pitch_pixels */ 4,
+                /* width */            4,
+                /* height */           4,
+                /* logical_width */    4,
+                /* range */            0.1,
+            )
+            .expect("detect dispatch");
+        let modes_slice = unsafe {
+            core::slice::from_raw_parts(modes.contents() as *const u8, 16)
+        };
+        // Inner region only fires at (1,1) and (2,1) (since right-of-inner
+        // is x+1 < logical_width = 4 → x in [1, 2], y in [1, 2]).
+        // (1,1): centre=B, right=W (different), all neighbours different → 0x8F
+        // (2,1): centre=W, right=W (same bytes) → fast_compare false → 0
+        // (1,2): centre=W, right=W (same bytes) → 0
+        // (2,2): centre=W, right=W (same bytes) → 0
+        // outside inner region → 0
+        assert_eq!(modes_slice[1 * 4 + 1], 0x8F,
+            "(1,1) should detect right+up+down+left edges; got 0x{:02X}",
+            modes_slice[1 * 4 + 1]);
+        // Spot-check a few zeros.
+        for &(x, y) in &[(0u32, 0u32), (3, 0), (0, 3), (3, 3), (2, 1), (1, 2)] {
+            let v = modes_slice[(y * 4 + x) as usize];
+            assert_eq!(v, 0,
+                "({},{}) should be 0 (outside inner region or fast_compare fail); got 0x{:02X}",
+                x, y, v);
+        }
+
+        backend.finish_frame(ctx).unwrap();
+    }
+
+    #[test]
+    fn detect_loose_range_records_fast_match_only() {
+        let w: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        let b: [f32; 4] = [0.0, 0.0, 0.0, 0.0];
+
+        let mut pixels = vec![w; 16];
+        pixels[1 * 4 + 1] = b;
+
+        let backend = MetalBackend::for_test().expect("Metal backend");
+        let bytes_len = pixels.len() * 16;
+        let src = backend.device.new_buffer_with_data(
+            pixels.as_ptr() as *const _,
+            bytes_len as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let mut ctx = backend.begin_frame().unwrap();
+
+        // Loose range: delta of 4.0 is below 5.0 → no edge bits set, but
+        // fast_compare still fires (bytes differ) → modes = 0x80 only.
+        let modes = backend
+            .dispatch_detect(
+                &mut ctx,
+                src.as_ptr() as *mut std::ffi::c_void,
+                4, 4, 4, 4,
+                /* range */ 5.0,
+            )
+            .expect("detect dispatch");
+        let modes_slice = unsafe {
+            core::slice::from_raw_parts(modes.contents() as *const u8, 16)
+        };
+        assert_eq!(modes_slice[1 * 4 + 1], 0x80,
+            "(1,1) tolerated → only fast_match bit; got 0x{:02X}",
+            modes_slice[1 * 4 + 1]);
+
+        backend.finish_frame(ctx).unwrap();
+    }
 }
