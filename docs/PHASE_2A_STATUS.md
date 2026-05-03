@@ -56,7 +56,9 @@ Phase 2-A.3 Sub-stage A / B / C-1(Rust 側)は先行完了済、Phase 2-A.3 の 
 - ✅ **Step 2 (Sub-stage B)**: Rust `gpu/` scaffold + GpuBackend trait(`gpu/{mod,cpu,metal,cuda,fallback,detection,tests}.rs` + shader stubs、cargo test 9/9 PASS、既存 regression 非劣化)
 - 🟡 **Step 3 (Sub-stage C)**: Mac Metal backend 本実装 + Effect.cpp GPU path + 基本 UI(分割実行中)
   - ✅ **C-1**: Rust MetalBackend + MSL identity passthrough + cargo test で実機 Metal device 上で MSL compile 動作確認
-  - ⬜ **C-2**: Effect.cpp 8 selector + Pipl.r flag + PreRender 5 条件 + GPU_FALLEN/UUID FFI bridge + 基本 checkbox stub
+  - ✅ **C-2**: Effect.cpp 8 selector + Pipl.r flag + PreRender 5 条件 + GPU_FALLEN/UUID FFI bridge + 基本 checkbox stub
+    - **C-2a**: Rust GPU plumbing FFI(`smooth_core_gpu_uuid_new` / `mark_fallen` / `is_fallen` / `forget` / `set_backend_usable` / `is_backend_usable` / `should_force_error`)、`uuid` crate 追加、`smooth_core_version()` を 0x0002_0004 に bump、cargo test 19/19 PASS
+    - **C-2b**: Effect.cpp に 8 selector(SEQUENCE_{SETUP/RESETUP/FLATTEN/SETDOWN}/GET_FLATTENED_SEQUENCE_DATA/GPU_DEVICE_{SETUP/SETDOWN}/SMART_RENDER_GPU)+ Pipl.r flags2 = 0x0A801410(`SUPPORTS_GPU_RENDER_F32` 追加、Pipl.r/GlobalSetup/GPU_DEVICE_SETUP 3 箇所同期)+ `PARAM_GPU_ACCELERATION` checkbox(default ON、SUPERVISE)+ `SequenceData{uuid_lo,uuid_hi}` PF_Handle で AE 管理 + `SmartPreRender` の 5-condition AND(input bpc=32 / checkbox ON / not fallen / backend usable / DEVICE_SETUP 成功 — C-2 では (d)/(e) を merge、Sub-stage D で分離)+ `SmartRenderGpu` stub(C-2.5 まで CPU SmartRender に routing、`SMOOTH_FORCE_GPU_ERROR={setup,render,oom}` 注入経路は実装済)、Mac plugin Release BUILD SUCCEEDED、regression 28/28 SMOOTH_PARALLEL=1/0 両方 PASS
   - ⬜ **C-2.5**: shader を 2-pass(detect + blend)smooth に書き換え、`gpu_metal_policy` 許容内で 32bpc goldens regression PASS
   - ⬜ **C-3**: Mac AE 2025 実機 + `SMOOTH_FORCE_GPU_ERROR` injection で fallback テスト + MFR + GPU stress
 - ⬜ **Step 4 (Sub-stage D)**: UI DISABLED wiring + GPU 検出機構 + About
