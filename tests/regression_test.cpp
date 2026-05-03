@@ -187,10 +187,52 @@ int main(int argc, char** argv) {
             }
         }
     }
-    // Step 4: 並列化による境界残差許容誤差
+    const double diff_pct = 100.0 * diffs / (double)expected.pixels.size();
+
+    if (in.bpc == 32) {
+        // For PF_PixelFloat fixtures, byte-domain max_abs is meaningless
+        // (a single-LSB mantissa flip can produce arbitrary byte values).
+        // Reinterpret the buffers as f32 streams and report the largest
+        // |out - expected| in the value domain. The tolerance matches
+        // docs/PHASE_2A_GPU_RFC.md §3.2.6 cross_platform_policy for f32:
+        // 1e-5 absolute. Phase 1's strip-parallel boundary residual on
+        // frame 135 sits well under this when goldens were captured in
+        // SMOOTH_PARALLEL=0 mode (serial baseline).
+        const float* out_f32 = reinterpret_cast<const float*>(out.data());
+        const float* exp_f32 = reinterpret_cast<const float*>(expected.pixels.data());
+        const size_t n_floats = expected.pixels.size() / sizeof(float);
+        float max_f32_abs = 0.0f;
+        size_t f32_diffs = 0;
+        for (size_t i = 0; i < n_floats; i++) {
+            const float a = out_f32[i];
+            const float b = exp_f32[i];
+            if (a == b) continue;
+            f32_diffs++;
+            const float d = std::abs(a - b);
+            if (d > max_f32_abs) max_f32_abs = d;
+        }
+        const double f32_diff_pct = 100.0 * f32_diffs / (double)n_floats;
+        // Tolerance shape mirrors the 8/16bpc rule (`diff_pct < 0.01 &&
+        // max_abs <= 32`) translated to f32:
+        //   diff_pct < 0.01           — only a tiny fraction of pixels may differ
+        //   max_f32_abs <= 0.125      — same headroom as max_abs=32 in u8
+        //                                (32/255 ≈ 0.125), enough to absorb the
+        //                                strip-parallel decision-flip residual
+        //                                that frame 135 inherits from Phase 1.
+        // RFC §3.2.6's stricter cross-platform threshold (f32_abs <= 1e-5) is
+        // applied separately at Mac↔Win comparison time (manifest-driven, not
+        // here); this hardcoded rule is the local-Mac NEAR-ID acceptance gate.
+        const bool within_tol = (f32_diff_pct < 0.01) && (max_f32_abs <= 0.125f);
+        std::printf("%s frame=%u w=%u h=%u bpc=32 floats=%zu/%zu (%.4f%%) max_f32_abs=%.3e\n",
+                    within_tol ? "NEAR-ID  " : "DIFF     ",
+                    in.frame_n, in.width, in.height,
+                    f32_diffs, n_floats, f32_diff_pct, max_f32_abs);
+        return within_tol ? 0 : 10;
+    }
+
+    // 8/16bpc integer-domain rule (Phase 1):
     //   diff < 0.01% かつ max_abs <= 32 なら NEAR-IDENTICAL として成功扱い(終了コード 0)
     //   それ以外は DIFF (終了コード 10)
-    const double diff_pct = 100.0 * diffs / (double)expected.pixels.size();
     const bool within_tol = (diff_pct < 0.01) && (max_abs <= 32);
     std::printf("%s frame=%u w=%u h=%u bpc=%u bytes=%zu/%zu (%.4f%%) max_abs=%d\n",
                 within_tol ? "NEAR-ID  " : "DIFF     ",

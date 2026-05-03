@@ -12,6 +12,7 @@
 /tests/.venv/
 /tests/regression_test
 /tests/test_white_option
+/tests/synth_32bpc
 # Operator-edited copy of capture_config_32bpc.toml.template (carries
 # local EXR scratch dir paths; the template itself stays committed as
 # the canonical schema + 14-frame parameter seed).
