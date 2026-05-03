@@ -40,10 +40,14 @@ echo "==> build Rust smooth_core (universal)"
 # Capture is always serial so the goldens are deterministic across reruns.
 # The PARALLEL=1 regression run still goes through the rayon strip-parallel
 # code path; frame 135 will exhibit a small f32 boundary residual that
-# regression_test.cpp accepts as NEAR-ID under the f32_abs <= 1e-5
-# tolerance. Letting the operator override this would defeat the
-# determinism guarantee, so we deliberately do NOT honour SMOOTH_PARALLEL
-# from the environment here.
+# regression_test.cpp accepts as NEAR-ID under its local-Mac threshold
+# (f32_diff_pct < 0.01% && max_f32_abs <= 0.125 — translated from the
+# 8/16bpc rule). The tighter f32_abs <= 1e-5 figure documented in
+# manifest.toml's cross_platform_policy is the Mac↔Win compare-time
+# bound (Step 5), enforced separately and not by this script. Letting
+# the operator override SMOOTH_PARALLEL here would defeat the
+# determinism guarantee, so we deliberately do NOT honour it
+# from the environment.
 SMOOTH_PARALLEL=0
 
 echo "==> build synth_32bpc tool (SMOOTH_PARALLEL=$SMOOTH_PARALLEL — serial for deterministic capture)"
