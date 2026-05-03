@@ -7,6 +7,7 @@
 #include "AE_Effect.h"
 #include "AE_EffectCB.h"
 #include "AE_EffectCBSuites.h"   // Phase 2-A.2: PF_WorldSuite2 / kPFWorldSuite for PF_GetPixelFormat (32bpc detection)
+#include "AE_EffectGPUSuites.h"  // Phase 2-A.3 C-2.5a: PF_GPUDeviceSuite1 (GetDeviceInfo / GetGPUWorldData)
 #include "SPBasic.h"             // SPBasicSuite (in_data->pica_basicP) AcquireSuite/ReleaseSuite
 #include "AE_Macros.h"
 
@@ -62,27 +63,25 @@ struct SequenceData
     uint64_t uuid_hi;
 };
 
-// Phase 2-A.3 Sub-stage C-2 dispatch gate.
+// Phase 2-A.3 dispatch gate.
 //
-// C-2 wires up every selector AE needs (GPU_DEVICE_SETUP, SMART_RENDER_GPU,
-// 5-condition AND in PreRender, fault injection plumbing) but does NOT yet
-// implement the actual Metal kernel dispatch — that is C-2.5. While this
-// gate is 0:
-//   * SmartPreRender's 5-condition AND still runs for verification, but its
-//     `flags |= PF_RenderOutputFlag_GPU_RENDER_POSSIBLE` write is suppressed,
-//     so AE never issues SMART_RENDER_GPU.
-//   * SmartRenderGpu remains dispatchable (a future AE / driver could still
-//     reach it), but it stays guarded — see the function body.
+// Flipped from 0 to 1 in Sub-stage C-2.5a once the Metal command-buffer
+// round-trip (GPU device suite -> MTLBuffer -> identity passthrough kernel
+// -> GPU output world) was wired end-to-end. With this set:
+//   * SmartPreRender's 5-condition AND raises GPU_RENDER_POSSIBLE on 32bpc
+//     comps that satisfy the other conditions, so AE dispatches
+//     SMART_RENDER_GPU.
+//   * SmartRenderGpu acquires kPFGPUDeviceSuite, obtains MTLBuffer pointers
+//     from the input/output GPU effect worlds, and calls
+//     smooth_core_metal_dispatch_passthrough. The kernel itself is still
+//     identity (Sub-stage C-1's smooth.metal `smooth_passthrough`); the
+//     real 2-pass smooth lands in C-2.5b.
 //
-// Why this matters: a 32bpc GPU comp delivers a *GPU world* (ARGB128 in
-// device memory). The CPU path's PF_GET_PIXEL_DATA16 / DATA8 macros raise
-// AE's "gpu effect world is not supported yet" verification error against
-// such a world, which crashes the host. Falling SMART_RENDER_GPU through to
-// SmartRender (the C-2 stub did this) walks straight into that trap. C-2.5
-// flips this to 1 once the Metal command-buffer path can actually consume
-// the GPU world via the GPU device suite.
+// While this is 0 the GPU plumbing is fully wired but dormant — every
+// selector still works, fault injection still fires, but AE never issues
+// SMART_RENDER_GPU because PreRender suppresses the flag.
 #ifndef SMOOTH_GPU_DISPATCH_READY
-#define SMOOTH_GPU_DISPATCH_READY 0
+#define SMOOTH_GPU_DISPATCH_READY 1
 #endif
 
 //---------------------------------------------------------------------------//
@@ -1134,24 +1133,94 @@ static PF_Err GetFlattenedSequenceData(PF_InData *in_data, PF_OutData *out_data)
 
 static PF_Err GpuDeviceSetup(PF_InData *in_data, PF_OutData *out_data, void *extra)
 {
-    (void)in_data; (void)extra;
-    // Sub-stage C-2 stub: just declare we accept the device. Real device-
-    // specific resource allocation (Metal command queue / compute pipeline /
-    // CUDA context) lands in C-2.5 when the actual kernel is wired.
-    //
+    PF_Err err = PF_Err_NONE;
+    PF_GPUDeviceSetupExtra *gpu_extra = (PF_GPUDeviceSetupExtra*)extra;
+
     // §4.4 fault injection: simulate "device setup failed" via env var.
     if (smooth_core_gpu_should_force_error(1) /* "setup" */) {
         return PF_Err_OUT_OF_MEMORY;
     }
+
+    // Mac: we only accept Metal devices. AE may also offer OpenCL on older
+    // hosts; skipping by leaving SUPPORTS_GPU_RENDER_F32 unset tells AE not
+    // to call SMART_RENDER_GPU on this device. Win CUDA path lands in
+    // Sub-stage E with a parallel branch.
+#ifdef __APPLE__
+    if (!gpu_extra || !gpu_extra->input ||
+        gpu_extra->input->what_gpu != PF_GPU_Framework_METAL) {
+        return PF_Err_NONE;  // not Metal — don't accept
+    }
+
+    // Acquire the GPU device suite to get MTLDevice / MTLCommandQueue raw
+    // pointers for the offered device_index.
+    PF_GPUDeviceSuite1 *gpu_suite = NULL;
+    if (in_data->pica_basicP->AcquireSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1,
+                                           (const void**)&gpu_suite) != 0 || !gpu_suite) {
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+    PF_GPUDeviceInfo info = {};
+    err = gpu_suite->GetDeviceInfo(in_data->effect_ref,
+                                   gpu_extra->input->device_index, &info);
+    if (err) {
+        in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+        return err;
+    }
+    if (info.device_framework != PF_GPU_Framework_METAL || !info.devicePV || !info.command_queuePV) {
+        in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+        return PF_Err_NONE;  // unsupported / missing — don't accept
+    }
+    if (!info.compatibleB) {
+        // Driver says this device cannot accelerate; honour it.
+        in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+        return PF_Err_NONE;
+    }
+
+    // Build the Rust-side MetalBackend (compiles MSL, builds compute pipeline).
+    void *metal_handle = smooth_core_metal_create(info.devicePV, info.command_queuePV);
+    in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+    if (!metal_handle) {
+        // MSL compile / pipeline build failed for this device. Decline politely.
+        return PF_Err_NONE;
+    }
+
+    // Stash the handle so AE round-trips it back via PF_SmartRenderInput->gpu_data.
+    if (gpu_extra->output) {
+        gpu_extra->output->gpu_data = metal_handle;
+    } else {
+        // Defensive: no output struct means AE can't carry our handle. Free it.
+        smooth_core_metal_destroy(metal_handle);
+        return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    }
+
+    // Required: 3rd of 3 sites for SUPPORTS_GPU_RENDER_F32 (the other two are
+    // GlobalSetup out_flags2 and Pipl.r). Without this, AE silently routes to
+    // CPU SmartRender and never calls SMART_RENDER_GPU on this device.
     out_data->out_flags2 |= PF_OutFlag2_SUPPORTS_GPU_RENDER_F32;
     return PF_Err_NONE;
+#else
+    (void)gpu_extra;
+    // Non-Apple builds (Win Sub-stage E) reach here with what_gpu == CUDA.
+    // C-2.5a is Mac-only; Sub-stage E will add the parallel CUDA branch
+    // and OR the flag from there.
+    return PF_Err_NONE;
+#endif
 }
 
 static PF_Err GpuDeviceSetdown(PF_InData *in_data, PF_OutData *out_data, void *extra)
 {
-    (void)in_data; (void)out_data; (void)extra;
-    // Nothing allocated per-device in C-2. C-2.5 will dispose
-    // command queue / compute pipeline state owned per device here.
+    (void)in_data; (void)out_data;
+#ifdef __APPLE__
+    PF_GPUDeviceSetdownExtra *gpu_extra = (PF_GPUDeviceSetdownExtra*)extra;
+    if (gpu_extra && gpu_extra->input && gpu_extra->input->gpu_data) {
+        smooth_core_metal_destroy(gpu_extra->input->gpu_data);
+        // The SDK header notes: "effect must dispose"; setting the field
+        // back to NULL is good hygiene even though AE will not read it
+        // again on this code path.
+        gpu_extra->input->gpu_data = NULL;
+    }
+#else
+    (void)extra;
+#endif
     return PF_Err_NONE;
 }
 
@@ -1164,61 +1233,115 @@ static PF_Err GpuDeviceSetdown(PF_InData *in_data, PF_OutData *out_data, void *e
 // while the shader is identity-only). The fallback is the device-host-device
 // (RFC §4.4 採用 (i)) shape we want anyway: any future GPU error path will
 // reuse this same code.
+// Mark this instance fallen and return PF_Err_NONE so AE's Render Queue
+// keeps moving (RFC §4.4 採用 (i): device->host->device or equivalent
+// graceful fallback). The next PreRender for this instance will see the
+// fallen flag and skip GPU entirely, routing to CPU SmartRender.
+static inline PF_Err mark_fallen_and_continue(PF_InData *in_data)
+{
+    uint64_t uuid_lo, uuid_hi;
+    if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
+        smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
+    }
+    return PF_Err_NONE;
+}
+
 static PF_Err SmartRenderGpu(PF_InData            *in_data,
                              PF_OutData           *out_data,
                              PF_SmartRenderExtra  *extraP)
 {
 #if !SMOOTH_GPU_DISPATCH_READY
-    // C-2 stub guard. PreRender does not raise GPU_RENDER_POSSIBLE while
-    // this gate is 0, so AE should never reach this path. If it does (an
-    // older cached PreRender result, a future AE/driver behaviour change,
-    // or a manual test harness), refuse cleanly instead of falling through
-    // to SmartRender — the latter calls PF_GET_PIXEL_DATA{8,16} which AE
-    // verifies-and-aborts when handed a GPU world.
-    //
-    // PF_Err_INTERNAL_STRUCT_DAMAGED is the most truthful code we have
-    // here ("the plugin is in an inconsistent state for this dispatch");
-    // it stops the current frame without crashing the host. The Render
-    // Queue may flag the frame, but the user can re-render after toggling
-    // off the GPU checkbox. C-2.5 removes this guard and replaces the body
-    // with the real Metal path.
-    (void)in_data; (void)out_data; (void)extraP;
-    uint64_t uuid_lo, uuid_hi;
-    if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
-        smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
-    }
-    return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    // Defensive guard. PreRender does not raise GPU_RENDER_POSSIBLE while
+    // this gate is 0, so AE should never reach here. If it does (a stale
+    // cached PreRender result, a future AE / driver behaviour change), mark
+    // fallen and bail out without touching the GPU world.
+    (void)out_data; (void)extraP;
+    return mark_fallen_and_continue(in_data);
 #else
     PF_Err err = PF_Err_NONE;
+    (void)out_data;
 
-    SmartRenderInfo *info = (SmartRenderInfo*)extraP->input->pre_render_data;
-    if (!info) return PF_Err_INTERNAL_STRUCT_DAMAGED;
+    if (extraP->input->pre_render_data == NULL) return PF_Err_INTERNAL_STRUCT_DAMAGED;
 
-    // §4.4 fault injection: simulate render-time failure.
+    // §4.4 fault injection: simulate render-time failure / VRAM OOM.
     if (smooth_core_gpu_should_force_error(2) /* "render" */ ||
         smooth_core_gpu_should_force_error(3) /* "oom"    */)
     {
-        // Mark this instance fallen so subsequent PreRenders skip GPU. AE
-        // will keep calling SMART_RENDER_GPU for in-flight frames in the
-        // same PreRender batch until PreRender re-runs and clears the flag,
-        // so we still need to produce output — go through the CPU path.
-        uint64_t uuid_lo, uuid_hi;
-        if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
-            smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
-        }
-        // RFC §4.4 採用 (i): device->host->device + PF_Err_NONE so the
-        // Render Queue job does not abort. C-2.5 wires the actual download/
-        // upload via the GPU device suite; until then this is a placeholder.
-        return PF_Err_NONE;
+        return mark_fallen_and_continue(in_data);
     }
 
-    // C-2.5: Metal command-buffer dispatch goes here. The GPU world handed
-    // to us by AE goes through the GPU device suite to obtain a writable
-    // CPU shadow (or, in the all-Metal path, stays on device through a
-    // 2-pass shader). The current empty body is a placeholder; SmartRender
-    // is NOT a valid fallback because it consumes GPU worlds via CPU
-    // pixel-data macros that AE rejects.
+#ifdef __APPLE__
+    // The MetalBackend handle was stashed by GpuDeviceSetup and AE round-
+    // trips it back to us via PF_SmartRenderInput->gpu_data.
+    void *metal_handle = (void*)extraP->input->gpu_data;
+    if (!metal_handle) return mark_fallen_and_continue(in_data);
+
+    // Mac builds only accept Metal devices in GpuDeviceSetup, so what_gpu
+    // here should always be METAL. Defensive check: bail out if AE somehow
+    // routed a non-Metal device here.
+    if (extraP->input->what_gpu != PF_GPU_Framework_METAL) {
+        return mark_fallen_and_continue(in_data);
+    }
+
+    // Acquire the GPU suite to (a) check out the input/output GPU effect
+    // worlds and (b) translate them to MTLBuffer raw pointers.
+    PF_GPUDeviceSuite1 *gpu_suite = NULL;
+    if (in_data->pica_basicP->AcquireSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1,
+                                           (const void**)&gpu_suite) != 0 || !gpu_suite) {
+        return mark_fallen_and_continue(in_data);
+    }
+
+    PF_EffectWorld *input_world  = NULL;
+    PF_EffectWorld *output_world = NULL;
+    void           *src_buf      = NULL;
+    void           *dst_buf      = NULL;
+
+    err = extraP->cb->checkout_layer_pixels(in_data->effect_ref, PARAM_INPUT, &input_world);
+    if (err || !input_world) {
+        in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+        return mark_fallen_and_continue(in_data);
+    }
+    err = extraP->cb->checkout_output(in_data->effect_ref, &output_world);
+    if (err || !output_world) {
+        extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
+        in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+        return mark_fallen_and_continue(in_data);
+    }
+
+    err = gpu_suite->GetGPUWorldData(in_data->effect_ref, input_world,  &src_buf);
+    if (!err) err = gpu_suite->GetGPUWorldData(in_data->effect_ref, output_world, &dst_buf);
+    if (err || !src_buf || !dst_buf) {
+        extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
+        in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+        return mark_fallen_and_continue(in_data);
+    }
+
+    // ARGB128 GPU world: 16 bytes per pixel. The Rust kernel expects
+    // pitches in pixels; AE delivers rowbytes in bytes.
+    const uint32_t src_pitch_pixels = (uint32_t)(input_world->rowbytes  / 16);
+    const uint32_t dst_pitch_pixels = (uint32_t)(output_world->rowbytes / 16);
+    const uint32_t width            = (uint32_t)input_world->width;
+    const uint32_t height           = (uint32_t)input_world->height;
+
+    // C-2.5a kernel: identity passthrough. Visually this means smooth has
+    // no effect when the GPU path runs. C-2.5b replaces the kernel with the
+    // real 2-pass detect+blend; the C++ side here does not change.
+    int32_t rc = smooth_core_metal_dispatch_passthrough(
+        metal_handle, src_buf, dst_buf,
+        src_pitch_pixels, dst_pitch_pixels, width, height);
+
+    extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
+    in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
+
+    if (rc != 0) {
+        return mark_fallen_and_continue(in_data);
+    }
     return PF_Err_NONE;
+#else
+    // Non-Apple builds: Sub-stage E will replace this with the CUDA path.
+    (void)extraP;
+    return mark_fallen_and_continue(in_data);
+#endif
 #endif
 }
 

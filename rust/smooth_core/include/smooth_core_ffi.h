@@ -222,6 +222,59 @@ int32_t smooth_core_gpu_is_backend_usable(void);
  */
 int32_t smooth_core_gpu_should_force_error(int32_t point);
 
+/* ============================================================================
+ * Phase 2-A.3 Sub-stage C-2.5a: Mac Metal dispatch FFI (macOS only)
+ * ----------------------------------------------------------------------------
+ *
+ * These symbols exist only in the macOS staticlib. The Windows path uses
+ * CUDA-specific symbols added in Sub-stage E. Effect.cpp gates calls to
+ * these behind `#ifdef __APPLE__` so the same source tree builds on both.
+ *
+ * Lifecycle (all called from Effect.cpp):
+ *   GPU_DEVICE_SETUP    -> smooth_core_metal_create(MTLDevice, MTLCommandQueue)
+ *                          -> opaque handle stashed in
+ *                             PF_GPUDeviceSetupOutput->gpu_data
+ *   SMART_RENDER_GPU    -> AE round-trips the handle back via
+ *                             PF_SmartRenderInput->gpu_data; we read it,
+ *                             obtain MTLBuffer pointers from AE's GPU suite,
+ *                             call smooth_core_metal_dispatch_passthrough.
+ *   GPU_DEVICE_SETDOWN  -> smooth_core_metal_destroy(handle)
+ *
+ * dispatch_passthrough returns 0 on success. Non-zero return codes are
+ * intentionally opaque from the caller's perspective — the contract is
+ * "did the kernel make it onto the queue?", not "did the kernel succeed
+ * downstream". AE handles command-buffer error reporting via separate
+ * callbacks. On non-zero, Effect.cpp marks the instance fallen via
+ * smooth_core_gpu_mark_fallen and returns PF_Err_NONE so the Render Queue
+ * does not abort (RFC §4.4 採用 (i)).
+ * ========================================================================== */
+
+#ifdef __APPLE__
+/* Wrap an MTLDevice / MTLCommandQueue raw pointer pair into a backend handle.
+ * device_ptr  : id<MTLDevice>     (cast to void*) from PF_GPUDeviceInfo.devicePV
+ * queue_ptr   : id<MTLCommandQueue> from PF_GPUDeviceInfo.command_queuePV
+ * Returns a handle, or NULL on failure (null inputs, MSL compile error, or
+ * pipeline build error).
+ */
+void *smooth_core_metal_create(void *device_ptr, void *queue_ptr);
+
+/* Tear down a handle previously returned by smooth_core_metal_create.
+ * Safe to call with NULL. */
+void  smooth_core_metal_destroy(void *handle);
+
+/* Dispatch the identity passthrough kernel (Sub-stage C-1's smooth.metal
+ * `smooth_passthrough`). Pitches are in pixels (= rowbytes / 16 for the
+ * ARGB128 format AE delivers to GPU effects). Returns 0 on success. */
+int32_t smooth_core_metal_dispatch_passthrough(
+    void    *handle,
+    void    *src_buf,
+    void    *dst_buf,
+    uint32_t src_pitch_pixels,
+    uint32_t dst_pitch_pixels,
+    uint32_t width,
+    uint32_t height);
+#endif /* __APPLE__ */
+
 #ifdef __cplusplus
 }
 #endif

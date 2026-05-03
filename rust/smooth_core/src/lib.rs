@@ -26,7 +26,10 @@ pub extern "C" fn smooth_core_version() -> u32 {
     // 0x0002_0004: added GPU plumbing FFI (uuid_new / fallen state / backend_usable
     //              / force-error injection). Still backward compatible — old plugin
     //              binaries that never call these symbols continue to load.
-    0x0002_0004
+    // 0x0002_0005: added Mac Metal dispatch FFI (smooth_core_metal_{create,destroy,
+    //              dispatch_passthrough}) for Sub-stage C-2.5a. Mac-only symbols; the
+    //              Windows staticlib does not export them. Still backward compatible.
+    0x0002_0005
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -355,6 +358,130 @@ pub extern "C" fn smooth_core_gpu_should_force_error(point: i32) -> i32 {
     match std::env::var("SMOOTH_FORCE_GPU_ERROR") {
         Ok(v) if v == want => 1,
         _ => 0,
+    }
+}
+
+// ============================================================================
+// Phase 2-A.3 Sub-stage C-2.5a: Mac Metal dispatch FFI
+// ============================================================================
+//
+// These FFI symbols are macOS-only. On Windows the staticlib does not export
+// them — the Win build of Effect.cpp will live behind `#ifdef __APPLE__` for
+// the Metal path and use CUDA-specific FFI (Sub-stage E) instead.
+//
+// Lifecycle is tied to AE's GPU_DEVICE_SETUP / SETDOWN selectors:
+//   create  — called from GPU_DEVICE_SETUP after the suite returns the
+//             MTLDevice / MTLCommandQueue raw pointers. The opaque handle
+//             is stashed in `PF_GPUDeviceSetupOutput->gpu_data`, then AE
+//             round-trips it back to us in `PF_SmartRenderInput->gpu_data`.
+//   destroy — called from GPU_DEVICE_SETDOWN to release the handle.
+//   dispatch_passthrough — called from SMART_RENDER_GPU; runs the existing
+//             identity passthrough kernel (Sub-stage C-1) so we can verify
+//             the round-trip plumbing end-to-end. The real 2-pass smooth
+//             kernel arrives in C-2.5b.
+
+#[cfg(target_os = "macos")]
+mod metal_ffi {
+    use super::gpu;
+    use core::ffi::c_void;
+
+    /// Wraps `MetalBackend::from_ae_device` for C callers. Returns an opaque
+    /// handle (`*mut c_void`) that the C++ side stores in PF_GPUDeviceSetupOutput.
+    /// On any failure (null pointers, MSL compile failure, pipeline build
+    /// failure) returns null — caller must check before stashing.
+    ///
+    /// SAFETY: `device_ptr` and `queue_ptr` must outlive the returned handle
+    /// (AE guarantees this between GPU_DEVICE_SETUP and GPU_DEVICE_SETDOWN).
+    #[no_mangle]
+    pub unsafe extern "C" fn smooth_core_metal_create(
+        device_ptr: *mut c_void,
+        queue_ptr: *mut c_void,
+    ) -> *mut c_void {
+        match gpu::metal::MetalBackend::from_ae_device(device_ptr, queue_ptr) {
+            Ok(backend) => Box::into_raw(Box::new(backend)) as *mut c_void,
+            Err(_) => core::ptr::null_mut(),
+        }
+    }
+
+    /// Tear down a backend handle previously returned by
+    /// `smooth_core_metal_create`. Safe to pass null (no-op).
+    ///
+    /// SAFETY: `handle` must originate from `smooth_core_metal_create` and
+    /// must not be used again after this call.
+    #[no_mangle]
+    pub unsafe extern "C" fn smooth_core_metal_destroy(handle: *mut c_void) {
+        if !handle.is_null() {
+            drop(Box::from_raw(handle as *mut gpu::metal::MetalBackend));
+        }
+    }
+
+    /// Run the identity passthrough Metal kernel from
+    /// `gpu/shaders/smooth.metal`. The pitches are in **pixels** (= rowbytes
+    /// / 16 for ARGB128). Returns 0 on success, non-zero on failure
+    /// (caller marks the instance fallen and returns PF_Err_NONE per RFC
+    /// §4.4 採用 (i)).
+    ///
+    /// SAFETY: `handle` must be a live MetalBackend pointer; `src_buf` /
+    /// `dst_buf` must be MTLBuffer raw pointers obtained from AE's GPU
+    /// suite for the matching device. Width/height bounded by the AE-
+    /// allocated GPU world dimensions.
+    #[no_mangle]
+    pub unsafe extern "C" fn smooth_core_metal_dispatch_passthrough(
+        handle: *mut c_void,
+        src_buf: *mut c_void,
+        dst_buf: *mut c_void,
+        src_pitch_pixels: u32,
+        dst_pitch_pixels: u32,
+        width: u32,
+        height: u32,
+    ) -> i32 {
+        if handle.is_null() { return -1; }
+        let backend = &*(handle as *const gpu::metal::MetalBackend);
+        let mut ctx = match <gpu::metal::MetalBackend as gpu::GpuBackend>::begin_frame(backend) {
+            Ok(c) => c,
+            Err(_) => return -2,
+        };
+        let dispatch = backend.dispatch_passthrough(
+            &mut ctx, src_buf, dst_buf,
+            src_pitch_pixels, dst_pitch_pixels, width, height,
+        );
+        if dispatch.is_err() {
+            let _ = <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx);
+            return -3;
+        }
+        if <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx).is_err() {
+            return -4;
+        }
+        0
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn create_with_null_returns_null() {
+            unsafe {
+                assert!(smooth_core_metal_create(core::ptr::null_mut(), core::ptr::null_mut())
+                    .is_null());
+            }
+        }
+
+        #[test]
+        fn destroy_null_is_safe() {
+            unsafe { smooth_core_metal_destroy(core::ptr::null_mut()); }
+        }
+
+        #[test]
+        fn dispatch_with_null_handle_returns_error() {
+            unsafe {
+                let rc = smooth_core_metal_dispatch_passthrough(
+                    core::ptr::null_mut(), core::ptr::null_mut(), core::ptr::null_mut(),
+                    0, 0, 0, 0,
+                );
+                assert_eq!(rc, -1);
+            }
+        }
     }
 }
 

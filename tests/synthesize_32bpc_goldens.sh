@@ -50,6 +50,14 @@ echo "==> build Rust smooth_core (universal)"
 # from the environment.
 SMOOTH_PARALLEL=0
 
+# Phase 2-A.3 C-2.5a: libsmooth_core.a now pulls in Metal / Objective-C
+# runtime symbols on macOS — link them even though synth_32bpc itself only
+# touches the CPU process<>() entry point.
+case "$(uname -s)" in
+  Darwin) GPU_LINK_FLAGS="-lobjc -framework Foundation -framework Metal -framework QuartzCore" ;;
+  *)      GPU_LINK_FLAGS="" ;;
+esac
+
 echo "==> build synth_32bpc tool (SMOOTH_PARALLEL=$SMOOTH_PARALLEL — serial for deterministic capture)"
 clang++ -std=c++17 -O2 \
     -DSMOOTH_PARALLEL=$SMOOTH_PARALLEL \
@@ -61,6 +69,7 @@ clang++ -std=c++17 -O2 \
     "$ROOT/tests/synth_32bpc.cpp" \
     "$ROOT/util.cpp" \
     "$RUST_LIB" \
+    $GPU_LINK_FLAGS \
     -o "$BIN" || { echo "synth_32bpc build failed"; exit 1; }
 
 mkdir -p "$DST_SUITE"

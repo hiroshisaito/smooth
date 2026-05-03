@@ -1828,3 +1828,50 @@ PF_GetPixelData16 → U_ReportFailedVerification
 - Stub fallthrough は便利だが「型」が合っていない場面では crash の温床。GPU/CPU world は別型として扱い、stub は dispatch gate で完全 dormant にする規律が要る
 - 5-condition AND の (a)/(b)/(c)/(d)/(e) はそれぞれ独立して gate が掛けられる。SMOOTH_GPU_DISPATCH_READY のような「6 番目の condition」を entropy として持てる構造
 
+---
+
+## Phase 2-A.3 Sub-stage C-2.5a: GPU 経路 round-trip 完成(identity passthrough)
+
+**日時**: 2026-05-03 JST(C-2 retest PASS 直後の連続着手)
+
+**目的**: GPU 経路の plumbing は C-2 で揃った(8 selector / sequence_data UUID / 5-condition AND / fault injection)が、`SMOOTH_GPU_DISPATCH_READY = 0` で完全 dormant 状態だった。本 Step では Effect.cpp が `kPFGPUDeviceSuite` 経由で MTLDevice / MTLCommandQueue / MTLBuffer を取得 → Rust `MetalBackend` に渡して既存の identity passthrough shader を dispatch する round-trip を完成させる。**実 smooth アルゴリズムは未 port**(C-2.5b 担当)、本 Step は「GPU 経路が動くこと」の検証に集中。
+
+**実施**:
+
+1. **Rust 側**: `rust/smooth_core/src/lib.rs` に `#[cfg(target_os = "macos")] mod metal_ffi` を追加:
+   - `smooth_core_metal_create(device_ptr, queue_ptr) -> *mut c_void`: `MetalBackend::from_ae_device` を Box → opaque handle へ変換、null 入力 / MSL compile fail / pipeline build fail 時は null
+   - `smooth_core_metal_destroy(handle)`: `Box::from_raw` で deallocate、null 入力 safe
+   - `smooth_core_metal_dispatch_passthrough(handle, src_buf, dst_buf, src_pitch_pixels, dst_pitch_pixels, width, height) -> i32`: `begin_frame → dispatch_passthrough → finish_frame` の 1 frame 分、success 時 0、各段階 fail で -1〜-4(opaque で C 側からは「kernel 投入できたか?」だけが分かれば十分)
+   - 単体 test 3 件: `create_with_null_returns_null` / `destroy_null_is_safe` / `dispatch_with_null_handle_returns_error`
+   - `smooth_core_version()` を 0x0002_0004 → 0x0002_0005 に bump
+2. **FFI header(`smooth_core_ffi.h`)**: 上記 3 symbols を `#ifdef __APPLE__` で囲んで宣言。caller contract(lifecycle / pitch unit / 戻り値の opaque さ)を明記
+3. **Effect.cpp**:
+   - `AE_EffectGPUSuites.h` を include
+   - `SMOOTH_GPU_DISPATCH_READY` を 0 → **1** に flip(コメントを「dormant 解除、Metal round-trip 動作」に書き換え)
+   - **`GpuDeviceSetup`**: `kPFGPUDeviceSuite` を `pica_basicP->AcquireSuite` で取得、`GetDeviceInfo(device_index)` で `PF_GPUDeviceInfo` 取得、`device_framework == PF_GPU_Framework_METAL && compatibleB && devicePV && command_queuePV` を確認、`smooth_core_metal_create(devicePV, command_queuePV)` で handle 生成、`gpu_extra->output->gpu_data` に格納、`out_data->out_flags2 |= SUPPORTS_GPU_RENDER_F32` を OR(3 箇所目)。各段階 fail 時は handle 解放 + suite release で leak 無し。Win 用 `#else` 分岐は no-op(Sub-stage E で CUDA 版を追加)
+   - **`GpuDeviceSetdown`**: `gpu_extra->input->gpu_data` を取り出して `smooth_core_metal_destroy` で解放、defensively NULL 化
+   - **`SmartRenderGpu`**: dispatch gate 1 経路を実装。`extraP->input->gpu_data` から MetalBackend handle、`extraP->input->what_gpu == PF_GPU_Framework_METAL` 確認、`pica_basicP` 経由で `kPFGPUDeviceSuite` 取得、`checkout_layer_pixels` + `checkout_output` で input/output PF_EffectWorld 取得、`GetGPUWorldData` で MTLBuffer raw pointer 抽出、`pitch_pixels = rowbytes / 16`(ARGB128 = 16 bytes/pixel)、`smooth_core_metal_dispatch_passthrough` 呼び出し、戻り値 0 以外は `mark_fallen_and_continue` に倒す(RFC §4.4 採用 (i)、`PF_Err_NONE` で Render Queue を止めない)
+   - **`mark_fallen_and_continue` ヘルパ** 新設: UUID 取得 → mark_fallen → `PF_Err_NONE` を返す、各 GPU 経路 error 経路の共通 hook
+4. **`tests/run_regression.sh` / `tests/synthesize_32bpc_goldens.sh`** link flag 修正: libsmooth_core.a が Mac で Objective-C runtime + Metal framework を参照するようになったため、`-lobjc -framework Foundation -framework Metal -framework QuartzCore` を `case "$(uname -s)"` で macOS のみ追加。Linux/Win は no-op
+
+**Step C-2.5a gate 結果**:
+- `cargo test --release`: **22/22 PASS**(C-2 19 + metal_ffi 3 新規)
+- `xcodebuild Mac/smooth.xcodeproj -scheme smooth -configuration Release build`: **BUILD SUCCEEDED**(Universal、Mac plugin に Metal framework がリンク済み)
+- `SMOOTH_PARALLEL=1 tests/run_regression.sh`: **PASS 28/28 + synthetic 6/6**(CPU 経路は GPU FFI 追加で非劣化)
+- `SMOOTH_PARALLEL=0 tests/run_regression.sh`: **PASS 28/28 + synthetic 6/6**
+
+**C-2.5a で意図的に未実装(C-2.5b で対応)**:
+- 実 smooth アルゴリズムの MSL kernel 化(現 shader = identity passthrough)。32bpc + GPU checkbox ON では effect が「無効化」状態で見える。CPU mode(checkbox OFF または 8/16bpc)では従来通り smooth 適用
+- `gpu_metal_policy` の manifest schema 追加 + regression(C-2.5c)
+- per-device tracking(現状 5-condition AND の (e) は (d) と merge)→ Sub-stage D で `GetDeviceCount` 経由で本実装
+
+**実機テスト(Hiroshi さん):** 4 点で C-2.5a の round-trip を検証:
+1. **About**: `rust_core 0.1.0+<sha>` clean、**`ffi=0x00020005`**(C-2.5a で bump)
+2. **8/16bpc Comp**: 従来通り smooth 適用 + crash 無し(CPU 経路、変化無し想定)
+3. **32bpc Comp + checkbox ON**: **smooth が見かけ上適用されない**(identity passthrough 動作、出力 = 入力)+ crash 無し + AE log で `Multithreaded render report` に `KOJI_SMOOTH` thread-safe が継続表示される
+4. **32bpc Comp + checkbox OFF**: smooth 適用される(CPU SmartRender 経由)+ crash 無し。3 と 4 の差分が C-2.5a の round-trip が動いている証拠
+
+**学び / Sub-stage E ハンドオーバ追加項目**:
+- libsmooth_core.a が Metal frameworks に依存するようになったので、Win build 環境でも `-lobjc` を要求しない(`#[cfg(target_os = "macos")]` で gate 済)。Win 側は CUDA framework 依存になるはずで、Sub-stage E で同様の OS 別 link flag を Win build script に追加する必要あり
+- `metal-rs` の `transmute::<*mut c_void, &MetalRef>` パターンは AE-owned MTLDevice を非所有で扱うのに有効。CUDA 側でも同様の `&CudaContextRef` wrapper を `cudarc` から借用する設計を design-freeze review で確認する
+
