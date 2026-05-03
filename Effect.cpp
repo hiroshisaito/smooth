@@ -1316,19 +1316,28 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         return mark_fallen_and_continue(in_data);
     }
 
-    // ARGB128 GPU world: 16 bytes per pixel. The Rust kernel expects
+    // BGRA128 GPU world: 16 bytes per pixel. The Rust kernel expects
     // pitches in pixels; AE delivers rowbytes in bytes.
     const uint32_t src_pitch_pixels = (uint32_t)(input_world->rowbytes  / 16);
     const uint32_t dst_pitch_pixels = (uint32_t)(output_world->rowbytes / 16);
     const uint32_t width            = (uint32_t)input_world->width;
     const uint32_t height           = (uint32_t)input_world->height;
 
-    // C-2.5a kernel: identity passthrough. Visually this means smooth has
-    // no effect when the GPU path runs. C-2.5b replaces the kernel with the
-    // real 2-pass detect+blend; the C++ side here does not change.
-    int32_t rc = smooth_core_metal_dispatch_passthrough(
+    // Look up the snapshotted GPU-Acceleration / white_option params so the
+    // preprocess kernel can do the white-key strip. (gpu_acceleration is
+    // always true here because PreRender's 5-condition AND would not have
+    // raised GPU_RENDER_POSSIBLE otherwise; we read it for symmetry / debug.)
+    SmartRenderInfo *info = (SmartRenderInfo*)extraP->input->pre_render_data;
+    const uint32_t white_opt = (info && info->white_option) ? 1u : 0u;
+
+    // C-2.5b.1 kernel: copy src→dst with optional white-key stripping.
+    // The actual smooth blend lands in C-2.5b.2; until then 32bpc + GPU
+    // acceleration ON renders without smoothing but with white_option
+    // honoured (tests/checked: white→null transparent works on the GPU
+    // path). 32bpc + GPU OFF stays on CPU SmartRender, full smooth + white.
+    int32_t rc = smooth_core_metal_dispatch_preprocess(
         metal_handle, src_buf, dst_buf,
-        src_pitch_pixels, dst_pitch_pixels, width, height);
+        src_pitch_pixels, dst_pitch_pixels, width, height, white_opt);
 
     extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
     in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);

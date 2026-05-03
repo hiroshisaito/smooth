@@ -264,7 +264,7 @@ void  smooth_core_metal_destroy(void *handle);
 
 /* Dispatch the identity passthrough kernel (Sub-stage C-1's smooth.metal
  * `smooth_passthrough`). Pitches are in pixels (= rowbytes / 16 for the
- * ARGB128 format AE delivers to GPU effects). Returns 0 on success. */
+ * BGRA128 format AE delivers to GPU effects). Returns 0 on success. */
 int32_t smooth_core_metal_dispatch_passthrough(
     void    *handle,
     void    *src_buf,
@@ -273,6 +273,22 @@ int32_t smooth_core_metal_dispatch_passthrough(
     uint32_t dst_pitch_pixels,
     uint32_t width,
     uint32_t height);
+
+/* Dispatch the preprocess kernel (Sub-stage C-2.5b.1: src->dst copy with
+ * optional white-key stripping). Mirrors the in-place white_option half of
+ * pre_process() in preprocess.rs. white_opt = 0 degenerates to a copy;
+ * white_opt != 0 replaces every pixel with RGB == (1.0, 1.0, 1.0) by the
+ * null pixel (all four channels zero, alpha included). Pitches in pixels,
+ * BGRA128 layout. Returns 0 on success. */
+int32_t smooth_core_metal_dispatch_preprocess(
+    void    *handle,
+    void    *src_buf,
+    void    *dst_buf,
+    uint32_t src_pitch_pixels,
+    uint32_t dst_pitch_pixels,
+    uint32_t width,
+    uint32_t height,
+    uint32_t white_opt);
 #endif /* __APPLE__ */
 
 #ifdef __cplusplus

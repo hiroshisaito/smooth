@@ -29,7 +29,10 @@ pub extern "C" fn smooth_core_version() -> u32 {
     // 0x0002_0005: added Mac Metal dispatch FFI (smooth_core_metal_{create,destroy,
     //              dispatch_passthrough}) for Sub-stage C-2.5a. Mac-only symbols; the
     //              Windows staticlib does not export them. Still backward compatible.
-    0x0002_0005
+    // 0x0002_0006: added smooth_core_metal_dispatch_preprocess (white-key strip kernel)
+    //              for Sub-stage C-2.5b.1. Production GPU path now uses preprocess
+    //              instead of passthrough.
+    0x0002_0006
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -417,9 +420,9 @@ mod metal_ffi {
 
     /// Run the identity passthrough Metal kernel from
     /// `gpu/shaders/smooth.metal`. The pitches are in **pixels** (= rowbytes
-    /// / 16 for ARGB128). Returns 0 on success, non-zero on failure
-    /// (caller marks the instance fallen and returns PF_Err_NONE per RFC
-    /// §4.4 採用 (i)).
+    /// / 16 for the GPU's BGRA128 format). Returns 0 on success, non-zero on
+    /// failure (caller marks the instance fallen and returns PF_Err_NONE per
+    /// RFC §4.4 採用 (i)).
     ///
     /// SAFETY: `handle` must be a live MetalBackend pointer; `src_buf` /
     /// `dst_buf` must be MTLBuffer raw pointers obtained from AE's GPU
@@ -444,6 +447,42 @@ mod metal_ffi {
         let dispatch = backend.dispatch_passthrough(
             &mut ctx, src_buf, dst_buf,
             src_pitch_pixels, dst_pitch_pixels, width, height,
+        );
+        if dispatch.is_err() {
+            let _ = <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx);
+            return -3;
+        }
+        if <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx).is_err() {
+            return -4;
+        }
+        0
+    }
+
+    /// Run the preprocess kernel: copy src → dst with optional white-key
+    /// stripping. Mirrors the in-place stripping half of `pre_process` in
+    /// `preprocess.rs`. `white_opt` is 0/1 — 1 strips RGB=(1,1,1) pixels to
+    /// the null pixel; 0 degenerates to a copy. Same return-code shape as
+    /// `dispatch_passthrough`. Pitches in pixels, BGRA128 layout.
+    #[no_mangle]
+    pub unsafe extern "C" fn smooth_core_metal_dispatch_preprocess(
+        handle: *mut c_void,
+        src_buf: *mut c_void,
+        dst_buf: *mut c_void,
+        src_pitch_pixels: u32,
+        dst_pitch_pixels: u32,
+        width: u32,
+        height: u32,
+        white_opt: u32,
+    ) -> i32 {
+        if handle.is_null() { return -1; }
+        let backend = &*(handle as *const gpu::metal::MetalBackend);
+        let mut ctx = match <gpu::metal::MetalBackend as gpu::GpuBackend>::begin_frame(backend) {
+            Ok(c) => c,
+            Err(_) => return -2,
+        };
+        let dispatch = backend.dispatch_preprocess(
+            &mut ctx, src_buf, dst_buf,
+            src_pitch_pixels, dst_pitch_pixels, width, height, white_opt,
         );
         if dispatch.is_err() {
             let _ = <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx);

@@ -22,6 +22,20 @@ use metal::{
 };
 use objc::rc::autoreleasepool;
 
+#[inline]
+fn build_pipeline(
+    device: &Device,
+    library: &Library,
+    fn_name: &str,
+) -> Result<ComputePipelineState, GpuError> {
+    let function = library
+        .get_function(fn_name, None)
+        .map_err(|e| GpuError::DeviceSetup(format!("get fn {fn_name}: {e}")))?;
+    device
+        .new_compute_pipeline_state_with_function(&function)
+        .map_err(|e| GpuError::DeviceSetup(format!("pipeline {fn_name}: {e}")))
+}
+
 /// Inline MSL source for the Sub-stage C-1 identity kernel. Sub-stage C-2
 /// replaces this with the 2-pass detect + blend implementation.
 const SMOOTH_MSL: &str = include_str!("shaders/smooth.metal");
@@ -32,7 +46,10 @@ pub struct MetalBackend {
     device: Device,
     queue: CommandQueue,
     pipeline_passthrough: ComputePipelineState,
-    // Sub-stage C-2 will add: pipeline_detect, pipeline_blend.
+    /// Sub-stage C-2.5b.1: preprocess (white-key strip + copy).
+    /// Replaces passthrough as the production-path entry kernel.
+    pipeline_preprocess: ComputePipelineState,
+    // Sub-stage C-2.5b.2 will add: pipeline_detect, pipeline_blend.
 }
 
 unsafe impl Send for MetalBackend {}
@@ -67,17 +84,14 @@ impl MetalBackend {
             let library: Library = device
                 .new_library_with_source(SMOOTH_MSL, &metal::CompileOptions::new())
                 .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
-            let function = library
-                .get_function("smooth_passthrough", None)
-                .map_err(|e| GpuError::DeviceSetup(format!("get fn smooth_passthrough: {e}")))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(|e| GpuError::DeviceSetup(format!("pipeline: {e}")))?;
+            let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
+            let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
 
             Ok(MetalBackend {
                 device,
                 queue,
-                pipeline_passthrough: pipeline,
+                pipeline_passthrough,
+                pipeline_preprocess,
             })
         })
     }
@@ -92,17 +106,67 @@ impl MetalBackend {
             let library = device
                 .new_library_with_source(SMOOTH_MSL, &metal::CompileOptions::new())
                 .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
-            let function = library
-                .get_function("smooth_passthrough", None)
-                .map_err(|e| GpuError::DeviceSetup(format!("get fn: {e}")))?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(|e| GpuError::DeviceSetup(format!("pipeline: {e}")))?;
+            let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
+            let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
             Ok(MetalBackend {
                 device,
                 queue,
-                pipeline_passthrough: pipeline,
+                pipeline_passthrough,
+                pipeline_preprocess,
             })
+        })
+    }
+
+    /// Sub-stage C-2.5b.1: preprocess. Mirrors `pre_process` in
+    /// `preprocess.rs` for the white-key stripping half. `white_opt` is a
+    /// boolean encoded as 0/1 (matches `info->white_option ? 1 : 0` on the
+    /// C++ side; matches the kernel's `constant uint& white_opt`). Pitches
+    /// in pixels per the same convention as `dispatch_passthrough`.
+    pub fn dispatch_preprocess(
+        &self,
+        ctx: &mut FrameContext,
+        src_buffer_ptr: *mut c_void,
+        dst_buffer_ptr: *mut c_void,
+        src_pitch_pixels: u32,
+        dst_pitch_pixels: u32,
+        width: u32,
+        height: u32,
+        white_opt: u32,
+    ) -> Result<(), GpuError> {
+        if src_buffer_ptr.is_null() || dst_buffer_ptr.is_null() {
+            return Err(GpuError::Dispatch("null buffer".into()));
+        }
+        if width == 0 || height == 0 {
+            return Err(GpuError::Dispatch("zero extent".into()));
+        }
+        let _ = &ctx.scratch;
+        autoreleasepool(|| -> Result<(), GpuError> {
+            let cb: &CommandBufferRef = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.pipeline_preprocess);
+            let src = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(src_buffer_ptr)
+            };
+            let dst = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buffer_ptr)
+            };
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
+            enc.set_bytes(6, 4, &white_opt as *const u32 as *const c_void);
+            let group = MTLSize::new(16, 16, 1);
+            let groups = MTLSize::new(
+                ((width + 15) / 16) as u64,
+                ((height + 15) / 16) as u64,
+                1,
+            );
+            enc.dispatch_thread_groups(groups, group);
+            enc.end_encoding();
+            cb.commit();
+            Ok(())
         })
     }
 
@@ -112,7 +176,8 @@ impl MetalBackend {
     /// MSL kernel signature; matches what AE provides via
     /// `rowbytes / 16`).
     ///
-    /// Sub-stage C-2 will add `dispatch_smooth` for the real algorithm.
+    /// Production GPU path now uses `dispatch_preprocess`; this remains
+    /// available for unit tests and as a minimal-ops debugging probe.
     pub fn dispatch_passthrough(
         &self,
         ctx: &mut FrameContext,
