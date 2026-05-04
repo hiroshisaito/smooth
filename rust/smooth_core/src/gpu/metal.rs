@@ -64,36 +64,14 @@ pub struct MetalBackend {
     /// were observed to occasionally trip AE's "smooth did not render
     /// anything" warning under MFR + 4K + memory pressure.
     pipeline_combined: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2b.2a: priority-buffer init kernel that
+    /// Sub-stage C-2.5b.2-prep2b.2: priority-buffer init kernel that
     /// fills the two `width × height × uint32` AE-allocated priority
     /// buffers with UINT32_MAX. Required before the line-blend kernels
-    /// (claim/apply) so atomic_min reduces to "lowest source-i-index
-    /// that touched this pixel" without a separate "untouched"
-    /// sentinel.
+    /// (claim/apply, landing in prep2b.3+) so atomic_min reduces to
+    /// "lowest source-i-index that touched this pixel" without a
+    /// separate "untouched" sentinel.
     pipeline_priority_init: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2b.2b: claim phase for mode_flg=15 outside
-    /// line-blends, dispatched per-tile (see TILE_SIZE in
-    /// dispatch_smooth_chain). Each thread = candidate centre within
-    /// the tile.
-    pipeline_blend_mode15_outside_claim: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2b.2b: apply phase for mode_flg=15 outside
-    /// line-blends, also tiled. Mirror of claim — reads priority and
-    /// conditionally writes the blend.
-    pipeline_blend_mode15_outside_apply: ComputePipelineState,
 }
-
-/// Tile size for prep2b.2b claim/apply dispatches. Each tile is encoded
-/// as one dispatch_thread_groups call within the same compute encoder
-/// (and hence the same command buffer), so atomic_min semantics on the
-/// priority buffers are preserved across tiles.
-///
-/// Sized to keep per-dispatch GPU runtime well under the macOS Metal
-/// driver watchdog (~2s/dispatch). At 4400² with ~10% mode_flg=15
-/// density, a 512×512 tile has ≈26K candidate centres, each doing up
-/// to ~1024 ops in claim or apply. ≈26M ops/tile → ~1ms on Apple
-/// silicon. Total tile count for 4400×4400 = ⌈4400/512⌉² = 81. Total
-/// claim+apply runtime ≈ 162ms (well within AE per-frame budget).
-const TILE_SIZE: u32 = 512;
 
 unsafe impl Send for MetalBackend {}
 unsafe impl Sync for MetalBackend {}
@@ -133,8 +111,6 @@ impl MetalBackend {
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
             let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
-            let pipeline_blend_mode15_outside_claim = build_pipeline(&device, &library, "smooth_blend_mode15_outside_claim")?;
-            let pipeline_blend_mode15_outside_apply = build_pipeline(&device, &library, "smooth_blend_mode15_outside_apply")?;
 
             Ok(MetalBackend {
                 device,
@@ -145,8 +121,6 @@ impl MetalBackend {
                 pipeline_blend,
                 pipeline_combined,
                 pipeline_priority_init,
-                pipeline_blend_mode15_outside_claim,
-                pipeline_blend_mode15_outside_apply,
             })
         })
     }
@@ -167,8 +141,6 @@ impl MetalBackend {
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
             let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
-            let pipeline_blend_mode15_outside_claim = build_pipeline(&device, &library, "smooth_blend_mode15_outside_claim")?;
-            let pipeline_blend_mode15_outside_apply = build_pipeline(&device, &library, "smooth_blend_mode15_outside_apply")?;
             Ok(MetalBackend {
                 device,
                 queue,
@@ -178,8 +150,6 @@ impl MetalBackend {
                 pipeline_blend,
                 pipeline_combined,
                 pipeline_priority_init,
-                pipeline_blend_mode15_outside_claim,
-                pipeline_blend_mode15_outside_apply,
             })
         })
     }
@@ -307,48 +277,26 @@ impl MetalBackend {
         })
     }
 
-    /// Sub-stage C-2.5b.2-prep2b.2b: smooth chain dispatcher with
-    /// priority buffers + mode_flg=15 outside line-blend kernels. Runs
-    /// 4 passes within a single command buffer:
-    ///   1. priority_init: zero-fill priority_v / priority_h to
-    ///      UINT32_MAX.
-    ///   2. smooth_combined: preprocess + detect + mode_flg=15 inside
-    ///      (centre 4-corner avg). All other mode_flg values pass
-    ///      through from src.
-    ///   3. blend_mode15_outside_claim (TILED): each candidate centre
-    ///      with mode_flg=15 walks its 4 outside-line calls and
-    ///      atomic_min on the touched output pixels' priority slots.
-    ///      Encoded as N×M dispatch_thread_groups calls, one per
-    ///      TILE_SIZE×TILE_SIZE tile, to keep per-dispatch GPU runtime
-    ///      under the macOS Metal driver watchdog.
-    ///   4. blend_mode15_outside_apply (TILED): same per-tile structure
-    ///      as claim; reads priority and conditionally writes blend.
-    ///
-    /// 2026-05-04: an earlier non-tiled implementation (commit ac408f7)
-    /// dispatched 19M threads per kernel and triggered AE warning
-    /// "smooth did not render anything" + FrameTask 517 errors at 4400²
-    /// resolution — symptoms of GPU watchdog timeout on heavy
-    /// mode_flg=15-dense regions. That commit was reverted; this tiled
-    /// version (commit prep2b.2b retry) keeps each dispatch's workload
-    /// bounded.
+    /// Sub-stage C-2.5b.2-prep2b.2: smooth chain dispatcher with priority
+    /// buffers. Runs `smooth_priority_init` (zero-fill of the two
+    /// AE-allocated `width × height × uint32` priority buffers, set to
+    /// UINT32_MAX) followed by `smooth_combined` (preprocess+detect+blend
+    /// for mode_flg=15). All passes go on a single command buffer; the
+    /// init pass is encoded before the combined pass so Metal pipelines
+    /// the dependency chain.
     ///
     /// `priority_v` / `priority_h` are AE-allocated MTLBuffers (see
     /// gpu_suite->AllocateDeviceMemory in Effect.cpp). They MUST be
-    /// non-null and at least `width * height * 4` bytes; the caller
-    /// owns them and frees via gpu_suite->FreeDeviceMemory after the
-    /// dispatch.
+    /// non-null and at least `width * height * 4` bytes; the caller owns
+    /// them and frees via gpu_suite->FreeDeviceMemory after the dispatch.
+    /// They are initialised here even though prep2b.2 doesn't yet bind
+    /// them to a working kernel — this lands the wiring so prep2b.3+
+    /// claim/apply kernels can drop in without further FFI changes.
     ///
-    /// `line_weight` is the per-blend line weighting (CPU-side encoding
-    /// `(slider_value / 2.0 + 0.5)`) used by the outside-line blend
-    /// kernels.
-    ///
-    /// Blend coverage:
-    ///   - mode_flg = 15 inside: pipeline_combined, centre 4-corner avg.
-    ///   - mode_flg = 15 outside: pipelines_blend_mode15_outside_*
-    ///     handle line-blends via atomic_min priority resolution
-    ///     ("lowest source-i_index wins").
-    ///   - mode_flg ∈ {3, 5, 7, 11, 13}: still identity copy from src
-    ///     (added in prep2b.3+).
+    /// The blend pass (in pipeline_combined) currently handles only
+    /// mode_flg = 15 (link8_square centre pixel). Other mode_flg values
+    /// fall through to identity copy from src; line-level blends arrive
+    /// in prep2b.3+ as the claim/apply kernels are added.
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
@@ -363,7 +311,6 @@ impl MetalBackend {
         logical_width:     u32,
         range_f32:         f32,
         white_opt:         u32,
-        line_weight:       f32,
     ) -> Result<(), GpuError> {
         if src_buf.is_null() || dst_buf.is_null() {
             return Err(GpuError::Dispatch("null src/dst buffer".into()));
@@ -413,9 +360,10 @@ impl MetalBackend {
                 enc.end_encoding();
             }
 
-            // Pass 2: combined — preprocess + detect + mode_flg=15
-            // inside (centre 4-corner avg). Priority buffers not bound
-            // here; consumed by passes 3+4 below.
+            // Pass 2: combined — preprocess+detect+blend per pixel.
+            // Priority buffers are not yet bound here (prep2b.3+ replaces
+            // pipeline_combined or adds claim/apply passes that consume
+            // them via atomic_min / read-back).
             {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.pipeline_combined);
@@ -431,60 +379,6 @@ impl MetalBackend {
                 enc.dispatch_thread_groups(groups, group);
                 enc.end_encoding();
             }
-
-            // Helper to encode the per-tile dispatches for either claim
-            // or apply pass. Each tile is one dispatch_thread_groups
-            // call; all tiles share a single compute encoder so atomic
-            // semantics across tiles are preserved (Metal serialises
-            // dispatches within a single encoder + command buffer).
-            //
-            // Tile loop: for tile_y in 0..height step TILE_SIZE
-            //              for tile_x in 0..width  step TILE_SIZE
-            //                  set_bytes(tile_origin) + dispatch
-            let encode_tiled_pass = |pipeline: &ComputePipelineState| {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(pipeline);
-                // Bindings 0..11 are constant across tiles; encode once.
-                enc.set_buffer(0, Some(src), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(pri_v), 0);
-                enc.set_buffer(3, Some(pri_h), 0);
-                enc.set_bytes(4, 4, &src_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &dst_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(8, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(9, 4, &range_f32 as *const f32 as *const c_void);
-                enc.set_bytes(10, 4, &white_opt as *const u32 as *const c_void);
-                enc.set_bytes(11, 4, &line_weight as *const f32 as *const c_void);
-
-                let mut tile_y: u32 = 0;
-                while tile_y < height {
-                    let mut tile_x: u32 = 0;
-                    while tile_x < width {
-                        let tw = (TILE_SIZE).min(width  - tile_x);
-                        let th = (TILE_SIZE).min(height - tile_y);
-                        let tile_origin: [u32; 2] = [tile_x, tile_y];
-                        enc.set_bytes(12, 8, tile_origin.as_ptr() as *const c_void);
-                        let tile_groups = MTLSize::new(
-                            ((tw + 15) / 16) as u64,
-                            ((th + 15) / 16) as u64,
-                            1,
-                        );
-                        enc.dispatch_thread_groups(tile_groups, group);
-                        tile_x += TILE_SIZE;
-                    }
-                    tile_y += TILE_SIZE;
-                }
-                enc.end_encoding();
-            };
-
-            // Pass 3: claim — atomic_min on touched output pixels'
-            // priority slots. No dst writes.
-            encode_tiled_pass(&self.pipeline_blend_mode15_outside_claim);
-            // Pass 4: apply — read priority + conditional dst writes
-            // for centres that won the claim.
-            encode_tiled_pass(&self.pipeline_blend_mode15_outside_apply);
 
             cb.commit();
             // RFC §3.3.6 contract: no Rust-allocated intermediates. The
