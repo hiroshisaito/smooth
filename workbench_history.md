@@ -1928,3 +1928,65 @@ PF_GetPixelData16 → U_ReportFailedVerification
 - 上記表は plugin が intermediate を確保しない前提。**Sub-stage C-2.5b.2-prep2b 以降で line-level blend が必要になり multi-pass を再導入する場合は、`gpu_suite->AllocateDeviceMemory` 経由で AE 管理 buffer を使う**(metal-rs `device.new_buffer()` 直接確保は AE synchronisation 視野外で AE 警告を招くことを実機テストで確認済、commit `c7e164a` → `8001aca` → `084b470` の系譜)
 - CUDA 側でも同じ原則(`gpu_suite->AllocateDeviceMemory` は CUDA で `cuMemAlloc` 経由)。Sub-stage E で line-level pass を実装する場合は最初から AE 管理を採用
 
+---
+
+## Phase 2-A.3 Sub-stage C-2.5b.2-prep2b 設計分析(2026-05-04、commit `9f82613`)
+
+**背景**: prep2a で mode_flg=15 中心 pixel のみの blend が動作 → 残り mode_flg ∈ {3, 5, 7, 11, 13} の line-level blend を完成させる必要。Hiroshi さんから設計上の hard requirement が示された:
+
+- CPU/GPU でレンダリング結果に大きな差が発生しない(同一が望ましく、最低でも目視で同等)
+- マルチマシンでネットワークレンダリング時にマシンによる差が発生しない
+- CPU fallback が Render Queue 中途で発火しても、視覚的な不連続が生じない
+
+これを受け、汎用 agent に深い trade-off 分析を依頼(prompt 全文は `docs/PHASE_2A_PREP2B_DESIGN_MEMO.md` を参照)。3 候補を比較:
+
+**(a) algorithm inversion**: 各 GPU thread が「自分の pixel に書く可能性のある全 source pixel を逆走査」設計
+- worst-case で **10⁷ reads/output pixel**(4K で 10¹³ 規模)→ memory bandwidth で非現実
+- 8〜14 sessions、~1500 LOC の net-new MSL(CPU oracle 無し)
+- CPU と spatial に異なる出力(bit-identical 不可)、視覚的近似のみ
+
+**(b) multi-pass + gpu_suite-allocated intermediates + atomic priority buffer**:
+- 5〜7 sessions、~700 LOC MSL + ~200 LOC Rust(各 kernel = CPU helper の直訳、レビュー oracle 完備)
+- 2 つの `uint32`/pixel priority buffer(計 32 MB at 4K)で write 競合を CPU 等価の "later wins" 順序で解決
+- **bit-identical CPU↔GPU 達成可能** ← Hiroshi さん要件への最強の答え
+- `PF_GPUDeviceSuite1::AllocateDeviceMemory` で AE 管理 → `c7e164a` の memory pressure 問題は回避(全 intermediate を 1 byte/pixel に抑える設計則、BGRA128 16 byte/pixel scratch は禁忌)
+
+**(c) partial implementation**: mode_flg=15 のみで出荷
+- mode_flg ∈ {3, 5, 7, 11, 13} は edge pixel の 80〜95% を占めるため skip = 視覚的に明白な未 smoothing
+- network render の fallback 切替時に半分は jaggy / 半分は綺麗の不連続が発生
+- **Hiroshi さん要件で却下**
+
+**Win CUDA fork リスク**: (a) も (b) も低い。`PF_GPUDeviceSuite1::AllocateDeviceMemory` が Mac で MTLBuffer / Win で CUdeviceptr を返すため intermediate の plumbing は platform-neutral、`atomic_min_explicit` (MSL) ↔ `atomicMin` (CUDA) は同等 semantics。SIMT/SIMD 幅差は inner scan loop の最適化のみに影響、algorithm は共通可能。**Mac/Win design fork は不要**。
+
+**判断**: option (b) を採用。理由:
+1. CPU↔GPU bit-identical 達成可能 = Hiroshi さん要件への完全な答え
+2. 各 kernel が単一 CPU helper の直訳 = レビューに oracle あり
+3. 1 byte/pixel intermediate なら memory pressure 問題が AE 管理経由で回避可能(8000² で計 ≤270 MB、4 GB GPU で MFR≤4 で十分余裕)
+
+**実装ロードマップ(prep2b.1〜prep2b.7、計 5〜7 sessions)**:
+
+| 段 | 内容 | 役割 |
+|---|---|---|
+| **prep2b.1** | 2 つの `uint32`/pixel priority buffer を `gpu_suite->AllocateDeviceMemory` で確保、dispatcher 配線 | **gating 実験**: AE 警告再発の有無を実機で検証 |
+| prep2b.2 | `smooth_blend_mode15_outside` kernel(`link8_square_blend_outside` の直訳、atomic_min で write 順序解決)| mode_flg=15 完全実装 |
+| prep2b.3 | link8_01/02/04(mode_flg 7/11/13)= `link8_execute` の line-blend 部分 | 主要エッジケース |
+| prep2b.4 | up_mode_corner(mode_flg=3)= `up_mode_*_count_length` + `up_mode_*_blending` × 4 | コーナー上向き |
+| prep2b.5 | down_mode_corner(mode_flg=5)= 上記 mirror | コーナー下向き |
+| prep2b.6 | lack_mode + 突起 mode3 | 残りエッジケース |
+| prep2b.7 | regression + 32bpc goldens 比較で CPU と bit-identical 確認 | 出荷前検証 |
+
+**Stop-and-reconsider trigger**(option (b) → (a) 切替条件):
+prep2b.1 で **2 つの uint32/pixel priority buffer 追加(AE 管理 32 MB at 4K)が AE 警告を再発させたら**、`gpu_suite->AllocateDeviceMemory` 経由でも memory pressure 系の問題があると判定。その時点で:
+- option (b) 放棄 → option (a) inversion に flip
+- bit-identical を諦め、視覚的近似 + 同一 device 内決定論を維持
+- 予算膨張(5〜7 → 8〜14 sessions)
+- `gpu_metal_policy` を緩める方針に修正
+
+この trigger は **prep2b.1 commit 1 つで早期判定可能** な設計にしてある。後段(prep2b.2 以降)に資源を投入する前に分岐する仕組み。
+
+**Sub-stage E(Win CUDA)ハンドオーバ事項**:
+- option (b) なら Win 側も同じアーキテクチャを reuse 可能(forkレス)
+- option (a) に flip した場合は Win も同じ inversion logic を port、ただし計算量問題は CUDA で同等(SIMT 32-wide なので Mac Apple Silicon の 32-wide と等価)
+
+**設計 memo 全文**: `docs/PHASE_2A_PREP2B_DESIGN_MEMO.md`(commit `9f82613`、agent 分析の生成果物。以降のセッションで Sub-stage E 担当者が参照する想定)。
+
