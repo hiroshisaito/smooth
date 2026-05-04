@@ -84,6 +84,7 @@ Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-
 - ⬜ **Step 4 (Sub-stage D)**: UI DISABLED wiring + GPU 検出機構 + About
 - ⬜ **Step 5 (Sub-stage E)**: Win CUDA backend 本実装 + Effect.cpp CUDA path
 - ⬜ **Step 6 (Sub-stage F)**: Full UAT + 性能測定 + v1.6.0 配布
+  - **README システム要件への GPU 要件追加**(2026-05-04 Hiroshi さん指示): UAT で 4 GB / 8 GB / 16 GB GPU × HD / 4K / 8000² の組合せを実測 → 現実的な「推奨 GPU メモリ」「最大解像度」「MFR 推奨スレッド数」のラインを README に明記。算出予測値は workbench_history.md「GPU メモリ要件算出」節 + README の「32bpc + GPU 経路の GPU メモリ要件」節を UAT 後に **目安 → 実測値** に置換
 
 ---
 
