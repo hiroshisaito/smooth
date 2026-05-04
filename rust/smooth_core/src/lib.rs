@@ -32,7 +32,11 @@ pub extern "C" fn smooth_core_version() -> u32 {
     // 0x0002_0006: added smooth_core_metal_dispatch_preprocess (white-key strip kernel)
     //              for Sub-stage C-2.5b.1. Production GPU path now uses preprocess
     //              instead of passthrough.
-    0x0002_0006
+    // 0x0002_0007: added smooth_core_metal_dispatch_smooth_chain (preprocess + detect
+    //              + blend in a single command buffer) for Sub-stage C-2.5b.2-prep2a.
+    //              The blend kernel currently handles only mode_flg=15 (link8_square
+    //              centre); other modes pass through unchanged.
+    0x0002_0007
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -447,6 +451,52 @@ mod metal_ffi {
         let dispatch = backend.dispatch_passthrough(
             &mut ctx, src_buf, dst_buf,
             src_pitch_pixels, dst_pitch_pixels, width, height,
+        );
+        if dispatch.is_err() {
+            let _ = <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx);
+            return -3;
+        }
+        if <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx).is_err() {
+            return -4;
+        }
+        0
+    }
+
+    /// Run the full GPU smooth chain: preprocess (white-key strip + copy
+    /// to an internal buffer) → detect (per-pixel mode_flg byte) → blend
+    /// (mode_flg=15 centre averaging only — other modes are identity copy
+    /// from the post-preprocess buffer through). Returns 0 on success;
+    /// non-zero return is the same opaque "kernel did not make it onto
+    /// the queue" signal as the simpler dispatchers. Caller marks the
+    /// instance fallen on non-zero per RFC §4.4 採用 (i).
+    ///
+    /// SAFETY: same as dispatch_passthrough — `handle` is a live
+    /// MetalBackend, src/dst are MTLBuffer pointers from AE's GPU suite,
+    /// pitches are in pixels (= rowbytes/16 for BGRA128).
+    #[no_mangle]
+    pub unsafe extern "C" fn smooth_core_metal_dispatch_smooth_chain(
+        handle: *mut c_void,
+        src_buf: *mut c_void,
+        dst_buf: *mut c_void,
+        src_pitch_pixels: u32,
+        dst_pitch_pixels: u32,
+        width: u32,
+        height: u32,
+        logical_width: u32,
+        range_f32: f32,
+        white_opt: u32,
+    ) -> i32 {
+        if handle.is_null() { return -1; }
+        let backend = &*(handle as *const gpu::metal::MetalBackend);
+        let mut ctx = match <gpu::metal::MetalBackend as gpu::GpuBackend>::begin_frame(backend) {
+            Ok(c) => c,
+            Err(_) => return -2,
+        };
+        let dispatch = backend.dispatch_smooth_chain(
+            &mut ctx, src_buf, dst_buf,
+            src_pitch_pixels, dst_pitch_pixels,
+            width, height, logical_width,
+            range_f32, white_opt,
         );
         if dispatch.is_err() {
             let _ = <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx);

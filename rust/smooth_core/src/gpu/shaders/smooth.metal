@@ -208,3 +208,86 @@ kernel void smooth_detect(
     // "fast_compare did not even fire" when triaging output.
     modes[out_idx] = (uchar)(mode_flg | 0x80u);
 }
+
+// ========================================================================
+// C-2.5b.2-prep2a: smooth_blend kernel — partial port.
+//
+// For each output pixel, read the centre pixel from `src` (post-preprocess
+// intermediate) plus the modes byte from the detect pass. If the pixel
+// triggers mode_flg == 15 (= every cardinal neighbour different = isolated
+// pixel surrounded by other colours), apply the CENTRE-PIXEL part of
+// `link8_square_execute` from link8.rs:
+//
+//     for each of 4 diagonals D:
+//         if compare_pixel_equal(centre, D)  → temp[i] = centre
+//         else                                → temp[i] = blend(centre, D, 0.5)
+//     out = average(temp[0..4])
+//
+// All other mode_flg values (3, 5, 7, 11, 13, etc) currently fall through
+// to identity copy — the line-level blends from link8_square_blend_outside,
+// up_mode_*_blending, down_mode_*_blending, lack_mode_* land in subsequent
+// prep steps. They have inter-thread write conflicts that need careful
+// algorithm inversion (each thread writes only its own pixel by reading
+// from any neighbour whose decision could affect it), so they are NOT in
+// this commit.
+//
+// `src` and `dst` are separate buffers so this kernel has NO read-after-
+// write hazard: src is the immutable post-preprocess image, dst gets the
+// final output. The chain dispatcher allocates the intermediate in
+// dispatch_smooth_chain and threads the buffers through.
+//
+// `modes` pitch is `width` (1 byte per pixel, no padding) per detect kernel
+// convention.
+kernel void smooth_blend(
+    device const float4* src           [[buffer(0)]],  // BGRA128 post-preprocess
+    device float4*       dst           [[buffer(1)]],  // BGRA128 output
+    device const uchar*  modes         [[buffer(2)]],
+    constant uint&       src_pitch     [[buffer(3)]],  // pixels
+    constant uint&       dst_pitch     [[buffer(4)]],  // pixels
+    constant uint&       width         [[buffer(5)]],
+    constant uint&       height        [[buffer(6)]],
+    constant uint&       logical_width [[buffer(7)]],
+    constant float&      range         [[buffer(8)]],
+    uint2                gid           [[thread_position_in_grid]])
+{
+    if (gid.x >= width || gid.y >= height) return;
+    const uint x = gid.x;
+    const uint y = gid.y;
+
+    const float4 c = src[y * src_pitch + x];
+
+    // Default: identity copy. mode_flg < 15 / outside inner region / etc.
+    float4 out = c;
+
+    // Inner region only — same gate the detect kernel applied.
+    if (x >= 1u && x + 1u < logical_width && y >= 1u && y + 1u < height) {
+        const uchar m = modes[y * width + x];
+        if ((m & 0x80u) != 0u) {
+            const uint mode_flg = (uint)(m & 0x0Fu);
+            if (mode_flg == 15u) {
+                // Read 4 diagonals — same offsets as link8.rs ref_tbl:
+                //   [0] (x-1, y-1) upper-left
+                //   [1] (x+1, y-1) upper-right
+                //   [2] (x+1, y+1) lower-right
+                //   [3] (x-1, y+1) lower-left
+                const float4 d_ul = src[(y - 1u) * src_pitch + (x - 1u)];
+                const float4 d_ur = src[(y - 1u) * src_pitch + (x + 1u)];
+                const float4 d_br = src[(y + 1u) * src_pitch + (x + 1u)];
+                const float4 d_bl = src[(y + 1u) * src_pitch + (x - 1u)];
+
+                // For each diagonal: if it's the same colour as centre
+                // (within tolerance), keep centre as-is; otherwise blend
+                // centre with the diagonal at 0.5. Then average the four.
+                const float4 t_ul = compare_pixel_equal(c, d_ul, range) ? c : blending_pixel_f(c, d_ul, 0.5f);
+                const float4 t_ur = compare_pixel_equal(c, d_ur, range) ? c : blending_pixel_f(c, d_ur, 0.5f);
+                const float4 t_br = compare_pixel_equal(c, d_br, range) ? c : blending_pixel_f(c, d_br, 0.5f);
+                const float4 t_bl = compare_pixel_equal(c, d_bl, range) ? c : blending_pixel_f(c, d_bl, 0.5f);
+
+                out = (t_ul + t_ur + t_br + t_bl) * 0.25f;
+            }
+            // mode_flg ∈ {3, 5, 7, 11, 13}: TODO in prep2b+. Identity for now.
+        }
+    }
+
+    dst[y * dst_pitch + x] = out;
+}

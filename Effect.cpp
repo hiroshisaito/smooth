@@ -1323,21 +1323,24 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
     const uint32_t width            = (uint32_t)input_world->width;
     const uint32_t height           = (uint32_t)input_world->height;
 
-    // Look up the snapshotted GPU-Acceleration / white_option params so the
-    // preprocess kernel can do the white-key strip. (gpu_acceleration is
-    // always true here because PreRender's 5-condition AND would not have
-    // raised GPU_RENDER_POSSIBLE otherwise; we read it for symmetry / debug.)
+    // Look up the snapshotted Params from PreRender so the smooth kernels
+    // can do the white-key strip + use the right f32 sum threshold.
     SmartRenderInfo *info = (SmartRenderInfo*)extraP->input->pre_render_data;
-    const uint32_t white_opt = (info && info->white_option) ? 1u : 0u;
+    const uint32_t white_opt   = (info && info->white_option) ? 1u : 0u;
+    // Match the CPU side's range_f32 derivation in smooth_core.h::smoothing<>
+    // for the 32bpc branch: slider × max_value(=1.0) × 4 channels / 100.
+    const float range_f32 = info ? (float)((info->range * 4.0) / 100.0) : 0.0f;
 
-    // C-2.5b.1 kernel: copy src→dst with optional white-key stripping.
-    // The actual smooth blend lands in C-2.5b.2; until then 32bpc + GPU
-    // acceleration ON renders without smoothing but with white_option
-    // honoured (tests/checked: white→null transparent works on the GPU
-    // path). 32bpc + GPU OFF stays on CPU SmartRender, full smooth + white.
-    int32_t rc = smooth_core_metal_dispatch_preprocess(
+    // C-2.5b.2-prep2a: full smooth chain (preprocess → detect → blend).
+    // The blend kernel currently handles only mode_flg=15 (link8_square
+    // centre pixel averaging); other mode values fall through to identity
+    // copy from the post-preprocess intermediate. Subsequent prep steps
+    // (prep2b+) add the line-level blends for mode_flg ∈ {3, 5, 7, 11, 13}.
+    int32_t rc = smooth_core_metal_dispatch_smooth_chain(
         metal_handle, src_buf, dst_buf,
-        src_pitch_pixels, dst_pitch_pixels, width, height, white_opt);
+        src_pitch_pixels, dst_pitch_pixels,
+        width, height, /* logical_width */ width,
+        range_f32, white_opt);
 
     extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
     in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);

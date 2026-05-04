@@ -51,11 +51,11 @@ pub struct MetalBackend {
     /// Replaces passthrough as the production-path entry kernel.
     pipeline_preprocess: ComputePipelineState,
     /// Sub-stage C-2.5b.2-prep1: detect (write per-pixel mode_flg byte to
-    /// an intermediate buffer for the blend pass to consume). Built and
-    /// unit-tested ahead of the blend pipeline; not wired into
-    /// SmartRenderGpu yet.
+    /// an intermediate buffer for the blend pass to consume).
     pipeline_detect: ComputePipelineState,
-    // Sub-stage C-2.5b.2-prep2 will add: pipeline_blend.
+    /// Sub-stage C-2.5b.2-prep2a: blend (mode_flg=15 centre pixel only;
+    /// other modes / line-level blends arrive in subsequent preps).
+    pipeline_blend: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -93,6 +93,7 @@ impl MetalBackend {
             let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
             let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
             let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
+            let pipeline_blend       = build_pipeline(&device, &library, "smooth_blend")?;
 
             Ok(MetalBackend {
                 device,
@@ -100,6 +101,7 @@ impl MetalBackend {
                 pipeline_passthrough,
                 pipeline_preprocess,
                 pipeline_detect,
+                pipeline_blend,
             })
         })
     }
@@ -117,12 +119,14 @@ impl MetalBackend {
             let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
             let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
             let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
+            let pipeline_blend       = build_pipeline(&device, &library, "smooth_blend")?;
             Ok(MetalBackend {
                 device,
                 queue,
                 pipeline_passthrough,
                 pipeline_preprocess,
                 pipeline_detect,
+                pipeline_blend,
             })
         })
     }
@@ -250,13 +254,143 @@ impl MetalBackend {
         })
     }
 
+    /// Sub-stage C-2.5b.2-prep2a: smooth chain dispatcher.
+    /// preprocess(src → inter) → detect(inter → modes) → blend(inter, modes → dst)
+    /// in one command buffer. Allocates the intermediate (inter) and modes
+    /// buffers internally; both are released when this method returns.
+    ///
+    /// The blend pass currently handles only mode_flg = 15 (link8_square
+    /// centre pixel). Pixels for which detect produced any other mode_flg
+    /// fall through to identity copy from `inter`. Visually this means a
+    /// 32bpc render with the GPU path engaged shows the white-key strip
+    /// (preprocess), the corner-pixel averaging at isolated-mode pixels,
+    /// and otherwise the post-preprocess image — the staircase smoothing
+    /// itself arrives once the line-level blends from prep2b+ land.
+    pub fn dispatch_smooth_chain(
+        &self,
+        ctx: &mut FrameContext,
+        src_buf:           *mut c_void,
+        dst_buf:           *mut c_void,
+        src_pitch_pixels:  u32,
+        dst_pitch_pixels:  u32,
+        width:             u32,
+        height:            u32,
+        logical_width:     u32,
+        range_f32:         f32,
+        white_opt:         u32,
+    ) -> Result<(), GpuError> {
+        if src_buf.is_null() || dst_buf.is_null() {
+            return Err(GpuError::Dispatch("null src/dst buffer".into()));
+        }
+        if width == 0 || height == 0 {
+            return Err(GpuError::Dispatch("zero extent".into()));
+        }
+        let _ = &ctx.scratch;
+
+        // Intermediate post-preprocess buffer (private storage = GPU-only).
+        let inter_pitch_pixels = width;
+        let inter_bytes = (width as u64) * (height as u64) * 16;
+        let inter = self.device.new_buffer(
+            inter_bytes,
+            MTLResourceOptions::StorageModePrivate,
+        );
+        let modes_bytes = (width as u64) * (height as u64);
+        let modes = self.device.new_buffer(
+            modes_bytes,
+            MTLResourceOptions::StorageModePrivate,
+        );
+
+        autoreleasepool(|| -> Result<(), GpuError> {
+            let cb: &CommandBufferRef = self.queue.new_command_buffer();
+
+            // Pass 1: preprocess src → inter.
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipeline_preprocess);
+                let src = unsafe {
+                    std::mem::transmute::<*mut c_void, &metal::BufferRef>(src_buf)
+                };
+                enc.set_buffer(0, Some(src), 0);
+                enc.set_buffer(1, Some(&inter), 0);
+                enc.set_bytes(2, 4, &src_pitch_pixels    as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &inter_pitch_pixels  as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &white_opt as *const u32 as *const c_void);
+                let group = MTLSize::new(16, 16, 1);
+                let groups = MTLSize::new(
+                    ((width + 15) / 16) as u64,
+                    ((height + 15) / 16) as u64,
+                    1,
+                );
+                enc.dispatch_thread_groups(groups, group);
+                enc.end_encoding();
+            }
+
+            // Pass 2: detect inter → modes.
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipeline_detect);
+                enc.set_buffer(0, Some(&inter), 0);
+                enc.set_buffer(1, Some(&modes), 0);
+                enc.set_bytes(2, 4, &inter_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &range_f32 as *const f32 as *const c_void);
+                let group = MTLSize::new(16, 16, 1);
+                let groups = MTLSize::new(
+                    ((width + 15) / 16) as u64,
+                    ((height + 15) / 16) as u64,
+                    1,
+                );
+                enc.dispatch_thread_groups(groups, group);
+                enc.end_encoding();
+            }
+
+            // Pass 3: blend (inter, modes) → dst.
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipeline_blend);
+                let dst = unsafe {
+                    std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
+                };
+                enc.set_buffer(0, Some(&inter), 0);
+                enc.set_buffer(1, Some(dst), 0);
+                enc.set_buffer(2, Some(&modes), 0);
+                enc.set_bytes(3, 4, &inter_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &dst_pitch_pixels   as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(7, 4, &logical_width as *const u32 as *const c_void);
+                enc.set_bytes(8, 4, &range_f32 as *const f32 as *const c_void);
+                let group = MTLSize::new(16, 16, 1);
+                let groups = MTLSize::new(
+                    ((width + 15) / 16) as u64,
+                    ((height + 15) / 16) as u64,
+                    1,
+                );
+                enc.dispatch_thread_groups(groups, group);
+                enc.end_encoding();
+            }
+
+            cb.commit();
+            // RFC §3.3.6: NO waitUntilCompleted. AE handles synchronisation.
+            // The inter / modes buffers are retained by the command buffer
+            // (Metal-rs / Objective-C ARC keeps them alive until the cb
+            // finishes); when this autoreleasepool drops they are released
+            // back to Metal's allocator.
+            Ok(())
+        })
+    }
+
     /// Sub-stage C-1 dispatch: identity passthrough. Both buffers must hold
     /// `width * height` BGRA128 (4×f32) pixels. `src_pitch_pixels` /
     /// `dst_pitch_pixels` are pitches in **pixels**, not bytes (matches
     /// MSL kernel signature; matches what AE provides via
     /// `rowbytes / 16`).
     ///
-    /// Production GPU path now uses `dispatch_preprocess`; this remains
+    /// Production GPU path now uses `dispatch_smooth_chain`; this remains
     /// available for unit tests and as a minimal-ops debugging probe.
     pub fn dispatch_passthrough(
         &self,
