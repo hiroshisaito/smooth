@@ -37,10 +37,14 @@ pub extern "C" fn smooth_core_version() -> u32 {
     //              The blend kernel currently handles only mode_flg=15 (link8_square
     //              centre); other modes pass through unchanged.
     // 0x0002_0008: dispatch_smooth_chain accepts two uint32-per-pixel priority buffer
-    //              pointers (priority_v, priority_h) for Sub-stage C-2.5b.2-prep2b.2.
+    //              pointers (priority_v, priority_h) for Sub-stage C-2.5b.2-prep2b.2a.
     //              The priority init kernel zeros them at the start of every dispatch;
     //              follow-up commits wire claim+apply kernels for line-level blends.
-    0x0002_0008
+    // 0x0002_0009: dispatch_smooth_chain takes line_weight (f32) and runs the
+    //              mode_flg=15 outside line-blend claim+apply kernels for prep2b.2b.
+    //              CPU semantics ported from link8_square_blend_outside; atomic_min
+    //              priority resolution per design memo §6 (lowest source-i_index wins).
+    0x0002_0009
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -498,6 +502,7 @@ mod metal_ffi {
         logical_width: u32,
         range_f32: f32,
         white_opt: u32,
+        line_weight: f32,
     ) -> i32 {
         if handle.is_null() { return -1; }
         let backend = &*(handle as *const gpu::metal::MetalBackend);
@@ -510,7 +515,7 @@ mod metal_ffi {
             priority_v_buf, priority_h_buf,
             src_pitch_pixels, dst_pitch_pixels,
             width, height, logical_width,
-            range_f32, white_opt,
+            range_f32, white_opt, line_weight,
         );
         if dispatch.is_err() {
             let _ = <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx);

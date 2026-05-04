@@ -447,6 +447,416 @@ kernel void smooth_combined(
 //
 // `modes` pitch is `width` (1 byte per pixel, no padding) per detect kernel
 // convention.
+// ========================================================================
+// C-2.5b.2-prep2b.2b: smooth_blend_mode15_outside_{claim,apply} kernels.
+//
+// Port of `link8_square_blend_outside` (link8.rs:390-405) per design memo
+// `docs/PHASE_2A_PREP2B_DESIGN_MEMO.md` §6 prep2b.2. CPU semantics:
+//
+//     // After centre 4-corner-avg already written by smooth_combined,
+//     // link8_square_execute issues up to 4 outside-line blend calls per
+//     // centre with mode_flg=15. Each call:
+//     //   count = count_length_two_lines(...)
+//     //   blend_line(count, in_target, out_target, ref_offset,
+//     //              step_in, step_out, ratio_invert=true, no_line_weight=t0_flg)
+//     // and `blend_line` writes ceil(count*line_weight) output pixels
+//     // along the step direction with quadratically-increasing ratios.
+//
+// GPU strategy (option (b), bit-identical via atomic claim+apply):
+//   Pass A (claim): each centre with mode_flg=15 computes its 4 active
+//                   outside calls, walks each line, and runs
+//                   atomic_fetch_min on the relevant priority buffer
+//                   (priority_h for horizontal lines, priority_v for
+//                   vertical lines) keyed by source linear index
+//                   `y * width + x` (centre's i_index).
+//   Pass B (apply): each centre re-walks the same calls; for each touched
+//                   output pixel, reads the priority value and writes the
+//                   blend only if `priority[idx] == this centre's i_index`
+//                   (= this centre is the lowest-i_index claimer).
+//
+// "Lowest i_index wins" means: in CPU scan order (row-major, ascending
+// j then i), the FIRST centre to call link8_square_blend_outside on a
+// given output pixel wins. This is one option among {first/last/none of
+// the above} — design memo §6 explicitly chose `atomic_min`. UAT will
+// surface whether the visual divergence from CPU "last writer wins" is
+// acceptable per Hiroshi's "視覚的に同等" requirement; if not, follow-up
+// commit flips to `atomic_max` (init=0).
+//
+// Helper structure: blend_line writes len_pixels = ceil(count * lw) where
+// lw = (no_line_weight ? 0.5 : line_weight). For each pixel index t in
+// [0, len_pixels), the output position is at
+//   out_target + (len_pixels-1-t) * step_out
+// and the blend ratio is computed from t / len_pixels using the CPU's
+// quadratic formula. Apply phase mirrors this exactly.
+
+// Compute the blend ratio for output pixel index t along a line of
+// total `len_pixels` pixels with effective length `len`. Mirrors the
+// inner loop of CPU `blend_line` (link8.rs:65-95 / blend.rs:62-98) for
+// step t.
+//
+// Returns `r` = the per-pixel blend ratio passed to blending_pixel_f.
+// `pre_ratio_out` is the pre-ratio for the NEXT iteration (caller passes
+// 0 for t=0; for t>0 caller passes the previous return).
+inline float blend_line_ratio(
+    int   t,
+    float len,
+    int   len_pixels_minus_1,
+    float pre_ratio,
+    bool  ratio_invert)
+{
+    // CPU: l = len - ((ceil(len)-1 - t) as f32) → len - (len_pixels-1-t)
+    const float l = len - float(len_pixels_minus_1 - t);
+    const float ratio = (l * l * 0.25f) / len;
+    const float diff  = ratio - pre_ratio;
+    return ratio_invert ? (1.0f - diff) : diff;
+}
+
+// Port of `blending_pixel_f` (blend.rs:15-45) for f32/Pixel32 = max=1.0.
+// CPU has 4 cases on (target.alpha, ref.alpha) ∈ {==max, ==0, other}.
+// Channel layout: BGRA on GPU (.x=blue, .y=green, .z=red, .w=alpha).
+inline float4 blending_pixel_f_full(float4 target, float4 ref_p, float ratio) {
+    const float r_alpha = 1.0f - ratio;
+    const float ta = target.w;
+    const float ra = ref_p.w;
+    const float out_a = ta * ratio + ra * r_alpha;
+    if (ta == 1.0f && ra == 1.0f) {
+        return float4(
+            target.x * ratio + ref_p.x * r_alpha,
+            target.y * ratio + ref_p.y * r_alpha,
+            target.z * ratio + ref_p.z * r_alpha,
+            1.0f);
+    }
+    if (ta == 0.0f) {
+        return float4(ref_p.x, ref_p.y, ref_p.z, out_a);
+    }
+    if (ra == 0.0f) {
+        return float4(target.x, target.y, target.z, out_a);
+    }
+    return float4(
+        target.x * ratio + ref_p.x * r_alpha,
+        target.y * ratio + ref_p.y * r_alpha,
+        target.z * ratio + ref_p.z * r_alpha,
+        out_a);
+}
+
+// Compute the 4-corner flg (link8_square_execute L416-420) for the
+// centre at (x, y). Returns the 4-bit flg or 0xFF if (x, y) is not a
+// mode_flg=15 centre (= early-out sentinel for the kernels below).
+//
+// The 4-corner flg encodes which diagonal neighbour is the SAME colour
+// as the centre (compare_pixel_equal). The if-blocks in the outside
+// section of link8_square_execute gate on (flg & mask) != mask.
+inline uint compute_centre_flg(
+    device const float4* src,
+    uint src_pitch,
+    uint x, uint y,
+    uint logical_width, uint height,
+    float range,
+    uint white_opt)
+{
+    if (x < 1u || x + 1u >= logical_width || y < 1u || y + 1u >= height) {
+        return 0xFFu;
+    }
+    const float4 c     = load_strip(src[y * src_pitch + x], white_opt);
+    const float4 right = load_strip(src[y * src_pitch + (x + 1u)], white_opt);
+    if (!fast_compare_pixel(c, right)) return 0xFFu;
+
+    const float4 up   = load_strip(src[(y - 1u) * src_pitch + x], white_opt);
+    const float4 down = load_strip(src[(y + 1u) * src_pitch + x], white_opt);
+    const float4 left = load_strip(src[y * src_pitch + (x - 1u)], white_opt);
+
+    uint mode_flg = 0u;
+    if (compare_pixel(c, right, range)) mode_flg |= 1u;
+    if (compare_pixel(c, up,    range)) mode_flg |= 2u;
+    if (compare_pixel(c, down,  range)) mode_flg |= 4u;
+    if (compare_pixel(c, left,  range)) mode_flg |= 8u;
+    if (mode_flg != 15u) return 0xFFu;
+
+    const float4 ul = load_strip(src[(y - 1u) * src_pitch + (x - 1u)], white_opt);
+    const float4 ur = load_strip(src[(y - 1u) * src_pitch + (x + 1u)], white_opt);
+    const float4 br = load_strip(src[(y + 1u) * src_pitch + (x + 1u)], white_opt);
+    const float4 bl = load_strip(src[(y + 1u) * src_pitch + (x - 1u)], white_opt);
+
+    uint flg = 0u;
+    if (compare_pixel_equal(c, ul, range)) flg |= 1u;
+    if (compare_pixel_equal(c, ur, range)) flg |= 2u;
+    if (compare_pixel_equal(c, br, range)) flg |= 4u;
+    if (compare_pixel_equal(c, bl, range)) flg |= 8u;
+    return flg;
+}
+
+// Tiny helper to make the dst index computation explicit (separate
+// pitches; src pitch and dst pitch may differ at row stride boundaries).
+inline uint dst_idx_for(int x, int y, uint dst_pitch) {
+    return uint(y) * dst_pitch + uint(x);
+}
+
+// Run claim or apply for a single outside line. `is_apply` = false for
+// the claim phase (atomic_min on priority buffer), true for the apply
+// phase (read priority, conditionally write blend). Caller passes the
+// CPU-side parameters of `link8_square_blend_outside`.
+//
+// `target_x/y` = in_target = out_target start pixel (CPU keeps in_target
+// and out_target identical for outside calls in link8_square_execute, see
+// L450-499 — out_target = info.out_target - 1, etc).
+// `ref_off_x/y` = ref_offset decomposed (CPU: -in_width, +1, -1, +in_width).
+// `step_x/y` = next_pixel_step_in = next_pixel_step_out (always parallel
+// for the outside calls).
+// `min/max/limit_from_here` = bounding parameters as in CPU.
+// `axis_h` = true if step is along x (use priority_h), false if along y.
+inline void process_outside_line(
+    device const float4* src,
+    device float4*       dst,
+    device atomic_uint*  priority_v,
+    device atomic_uint*  priority_h,
+    uint src_pitch,
+    uint dst_pitch,
+    uint width,
+    int  target_x, int target_y,
+    int  ref_off_x, int ref_off_y,
+    int  step_x,    int step_y,
+    int  min_bound, int max_bound, int limit_from_here,
+    float range,
+    uint  white_opt,
+    float line_weight,
+    uint  centre_index,
+    bool  axis_h,
+    bool  is_apply)
+{
+    // count_length_two_lines on the existing ported helper.
+    const CountLenResult clr = count_length_two_lines(
+        src, src_pitch,
+        target_x, target_y,
+        target_x + ref_off_x, target_y + ref_off_y,
+        step_x, step_y,
+        min_bound, max_bound, limit_from_here,
+        range, white_opt);
+    if (clr.length <= 0) return;
+
+    // CPU blend_line: len = count * (no_line_weight ? 0.5 : line_weight).
+    // no_line_weight = t0_flg (clr.t0_flg).
+    const float lw = clr.t0_flg ? 0.5f : line_weight;
+    const float len = float(clr.length) * lw;
+    const int   len_pixels = int(ceil(len));
+    if (len_pixels <= 0) return;
+    const int   last = len_pixels - 1;
+
+    device atomic_uint* priority = axis_h ? priority_h : priority_v;
+
+    // CPU: blend_target += (last) * step_in; out_target += (last) * step_out.
+    // We then walk t = 0..last writing pixels in DECREASING address order
+    // (each iter does: blend, then advance backward by step). The output
+    // pixel for iteration t is at (target + last*step) - t*step
+    //                            = target + (last - t) * step
+    // i.e. iteration 0 writes the FARTHEST pixel; iteration last writes
+    // the pixel adjacent to the centre.
+    //
+    // Per design memo §6, claim/apply both walk these pixels and:
+    //   - claim: atomic_fetch_min(&priority[idx], centre_index)
+    //   - apply: if (priority[idx] == centre_index) write blend
+    float pre_ratio = 0.0f;
+    for (int t = 0; t < len_pixels; ++t) {
+        const int offset = last - t;
+        const int px_x = target_x + offset * step_x;
+        const int px_y = target_y + offset * step_y;
+        // Bounds: writes within [0, width) × [0, height) — caller's min/max
+        // limits should already keep us inside the layer, but guard anyway
+        // to defend against rounding edges in line_weight scaling.
+        if (px_x < 0 || px_y < 0) break;
+        if (uint(px_x) >= width) break;
+
+        const uint out_idx = uint(px_y) * width + uint(px_x);
+        if (is_apply) {
+            const uint winner = atomic_load_explicit(&priority[out_idx], memory_order_relaxed);
+            if (winner == centre_index) {
+                // Recompute ratio for this pixel.
+                const float r = blend_line_ratio(t, len, last, pre_ratio, true);
+                // Read blend_target = (target + offset * step_in) and
+                // ref = blend_target + ref_offset.
+                const int bx = px_x;
+                const int by = px_y;
+                const int rx = bx + ref_off_x;
+                const int ry = by + ref_off_y;
+                const float4 a = src[uint(by) * src_pitch + uint(bx)];
+                const float4 b = src[uint(ry) * src_pitch + uint(rx)];
+                const float4 out_pixel = blending_pixel_f_full(a, b, r);
+                dst[dst_idx_for(bx, by, dst_pitch)] = out_pixel;
+            }
+            // pre_ratio update for the NEXT iteration regardless of winner —
+            // CPU's pre_ratio threading is sequential.
+            const float l = len - float(last - t);
+            pre_ratio = (l * l * 0.25f) / len;
+        } else {
+            atomic_fetch_min_explicit(&priority[out_idx], centre_index, memory_order_relaxed);
+        }
+    }
+}
+
+// Run all 4 outside conditional blocks for a centre with mode_flg=15.
+// Mirrors link8_square_execute L448-502 precisely. `flg` is the 4-corner
+// equal flg from compute_centre_flg.
+inline void run_outside_blocks(
+    device const float4* src,
+    device float4*       dst,
+    device atomic_uint*  priority_v,
+    device atomic_uint*  priority_h,
+    uint src_pitch,
+    uint dst_pitch,
+    uint width,
+    uint height,
+    uint logical_width,
+    int  cx, int cy,
+    uint flg,
+    float range,
+    uint  white_opt,
+    float line_weight,
+    uint  centre_index,
+    bool  is_apply)
+{
+    const int in_w  = int(width);
+    const int in_h  = int(height);
+
+    // Block 1: flg & 0x9 != 0x9 → horizontal line through (cx-1, cy)
+    //          step_in = -1 (leftward), bounds = (1, in_w-2, info.i)
+    if ((flg & 0x9u) != 0x9u) {
+        if ((flg & 1u) != 0u) {
+            // ref_offset = -in_width → ref pixel is at (current, current_y - 1)
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx - 1, cy, 0, -1, -1, 0,
+                1, in_w - 2, cx, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ true, is_apply);
+        } else if ((flg & 8u) != 0u) {
+            // ref_offset = +in_width → ref at (current, current_y + 1)
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx - 1, cy, 0, 1, -1, 0,
+                1, in_w - 2, cx, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ true, is_apply);
+        }
+    }
+
+    // Block 2: flg & 0x3 != 0x3 → vertical line through (cx, cy-1)
+    //          step_in = -in_width (upward), bounds = (1, in_h-2, info.j)
+    if ((flg & 0x3u) != 0x3u) {
+        if ((flg & 1u) != 0u) {
+            // ref_offset = -1 → ref at (current_x - 1, current)
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx, cy - 1, -1, 0, 0, -1,
+                1, in_h - 2, cy, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ false, is_apply);
+        } else if ((flg & 2u) != 0u) {
+            // ref_offset = +1 → ref at (current_x + 1, current)
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx, cy - 1, 1, 0, 0, -1,
+                1, in_h - 2, cy, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ false, is_apply);
+        }
+    }
+
+    // Block 3: flg & 0x6 != 0x6 → horizontal line through (cx+1, cy)
+    //          step_in = +1 (rightward)
+    if ((flg & 0x6u) != 0x6u) {
+        if ((flg & 2u) != 0u) {
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx + 1, cy, 0, -1, 1, 0,
+                1, in_w - 2, cx, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ true, is_apply);
+        } else if ((flg & 4u) != 0u) {
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx + 1, cy, 0, 1, 1, 0,
+                1, in_w - 2, cx, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ true, is_apply);
+        }
+    }
+
+    // Block 4: flg & 0xc != 0xc → vertical line through (cx, cy+1)
+    //          step_in = +in_width (downward)
+    if ((flg & 0xcu) != 0xcu) {
+        if ((flg & 4u) != 0u) {
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx, cy + 1, 1, 0, 0, 1,
+                1, in_h - 2, cy, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ false, is_apply);
+        } else if ((flg & 8u) != 0u) {
+            process_outside_line(
+                src, dst, priority_v, priority_h, src_pitch, dst_pitch, width,
+                cx, cy + 1, -1, 0, 0, 1,
+                1, in_h - 2, cy, range, white_opt, line_weight, centre_index,
+                /*axis_h*/ false, is_apply);
+        }
+    }
+}
+
+// Pass A: claim phase. Each thread = a candidate centre pixel. If it has
+// mode_flg=15, walk its 4 outside-line calls and atomic_min on each
+// touched output pixel's priority slot.
+kernel void smooth_blend_mode15_outside_claim(
+    device const float4* src           [[buffer(0)]],
+    device float4*       dst           [[buffer(1)]],   // unused in claim, kept for parity
+    device atomic_uint*  priority_v    [[buffer(2)]],
+    device atomic_uint*  priority_h    [[buffer(3)]],
+    constant uint&       src_pitch     [[buffer(4)]],
+    constant uint&       dst_pitch     [[buffer(5)]],
+    constant uint&       width         [[buffer(6)]],
+    constant uint&       height        [[buffer(7)]],
+    constant uint&       logical_width [[buffer(8)]],
+    constant float&      range         [[buffer(9)]],
+    constant uint&       white_opt     [[buffer(10)]],
+    constant float&      line_weight   [[buffer(11)]],
+    uint2                gid           [[thread_position_in_grid]])
+{
+    if (gid.x >= width || gid.y >= height) return;
+    const uint flg = compute_centre_flg(src, src_pitch, gid.x, gid.y,
+                                         logical_width, height, range, white_opt);
+    if (flg == 0xFFu) return;
+
+    const uint centre_index = gid.y * width + gid.x;
+    run_outside_blocks(
+        src, dst, priority_v, priority_h,
+        src_pitch, dst_pitch, width, height, logical_width,
+        int(gid.x), int(gid.y), flg,
+        range, white_opt, line_weight, centre_index,
+        /*is_apply*/ false);
+}
+
+// Pass B: apply phase. Each thread = candidate centre pixel. If it has
+// mode_flg=15, re-walk its 4 outside-line calls; for each touched output
+// pixel, read priority and write blend only if this centre won the claim.
+kernel void smooth_blend_mode15_outside_apply(
+    device const float4* src           [[buffer(0)]],
+    device float4*       dst           [[buffer(1)]],
+    device atomic_uint*  priority_v    [[buffer(2)]],
+    device atomic_uint*  priority_h    [[buffer(3)]],
+    constant uint&       src_pitch     [[buffer(4)]],
+    constant uint&       dst_pitch     [[buffer(5)]],
+    constant uint&       width         [[buffer(6)]],
+    constant uint&       height        [[buffer(7)]],
+    constant uint&       logical_width [[buffer(8)]],
+    constant float&      range         [[buffer(9)]],
+    constant uint&       white_opt     [[buffer(10)]],
+    constant float&      line_weight   [[buffer(11)]],
+    uint2                gid           [[thread_position_in_grid]])
+{
+    if (gid.x >= width || gid.y >= height) return;
+    const uint flg = compute_centre_flg(src, src_pitch, gid.x, gid.y,
+                                         logical_width, height, range, white_opt);
+    if (flg == 0xFFu) return;
+
+    const uint centre_index = gid.y * width + gid.x;
+    run_outside_blocks(
+        src, dst, priority_v, priority_h,
+        src_pitch, dst_pitch, width, height, logical_width,
+        int(gid.x), int(gid.y), flg,
+        range, white_opt, line_weight, centre_index,
+        /*is_apply*/ true);
+}
+
 kernel void smooth_blend(
     device const float4* src           [[buffer(0)]],  // BGRA128 post-preprocess
     device float4*       dst           [[buffer(1)]],  // BGRA128 output
