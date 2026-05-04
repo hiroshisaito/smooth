@@ -1381,35 +1381,72 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // outside line-blend kernels in prep2b.2b.
         const float line_weight = (float)(info->line_weight / 2.0 + 0.5);
 
-        // Sub-stage C-2.5b.2-prep2b.2: allocate two uint32-per-pixel
-        // priority buffers via gpu_suite->AllocateDeviceMemory and pass
-        // them to dispatch_smooth_chain. The chain dispatcher runs
-        // smooth_priority_init (zero-fill to UINT32_MAX) before the
-        // combined kernel; prep2b.3+ claim/apply kernels will consume
-        // these buffers via atomic_min for CPU-equivalent line-blend
-        // write ordering.
+        // Sub-stage C-2.5b.2-prep2b.2 (CreateGPUWorld variant): allocate
+        // two priority intermediate buffers via gpu_suite->CreateGPUWorld
+        // — the SDK-canonical pattern for compute-kernel intermediates
+        // (matches SDK_Invert_ProcAmp.cpp:858-866). The earlier
+        // AllocateDeviceMemory variant (commits fa8642c → ac408f7 →
+        // 920e80e) failed at real-device UAT with AE "smooth did not
+        // render anything" warning + FrameTask 517; root cause hypothesis:
+        // AllocateDeviceMemory's docstring lists CUDA / OpenCL / DX12
+        // allocators only (no Metal mention), and no AE SDK sample uses
+        // it — strong evidence its return value is not a Metal-bindable
+        // MTLBuffer suitable for compute kernel atomic_uint operations.
+        // CreateGPUWorld + GetGPUWorldData is the SDK-blessed path.
         //
-        // Allocation size at 4K UHD = 2 × 4 × 3840 × 2160 ≈ 66 MB; at
-        // 8000² ≈ 488 MB. gating PASS (commit fa8642c) confirmed that
-        // gpu_suite-managed priority buffers do not re-trigger the
-        // "smooth did not render anything" warning that Rust-allocated
-        // intermediates produced.
+        // Pixel format is forced to PF_PixelFormat_GPU_BGRA128 (the only
+        // GPU world format AE accepts) = 16 bytes/pixel. We use only the
+        // first uint32 of each BGRA pixel for our priority slot — the
+        // remaining 12 bytes/pixel are dead weight. Memory budget:
+        //   - 4400² = 16 × 4400² × 2 ≈ 620 MB
+        //   - 4K UHD (3840×2160) = 16 × 3840 × 2160 × 2 ≈ 253 MB
+        //   - 8000² = 16 × 8000² × 2 ≈ 2 GB
+        // 4 GB GPU + 8000² + MFR is at the edge of AE memory pressure;
+        // memory issues are ultimately user-hardware-limited per AE SDK
+        // structural constraints (no patch/stripe rendering API).
         //
-        // Allocation failure (e.g. OOM under MFR + 4K) routes through
-        // the once-fallen-always-fall fallback per RFC §4.4 採用 (i).
+        // pix_aspect_ratio + field_type pulled from input_world so the
+        // intermediate matches AE's tracking expectations.
+        PF_EffectWorld *priority_v_world = NULL;
+        PF_EffectWorld *priority_h_world = NULL;
         const A_u_long dev_idx = extraP->input->device_index;
-        const size_t   priority_bytes = (size_t)width * (size_t)height * sizeof(uint32_t);
+        PF_Err pri_err = gpu_suite->CreateGPUWorld(
+            in_data->effect_ref, dev_idx,
+            (A_long)width, (A_long)height,
+            input_world->pix_aspect_ratio,
+            in_data->field,
+            PF_PixelFormat_GPU_BGRA128,
+            /*clear_pixB*/ false,
+            &priority_v_world);
+        if (!pri_err) {
+            pri_err = gpu_suite->CreateGPUWorld(
+                in_data->effect_ref, dev_idx,
+                (A_long)width, (A_long)height,
+                input_world->pix_aspect_ratio,
+                in_data->field,
+                PF_PixelFormat_GPU_BGRA128,
+                /*clear_pixB*/ false,
+                &priority_h_world);
+        }
         void *priority_v = NULL;
         void *priority_h = NULL;
-        PF_Err pri_err = gpu_suite->AllocateDeviceMemory(
-            in_data->effect_ref, dev_idx, priority_bytes, &priority_v);
-        if (!pri_err) {
-            pri_err = gpu_suite->AllocateDeviceMemory(
-                in_data->effect_ref, dev_idx, priority_bytes, &priority_h);
+        if (!pri_err) pri_err = gpu_suite->GetGPUWorldData(in_data->effect_ref, priority_v_world, &priority_v);
+        if (!pri_err) pri_err = gpu_suite->GetGPUWorldData(in_data->effect_ref, priority_h_world, &priority_h);
+
+        // priority_pitch_pixels: row stride in BGRA128 pixels (= rowbytes
+        // / 16). The MSL kernel interprets the buffer as `device
+        // atomic_uint*` and addresses the first uint32 of each pixel as
+        // (y * priority_pitch_uints + x * 4) where priority_pitch_uints =
+        // priority_pitch_pixels * 4. Both priority_v and priority_h are
+        // allocated identically so they share the same pitch.
+        uint32_t priority_pitch_pixels = 0;
+        if (!pri_err && priority_v_world) {
+            priority_pitch_pixels = (uint32_t)(priority_v_world->rowbytes / 16);
         }
-        if (pri_err || !priority_v || !priority_h) {
-            if (priority_v) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
-            if (priority_h) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
+
+        if (pri_err || !priority_v || !priority_h || priority_pitch_pixels == 0) {
+            if (priority_v_world) gpu_suite->DisposeGPUWorld(in_data->effect_ref, priority_v_world);
+            if (priority_h_world) gpu_suite->DisposeGPUWorld(in_data->effect_ref, priority_h_world);
             gpu_passthrough_to_dst(
                 metal_handle, src_buf, dst_buf,
                 src_pitch_pixels, dst_pitch_pixels, width, height);
@@ -1422,11 +1459,12 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
                 metal_handle, src_buf, dst_buf,
                 priority_v, priority_h,
                 src_pitch_pixels, dst_pitch_pixels,
+                priority_pitch_pixels,
                 width, height, /* logical_width */ width,
                 range_f32, white_opt, line_weight);
 
-            gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
-            gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
+            gpu_suite->DisposeGPUWorld(in_data->effect_ref, priority_v_world);
+            gpu_suite->DisposeGPUWorld(in_data->effect_ref, priority_h_world);
 
             if (rc != 0) {
                 gpu_passthrough_to_dst(

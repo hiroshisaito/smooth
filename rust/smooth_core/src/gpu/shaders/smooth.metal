@@ -86,33 +86,41 @@ inline float4 blending_pixel_f(float4 target, float4 ref, float ratio) {
         out_a);
 }
 
-// C-2.5b.2-prep2b.2: smooth_priority_init kernel.
+// C-2.5b.2-prep2b.2 (CreateGPUWorld variant): smooth_priority_init.
 //
-// Zero out the two `width × height × uint32` priority buffers that the
-// follow-up claim/apply kernels will use for line-level blends. Each
-// pixel's priority slot is initialised to UINT32_MAX so atomic_min() in
-// the claim kernel reduces to "lowest source-i-index that touched this
-// pixel" without needing a separate "untouched" sentinel.
+// Zero out the two priority intermediate buffers that the follow-up
+// claim/apply kernels use for line-level blend write conflict
+// resolution. Each pixel's priority slot is initialised to UINT32_MAX
+// so atomic_min() in the claim kernel reduces to "lowest source-i-index
+// that touched this pixel" without needing a separate "untouched"
+// sentinel.
 //
-// `priority_v` tracks vertical-line claims (used by up_mode / down_mode
-// cases); `priority_h` tracks horizontal-line claims (used by link8_*
-// line cases). Both are 1 uint32 per pixel; pitch = width.
+// Priority buffers are now allocated by the C++ side via
+// gpu_suite->CreateGPUWorld with PF_PixelFormat_GPU_BGRA128 — the
+// SDK-canonical pattern for compute-kernel intermediates. We interpret
+// the underlying memory as `device uint*` and use only the FIRST
+// uint32 of each BGRA128 pixel (4 uints per pixel) — the other 3 are
+// unused. To address pixel (x, y)'s priority slot:
+//   slot_index = y * (priority_pitch_pixels * 4) + x * 4
+// where priority_pitch_pixels is the BGRA128 row stride in pixels
+// (= AE-reported rowbytes / 16). This is the row stride the C++ side
+// pulls from priority_world->rowbytes.
 //
-// Driving this from a dedicated kernel rather than buffer.fill() so the
-// init lives on the same command queue as the smooth chain → AE's
-// synchroniser sees a single command-buffer dependency edge from src to
-// dst rather than a separate fill-then-compute pair.
+// `priority_v` tracks vertical-line claims; `priority_h` tracks
+// horizontal-line claims.
 kernel void smooth_priority_init(
-    device uint*   priority_v [[buffer(0)]],
-    device uint*   priority_h [[buffer(1)]],
-    constant uint& width      [[buffer(2)]],
-    constant uint& height     [[buffer(3)]],
-    uint2          gid        [[thread_position_in_grid]])
+    device uint*   priority_v             [[buffer(0)]],
+    device uint*   priority_h             [[buffer(1)]],
+    constant uint& priority_pitch_pixels  [[buffer(2)]],
+    constant uint& width                  [[buffer(3)]],
+    constant uint& height                 [[buffer(4)]],
+    uint2          gid                    [[thread_position_in_grid]])
 {
     if (gid.x >= width || gid.y >= height) return;
-    const uint idx = gid.y * width + gid.x;
+    const uint idx = gid.y * (priority_pitch_pixels * 4u) + gid.x * 4u;
     priority_v[idx] = 0xFFFFFFFFu;
     priority_h[idx] = 0xFFFFFFFFu;
+    // Other 3 uints of this BGRA pixel slot left untouched (unused).
 }
 
 // C-1 plumbing kernel: identity copy src → dst. Kept for unit tests; the
@@ -599,6 +607,7 @@ inline void process_outside_line(
     device atomic_uint*  priority_h,
     uint src_pitch,
     uint dst_pitch,
+    uint priority_pitch_pixels,
     uint width,
     uint height,
     int  target_x, int target_y,
@@ -628,6 +637,9 @@ inline void process_outside_line(
     const int   last = len_pixels - 1;
 
     device atomic_uint* priority = axis_h ? priority_h : priority_v;
+    // BGRA128 stride: 4 uints per pixel; only the first uint per pixel
+    // is used as the priority slot.
+    const uint priority_row_uints = priority_pitch_pixels * 4u;
 
     // CPU blend_line walks t=0..last writing pixels in REVERSE order
     // along step (start = target + last*step, decrement by step each iter).
@@ -642,7 +654,9 @@ inline void process_outside_line(
         if (px_x < 0 || px_y < 0) break;
         if (uint(px_x) >= width || uint(px_y) >= height) break;
 
-        const uint out_idx = uint(px_y) * width + uint(px_x);
+        // priority_pitch_pixels is in BGRA128 pixels (4 uints each); we
+        // store the priority value in the FIRST uint of each pixel slot.
+        const uint out_idx = uint(px_y) * priority_row_uints + uint(px_x) * 4u;
         if (is_apply) {
             const uint winner = atomic_load_explicit(&priority[out_idx], memory_order_relaxed);
             if (winner == centre_index) {
@@ -677,6 +691,7 @@ inline void run_outside_blocks(
     device atomic_uint*  priority_h,
     uint src_pitch,
     uint dst_pitch,
+    uint priority_pitch_pixels,
     uint width,
     uint height,
     int  cx, int cy,
@@ -695,14 +710,14 @@ inline void run_outside_blocks(
         if ((flg & 1u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx - 1, cy, 0, -1, -1, 0,
                 1, in_w - 2, cx, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ true, is_apply);
         } else if ((flg & 8u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx - 1, cy, 0, 1, -1, 0,
                 1, in_w - 2, cx, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ true, is_apply);
@@ -714,14 +729,14 @@ inline void run_outside_blocks(
         if ((flg & 1u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx, cy - 1, -1, 0, 0, -1,
                 1, in_h - 2, cy, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ false, is_apply);
         } else if ((flg & 2u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx, cy - 1, 1, 0, 0, -1,
                 1, in_h - 2, cy, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ false, is_apply);
@@ -733,14 +748,14 @@ inline void run_outside_blocks(
         if ((flg & 2u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx + 1, cy, 0, -1, 1, 0,
                 1, in_w - 2, cx, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ true, is_apply);
         } else if ((flg & 4u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx + 1, cy, 0, 1, 1, 0,
                 1, in_w - 2, cx, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ true, is_apply);
@@ -752,14 +767,14 @@ inline void run_outside_blocks(
         if ((flg & 4u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx, cy + 1, 1, 0, 0, 1,
                 1, in_h - 2, cy, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ false, is_apply);
         } else if ((flg & 8u) != 0u) {
             process_outside_line(
                 src, dst, priority_v, priority_h, src_pitch, dst_pitch,
-                width, height,
+                priority_pitch_pixels, width, height,
                 cx, cy + 1, -1, 0, 0, 1,
                 1, in_h - 2, cy, range, white_opt, line_weight,
                 centre_index, /*axis_h*/ false, is_apply);
@@ -774,20 +789,21 @@ inline void run_outside_blocks(
 // The host loops over WxH-area tiles and encodes one dispatch per tile.
 // `gid` is local to the tile; absolute pixel coords = `gid + tile_origin`.
 kernel void smooth_blend_mode15_outside_claim(
-    device const float4* src           [[buffer(0)]],
-    device float4*       dst           [[buffer(1)]],
-    device atomic_uint*  priority_v    [[buffer(2)]],
-    device atomic_uint*  priority_h    [[buffer(3)]],
-    constant uint&       src_pitch     [[buffer(4)]],
-    constant uint&       dst_pitch     [[buffer(5)]],
-    constant uint&       width         [[buffer(6)]],
-    constant uint&       height        [[buffer(7)]],
-    constant uint&       logical_width [[buffer(8)]],
-    constant float&      range         [[buffer(9)]],
-    constant uint&       white_opt     [[buffer(10)]],
-    constant float&      line_weight   [[buffer(11)]],
-    constant uint2&      tile_origin   [[buffer(12)]],
-    uint2                gid           [[thread_position_in_grid]])
+    device const float4* src                   [[buffer(0)]],
+    device float4*       dst                   [[buffer(1)]],
+    device atomic_uint*  priority_v            [[buffer(2)]],
+    device atomic_uint*  priority_h            [[buffer(3)]],
+    constant uint&       src_pitch             [[buffer(4)]],
+    constant uint&       dst_pitch             [[buffer(5)]],
+    constant uint&       priority_pitch_pixels [[buffer(6)]],
+    constant uint&       width                 [[buffer(7)]],
+    constant uint&       height                [[buffer(8)]],
+    constant uint&       logical_width         [[buffer(9)]],
+    constant float&      range                 [[buffer(10)]],
+    constant uint&       white_opt             [[buffer(11)]],
+    constant float&      line_weight           [[buffer(12)]],
+    constant uint2&      tile_origin           [[buffer(13)]],
+    uint2                gid                   [[thread_position_in_grid]])
 {
     const uint x = gid.x + tile_origin.x;
     const uint y = gid.y + tile_origin.y;
@@ -800,7 +816,7 @@ kernel void smooth_blend_mode15_outside_claim(
     const uint centre_index = y * width + x;
     run_outside_blocks(
         src, dst, priority_v, priority_h,
-        src_pitch, dst_pitch, width, height,
+        src_pitch, dst_pitch, priority_pitch_pixels, width, height,
         int(x), int(y), flg,
         range, white_opt, line_weight, centre_index,
         /*is_apply*/ false);
@@ -809,20 +825,21 @@ kernel void smooth_blend_mode15_outside_claim(
 // Pass B: apply phase, tiled. Same per-thread structure as claim, but
 // reads priority and writes blend conditionally.
 kernel void smooth_blend_mode15_outside_apply(
-    device const float4* src           [[buffer(0)]],
-    device float4*       dst           [[buffer(1)]],
-    device atomic_uint*  priority_v    [[buffer(2)]],
-    device atomic_uint*  priority_h    [[buffer(3)]],
-    constant uint&       src_pitch     [[buffer(4)]],
-    constant uint&       dst_pitch     [[buffer(5)]],
-    constant uint&       width         [[buffer(6)]],
-    constant uint&       height        [[buffer(7)]],
-    constant uint&       logical_width [[buffer(8)]],
-    constant float&      range         [[buffer(9)]],
-    constant uint&       white_opt     [[buffer(10)]],
-    constant float&      line_weight   [[buffer(11)]],
-    constant uint2&      tile_origin   [[buffer(12)]],
-    uint2                gid           [[thread_position_in_grid]])
+    device const float4* src                   [[buffer(0)]],
+    device float4*       dst                   [[buffer(1)]],
+    device atomic_uint*  priority_v            [[buffer(2)]],
+    device atomic_uint*  priority_h            [[buffer(3)]],
+    constant uint&       src_pitch             [[buffer(4)]],
+    constant uint&       dst_pitch             [[buffer(5)]],
+    constant uint&       priority_pitch_pixels [[buffer(6)]],
+    constant uint&       width                 [[buffer(7)]],
+    constant uint&       height                [[buffer(8)]],
+    constant uint&       logical_width         [[buffer(9)]],
+    constant float&      range                 [[buffer(10)]],
+    constant uint&       white_opt             [[buffer(11)]],
+    constant float&      line_weight           [[buffer(12)]],
+    constant uint2&      tile_origin           [[buffer(13)]],
+    uint2                gid                   [[thread_position_in_grid]])
 {
     const uint x = gid.x + tile_origin.x;
     const uint y = gid.y + tile_origin.y;
@@ -835,7 +852,7 @@ kernel void smooth_blend_mode15_outside_apply(
     const uint centre_index = y * width + x;
     run_outside_blocks(
         src, dst, priority_v, priority_h,
-        src_pitch, dst_pitch, width, height,
+        src_pitch, dst_pitch, priority_pitch_pixels, width, height,
         int(x), int(y), flg,
         range, white_opt, line_weight, centre_index,
         /*is_apply*/ true);
