@@ -1377,20 +1377,22 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // smoothing<> for the 32bpc branch: slider × max(=1.0) × 4 / 100.
         const float range_f32 = (float)((info->range * 4.0) / 100.0);
 
-        // Sub-stage C-2.5b.2-prep2b.1 (gating experiment): allocate two
-        // uint32-per-pixel priority buffers via gpu_suite->AllocateDevice
-        // Memory. These will hold "lowest source-i-index that has written
-        // here" once prep2b.2+ wires the line-level blend kernels with
-        // atomic_min for CPU-equivalent write ordering. For now they are
-        // allocated and immediately freed — the experiment's question is
-        // simply: does AE accept this extra ≈ 2 × 4 × W × H byte allocation
-        // (= ≤ 66 MB at 4K, ≤ 488 MB at 8000²) without re-triggering the
-        // "smooth did not render anything" warning that c7e164a's metal-rs
-        // self-allocated intermediates produced?
+        // Sub-stage C-2.5b.2-prep2b.2: allocate two uint32-per-pixel
+        // priority buffers via gpu_suite->AllocateDeviceMemory and pass
+        // them to dispatch_smooth_chain. The chain dispatcher runs
+        // smooth_priority_init (zero-fill to UINT32_MAX) before the
+        // combined kernel; prep2b.3+ claim/apply kernels will consume
+        // these buffers via atomic_min for CPU-equivalent line-blend
+        // write ordering.
         //
-        // If this gating test PASSes (no AE warning, no FrameTask 517 on
-        // 4K MFR-stress), proceed with prep2b.2 (wire kernels). If FAIL,
-        // PHASE_2A_PREP2B_DESIGN_MEMO.md says flip to option (a) inversion.
+        // Allocation size at 4K UHD = 2 × 4 × 3840 × 2160 ≈ 66 MB; at
+        // 8000² ≈ 488 MB. gating PASS (commit fa8642c) confirmed that
+        // gpu_suite-managed priority buffers do not re-trigger the
+        // "smooth did not render anything" warning that Rust-allocated
+        // intermediates produced.
+        //
+        // Allocation failure (e.g. OOM under MFR + 4K) routes through
+        // the once-fallen-always-fall fallback per RFC §4.4 採用 (i).
         const A_u_long dev_idx = extraP->input->device_index;
         const size_t   priority_bytes = (size_t)width * (size_t)height * sizeof(uint32_t);
         void *priority_v = NULL;
@@ -1402,9 +1404,6 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
                 in_data->effect_ref, dev_idx, priority_bytes, &priority_h);
         }
         if (pri_err || !priority_v || !priority_h) {
-            // Allocation failed under memory pressure. Free what we got,
-            // passthrough fallback, mark fallen so the next PreRender
-            // routes this instance to CPU.
             if (priority_v) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
             if (priority_h) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
             gpu_passthrough_to_dst(
@@ -1415,17 +1414,13 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
                 smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
             }
         } else {
-            // C-2.5b.2-prep2a chain (mode_flg=15 only). The priority
-            // buffers are held during this call but not yet bound to any
-            // kernel — that is prep2b.2's job.
             int32_t rc = smooth_core_metal_dispatch_smooth_chain(
                 metal_handle, src_buf, dst_buf,
+                priority_v, priority_h,
                 src_pitch_pixels, dst_pitch_pixels,
                 width, height, /* logical_width */ width,
                 range_f32, white_opt);
 
-            // Free the gating-experiment buffers in the same call before
-            // we return — AE's gpu_suite expects symmetric alloc/free.
             gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
             gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
 

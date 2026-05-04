@@ -290,20 +290,24 @@ int32_t smooth_core_metal_dispatch_preprocess(
     uint32_t height,
     uint32_t white_opt);
 
-/* Dispatch the full smooth chain (Sub-stage C-2.5b.2-prep2a):
- *   preprocess(src -> internal inter buffer) ->
- *   detect(inter -> internal modes buffer)   ->
- *   blend(inter, modes -> dst)
- * in a single command buffer. The internal buffers are allocated by Rust
- * for the duration of the call and released when the command buffer
- * finishes.
+/* Dispatch the full smooth chain (Sub-stage C-2.5b.2-prep2b.2):
+ *   priority_init(priority_v, priority_h -> UINT32_MAX) ->
+ *   smooth_combined(src -> dst, mode_flg=15 only)
+ * in a single command buffer.
+ *
+ * priority_v_buf / priority_h_buf are AE-allocated MTLBuffer pointers
+ * (gpu_suite->AllocateDeviceMemory) of at least width*height*4 bytes
+ * each. They MUST be non-null. Caller frees via FreeDeviceMemory after
+ * this call returns. Currently only the priority_init pass binds them;
+ * prep2b.3+ claim/apply kernels will consume them for line-blend
+ * write-conflict resolution via atomic_min.
  *
  * The blend pass currently handles only mode_flg = 15 (link8_square centre
  * pixel averaging). All other mode_flg values fall through to identity
- * copy from the post-preprocess intermediate. Visually this means the
- * GPU path applies the white-key strip + corner-pixel averaging at
- * isolated-mode pixels but not the staircase line smoothing yet —
- * subsequent prep steps add the line-level cases.
+ * copy from src. Visually this means the GPU path applies the white-key
+ * strip + corner-pixel averaging at isolated-mode pixels but not the
+ * staircase line smoothing yet — subsequent prep steps add the line-
+ * level cases.
  *
  * range_f32 is the f32 sum-threshold (= raw slider * 4 / 100 for max=1.0,
  * matching Params::range_f32 on the C++ side).
@@ -314,6 +318,8 @@ int32_t smooth_core_metal_dispatch_smooth_chain(
     void    *handle,
     void    *src_buf,
     void    *dst_buf,
+    void    *priority_v_buf,
+    void    *priority_h_buf,
     uint32_t src_pitch_pixels,
     uint32_t dst_pitch_pixels,
     uint32_t width,

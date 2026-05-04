@@ -36,7 +36,11 @@ pub extern "C" fn smooth_core_version() -> u32 {
     //              + blend in a single command buffer) for Sub-stage C-2.5b.2-prep2a.
     //              The blend kernel currently handles only mode_flg=15 (link8_square
     //              centre); other modes pass through unchanged.
-    0x0002_0007
+    // 0x0002_0008: dispatch_smooth_chain accepts two uint32-per-pixel priority buffer
+    //              pointers (priority_v, priority_h) for Sub-stage C-2.5b.2-prep2b.2.
+    //              The priority init kernel zeros them at the start of every dispatch;
+    //              follow-up commits wire claim+apply kernels for line-level blends.
+    0x0002_0008
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -462,22 +466,31 @@ mod metal_ffi {
         0
     }
 
-    /// Run the full GPU smooth chain: preprocess (white-key strip + copy
-    /// to an internal buffer) → detect (per-pixel mode_flg byte) → blend
-    /// (mode_flg=15 centre averaging only — other modes are identity copy
-    /// from the post-preprocess buffer through). Returns 0 on success;
-    /// non-zero return is the same opaque "kernel did not make it onto
-    /// the queue" signal as the simpler dispatchers. Caller marks the
-    /// instance fallen on non-zero per RFC §4.4 採用 (i).
+    /// Run the full GPU smooth chain: priority_init (zero-fill the two
+    /// AE-allocated priority buffers to UINT32_MAX) → smooth_combined
+    /// (preprocess + detect + blend per pixel; mode_flg=15 centre
+    /// averaging only — other modes are identity copy through). Returns
+    /// 0 on success; non-zero return is the same opaque "kernel did not
+    /// make it onto the queue" signal as the simpler dispatchers. Caller
+    /// marks the instance fallen on non-zero per RFC §4.4 採用 (i).
+    ///
+    /// `priority_v_buf` / `priority_h_buf` are AE-allocated MTLBuffers
+    /// (gpu_suite->AllocateDeviceMemory) of at least `width*height*4`
+    /// bytes each. They MUST be non-null. The caller frees them via
+    /// gpu_suite->FreeDeviceMemory after this call returns. They are
+    /// initialised by the priority_init kernel here; prep2b.3+ kernels
+    /// will consume them for line-blend write-conflict resolution.
     ///
     /// SAFETY: same as dispatch_passthrough — `handle` is a live
-    /// MetalBackend, src/dst are MTLBuffer pointers from AE's GPU suite,
-    /// pitches are in pixels (= rowbytes/16 for BGRA128).
+    /// MetalBackend, src/dst/priority_* are MTLBuffer pointers from AE's
+    /// GPU suite, pitches are in pixels (= rowbytes/16 for BGRA128).
     #[no_mangle]
     pub unsafe extern "C" fn smooth_core_metal_dispatch_smooth_chain(
         handle: *mut c_void,
         src_buf: *mut c_void,
         dst_buf: *mut c_void,
+        priority_v_buf: *mut c_void,
+        priority_h_buf: *mut c_void,
         src_pitch_pixels: u32,
         dst_pitch_pixels: u32,
         width: u32,
@@ -494,6 +507,7 @@ mod metal_ffi {
         };
         let dispatch = backend.dispatch_smooth_chain(
             &mut ctx, src_buf, dst_buf,
+            priority_v_buf, priority_h_buf,
             src_pitch_pixels, dst_pitch_pixels,
             width, height, logical_width,
             range_f32, white_opt,

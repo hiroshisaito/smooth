@@ -64,6 +64,13 @@ pub struct MetalBackend {
     /// were observed to occasionally trip AE's "smooth did not render
     /// anything" warning under MFR + 4K + memory pressure.
     pipeline_combined: ComputePipelineState,
+    /// Sub-stage C-2.5b.2-prep2b.2: priority-buffer init kernel that
+    /// fills the two `width × height × uint32` AE-allocated priority
+    /// buffers with UINT32_MAX. Required before the line-blend kernels
+    /// (claim/apply, landing in prep2b.3+) so atomic_min reduces to
+    /// "lowest source-i-index that touched this pixel" without a
+    /// separate "untouched" sentinel.
+    pipeline_priority_init: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -98,11 +105,12 @@ impl MetalBackend {
             let library: Library = device
                 .new_library_with_source(SMOOTH_MSL, &metal::CompileOptions::new())
                 .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
-            let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
-            let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
-            let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
-            let pipeline_blend       = build_pipeline(&device, &library, "smooth_blend")?;
-            let pipeline_combined    = build_pipeline(&device, &library, "smooth_combined")?;
+            let pipeline_passthrough    = build_pipeline(&device, &library, "smooth_passthrough")?;
+            let pipeline_preprocess     = build_pipeline(&device, &library, "smooth_preprocess")?;
+            let pipeline_detect         = build_pipeline(&device, &library, "smooth_detect")?;
+            let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
+            let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
+            let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
 
             Ok(MetalBackend {
                 device,
@@ -112,6 +120,7 @@ impl MetalBackend {
                 pipeline_detect,
                 pipeline_blend,
                 pipeline_combined,
+                pipeline_priority_init,
             })
         })
     }
@@ -126,11 +135,12 @@ impl MetalBackend {
             let library = device
                 .new_library_with_source(SMOOTH_MSL, &metal::CompileOptions::new())
                 .map_err(|e| GpuError::DeviceSetup(format!("MSL compile: {e}")))?;
-            let pipeline_passthrough = build_pipeline(&device, &library, "smooth_passthrough")?;
-            let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
-            let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
-            let pipeline_blend       = build_pipeline(&device, &library, "smooth_blend")?;
-            let pipeline_combined    = build_pipeline(&device, &library, "smooth_combined")?;
+            let pipeline_passthrough    = build_pipeline(&device, &library, "smooth_passthrough")?;
+            let pipeline_preprocess     = build_pipeline(&device, &library, "smooth_preprocess")?;
+            let pipeline_detect         = build_pipeline(&device, &library, "smooth_detect")?;
+            let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
+            let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
+            let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
             Ok(MetalBackend {
                 device,
                 queue,
@@ -139,6 +149,7 @@ impl MetalBackend {
                 pipeline_detect,
                 pipeline_blend,
                 pipeline_combined,
+                pipeline_priority_init,
             })
         })
     }
@@ -266,23 +277,33 @@ impl MetalBackend {
         })
     }
 
-    /// Sub-stage C-2.5b.2-prep2a: smooth chain dispatcher.
-    /// preprocess(src → inter) → detect(inter → modes) → blend(inter, modes → dst)
-    /// in one command buffer. Allocates the intermediate (inter) and modes
-    /// buffers internally; both are released when this method returns.
+    /// Sub-stage C-2.5b.2-prep2b.2: smooth chain dispatcher with priority
+    /// buffers. Runs `smooth_priority_init` (zero-fill of the two
+    /// AE-allocated `width × height × uint32` priority buffers, set to
+    /// UINT32_MAX) followed by `smooth_combined` (preprocess+detect+blend
+    /// for mode_flg=15). All passes go on a single command buffer; the
+    /// init pass is encoded before the combined pass so Metal pipelines
+    /// the dependency chain.
     ///
-    /// The blend pass currently handles only mode_flg = 15 (link8_square
-    /// centre pixel). Pixels for which detect produced any other mode_flg
-    /// fall through to identity copy from `inter`. Visually this means a
-    /// 32bpc render with the GPU path engaged shows the white-key strip
-    /// (preprocess), the corner-pixel averaging at isolated-mode pixels,
-    /// and otherwise the post-preprocess image — the staircase smoothing
-    /// itself arrives once the line-level blends from prep2b+ land.
+    /// `priority_v` / `priority_h` are AE-allocated MTLBuffers (see
+    /// gpu_suite->AllocateDeviceMemory in Effect.cpp). They MUST be
+    /// non-null and at least `width * height * 4` bytes; the caller owns
+    /// them and frees via gpu_suite->FreeDeviceMemory after the dispatch.
+    /// They are initialised here even though prep2b.2 doesn't yet bind
+    /// them to a working kernel — this lands the wiring so prep2b.3+
+    /// claim/apply kernels can drop in without further FFI changes.
+    ///
+    /// The blend pass (in pipeline_combined) currently handles only
+    /// mode_flg = 15 (link8_square centre pixel). Other mode_flg values
+    /// fall through to identity copy from src; line-level blends arrive
+    /// in prep2b.3+ as the claim/apply kernels are added.
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
         src_buf:           *mut c_void,
         dst_buf:           *mut c_void,
+        priority_v_buf:    *mut c_void,
+        priority_h_buf:    *mut c_void,
         src_pitch_pixels:  u32,
         dst_pitch_pixels:  u32,
         width:             u32,
@@ -294,23 +315,16 @@ impl MetalBackend {
         if src_buf.is_null() || dst_buf.is_null() {
             return Err(GpuError::Dispatch("null src/dst buffer".into()));
         }
+        if priority_v_buf.is_null() || priority_h_buf.is_null() {
+            return Err(GpuError::Dispatch("null priority buffer".into()));
+        }
         if width == 0 || height == 0 {
             return Err(GpuError::Dispatch("zero extent".into()));
         }
         let _ = &ctx.scratch;
 
-        // No intermediate buffers — combined kernel reads src / writes dst.
-        // Sub-stage C-2.5b.2-prep2a follow-up after first install of build
-        // 8001aca: the previous chain (preprocess → detect → blend) allocated
-        // width×height×16-byte intermediates per call, which under MFR + 4K
-        // pressure tripped AE's "smooth did not render anything" warning and
-        // FrameTask 517 errors even with cb.wait_until_completed(). Inlining
-        // the three passes into one kernel removes the allocation entirely.
-        let _ = (src_pitch_pixels, dst_pitch_pixels);  // used below
-
         autoreleasepool(|| -> Result<(), GpuError> {
             let cb: &CommandBufferRef = self.queue.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
 
             let src = unsafe {
                 std::mem::transmute::<*mut c_void, &metal::BufferRef>(src_buf)
@@ -318,17 +332,12 @@ impl MetalBackend {
             let dst = unsafe {
                 std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
             };
-
-            enc.set_compute_pipeline_state(&self.pipeline_combined);
-            enc.set_buffer(0, Some(src), 0);
-            enc.set_buffer(1, Some(dst), 0);
-            enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
-            enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
-            enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
-            enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
-            enc.set_bytes(6, 4, &logical_width as *const u32 as *const c_void);
-            enc.set_bytes(7, 4, &range_f32 as *const f32 as *const c_void);
-            enc.set_bytes(8, 4, &white_opt as *const u32 as *const c_void);
+            let pri_v = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(priority_v_buf)
+            };
+            let pri_h = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(priority_h_buf)
+            };
 
             let group = MTLSize::new(16, 16, 1);
             let groups = MTLSize::new(
@@ -336,13 +345,45 @@ impl MetalBackend {
                 ((height + 15) / 16) as u64,
                 1,
             );
-            enc.dispatch_thread_groups(groups, group);
-            enc.end_encoding();
+
+            // Pass 1: priority_init — zero-fill priority_v / priority_h to
+            // UINT32_MAX. Encoded first so the combined kernel (and future
+            // claim/apply kernels) see initialised buffers.
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipeline_priority_init);
+                enc.set_buffer(0, Some(pri_v), 0);
+                enc.set_buffer(1, Some(pri_h), 0);
+                enc.set_bytes(2, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &height as *const u32 as *const c_void);
+                enc.dispatch_thread_groups(groups, group);
+                enc.end_encoding();
+            }
+
+            // Pass 2: combined — preprocess+detect+blend per pixel.
+            // Priority buffers are not yet bound here (prep2b.3+ replaces
+            // pipeline_combined or adds claim/apply passes that consume
+            // them via atomic_min / read-back).
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipeline_combined);
+                enc.set_buffer(0, Some(src), 0);
+                enc.set_buffer(1, Some(dst), 0);
+                enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &logical_width as *const u32 as *const c_void);
+                enc.set_bytes(7, 4, &range_f32 as *const f32 as *const c_void);
+                enc.set_bytes(8, 4, &white_opt as *const u32 as *const c_void);
+                enc.dispatch_thread_groups(groups, group);
+                enc.end_encoding();
+            }
+
             cb.commit();
-            // RFC §3.3.6 contract is now achievable: no intermediates that
-            // AE doesn't know about → cb.commit() alone is sufficient. AE's
-            // framework synchronises the GPU world view via the standard
-            // command-buffer dependency chain.
+            // RFC §3.3.6 contract: no Rust-allocated intermediates. The
+            // priority buffers are AE-allocated (gpu_suite) and live for
+            // the whole call → AE's synchroniser sees them.
             Ok(())
         })
     }

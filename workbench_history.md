@@ -2033,3 +2033,53 @@ prep2b.1 で **2 つの uint32/pixel priority buffer 追加(AE 管理 32 MB at 4
 
 **Sub-stage E ハンドオーバ note**: prep2b.1 gating 実験は AE gpu_suite が Mac で機能することを確認しただけ。Win CUDA 側は **同 design パターンを reuse する前提だが、`PF_GPUDeviceSuite1::AllocateDeviceMemory` が Win CUDA で同等の synchroniser 視野挙動になるか** は Sub-stage E の最初の検証項目。万一 Win 側で同 issue が再発したら CUDA 専用の解決策(`cuMemAlloc` + `cuStreamSynchronize`)に切替える可能性。
 
+## Phase 2-A.3 Sub-stage C-2.5b.2-prep2b.2 foundation(2026-05-04)
+
+prep2b.1 の gating 実験 PASS を受け、option (b) の **基盤 wiring** をこの session で完成。range は意図的に絞り、claim/apply kernel 本体は次 session に分離。
+
+**この session で landing したもの**:
+
+1. **`smooth_priority_init` MSL kernel 追加**(`rust/smooth_core/src/gpu/shaders/smooth.metal`)
+   - 2 つの `width × height × uint32` priority buffer を `UINT32_MAX` で zero-fill
+   - CPU の "lowest source-i-index that touched this pixel" sentinel を atomic_min で表現するため
+   - 8 thread group sizing は他 kernel と同一(16×16 = 256 thread)
+2. **`MetalBackend::pipeline_priority_init` field 追加**(`rust/smooth_core/src/gpu/metal.rs`)
+   - `from_ae_device` / `for_test` 両 path で MSL ライブラリから build
+   - 既存 `cargo test` の MSL compile gate(`metal_for_test_compiles_msl`)で kernel symbol 存在確認 PASS
+3. **`dispatch_smooth_chain` signature 拡張**:
+   - 新規 param: `priority_v_buf: *mut c_void, priority_h_buf: *mut c_void`(AE-allocated MTLBuffer)
+   - 単一 command buffer 内で **2 pass** encoded:
+     - Pass 1: `smooth_priority_init` → priority_v / priority_h を UINT32_MAX で zero-fill
+     - Pass 2: `smooth_combined`(従前通り、mode_flg=15 のみ)
+   - priority buffer は **prep2b.2 では init 以外には bind されない**(prep2b.3+ の claim/apply kernel が consume)
+4. **FFI 拡張**(`smooth_core_metal_dispatch_smooth_chain` + `smooth_core_ffi.h`):
+   - `priority_v_buf, priority_h_buf` 引数を `dst_buf` の直後に挿入
+   - `smooth_core_version()` を `0x0002_0007 → 0x0002_0008` に bump
+   - null-check で `Dispatch("null priority buffer")` を返す追加 invariant
+5. **Effect.cpp の SmartRenderGpu 配線変更**:
+   - prep2b.1 では `priority_v / priority_h` を確保→即座に解放していたのを、`dispatch_smooth_chain` に **両方渡してから FreeDeviceMemory** に変更
+   - 失敗 path(allocation 失敗 or rc != 0)は従前通り passthrough fallback + mark fallen
+   - メモリ predict は prep2b.1 と同一(2 × 4 × W × H byte)、UAT 後の README 更新項目に変更なし
+
+**意図的に landing しなかったもの**(次 session 担当):
+- claim kernel(各 thread が自分の pixel の line を辿り、`atomic_min(priority_h[idx], i_index)` で「自分が write 担当か」を ratchet)
+- apply kernel(claim の結果を読み、自分が最低 i_index = winner の場合のみ blend を書く)
+- mode_flg=3 / 5 / 7 / 11 / 13 の line-blend MSL ports
+
+**build / test 結果**:
+- `cargo build --release`: clean(warning は既存の `from_u32` dead_code のみ)
+- `cargo test --release`: **24/24 PASS**(MSL compile gate `metal_for_test_compiles_msl` 含む → `smooth_priority_init` も Metal で build 可能を確認)
+- `xcodebuild -configuration Release`: **BUILD SUCCEEDED**(arm64 + x86_64 universal)
+- build sha: `fa8642c-dirty`(commit 前)
+- 出力 plugin: `Mac/build/Release/smooth.plugin` v1.5.0
+
+**実機テスト方針**:
+- prep2b.2 の foundation は priority_init pass だけで claim/apply は無いため、**観察可能な視覚出力差は無い**(出力 = prep2a 同等 + priority buffer が UINT32_MAX で初期化されてるだけ)
+- 実機検証で見るべきは:
+  1. AE 警告ゼロ(prep2b.1 と同じ条件)
+  2. `FrameTask threw 517` ゼロ
+  3. white-key strip + mode_flg=15 corner blend が引き続き正しく出る(視覚的に prep2b.1 と diff なし)
+- もし AE 警告 / 517 が prep2b.1 比で増える場合は、priority buffer の **kernel bind 自体** が原因(まだ atomic 操作が無いため可能性は低いが gating)
+
+**次 session 着手予定**: prep2b.3(claim/apply kernel + mode_flg=3 / 5 / 7 / 11 / 13 の line-blend port)。FFI signature は prep2b.2 で確定したので、追加変更なしに kernel 中身だけ port していける設計。
+

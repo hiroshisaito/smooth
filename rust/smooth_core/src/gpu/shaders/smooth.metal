@@ -86,6 +86,35 @@ inline float4 blending_pixel_f(float4 target, float4 ref, float ratio) {
         out_a);
 }
 
+// C-2.5b.2-prep2b.2: smooth_priority_init kernel.
+//
+// Zero out the two `width × height × uint32` priority buffers that the
+// follow-up claim/apply kernels will use for line-level blends. Each
+// pixel's priority slot is initialised to UINT32_MAX so atomic_min() in
+// the claim kernel reduces to "lowest source-i-index that touched this
+// pixel" without needing a separate "untouched" sentinel.
+//
+// `priority_v` tracks vertical-line claims (used by up_mode / down_mode
+// cases); `priority_h` tracks horizontal-line claims (used by link8_*
+// line cases). Both are 1 uint32 per pixel; pitch = width.
+//
+// Driving this from a dedicated kernel rather than buffer.fill() so the
+// init lives on the same command queue as the smooth chain → AE's
+// synchroniser sees a single command-buffer dependency edge from src to
+// dst rather than a separate fill-then-compute pair.
+kernel void smooth_priority_init(
+    device uint*   priority_v [[buffer(0)]],
+    device uint*   priority_h [[buffer(1)]],
+    constant uint& width      [[buffer(2)]],
+    constant uint& height     [[buffer(3)]],
+    uint2          gid        [[thread_position_in_grid]])
+{
+    if (gid.x >= width || gid.y >= height) return;
+    const uint idx = gid.y * width + gid.x;
+    priority_v[idx] = 0xFFFFFFFFu;
+    priority_h[idx] = 0xFFFFFFFFu;
+}
+
 // C-1 plumbing kernel: identity copy src → dst. Kept for unit tests; the
 // production GPU path uses smooth_preprocess (below) instead.
 kernel void smooth_passthrough(

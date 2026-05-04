@@ -2,11 +2,11 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.3 Sub-stage **C-2.5b.2-prep2b.1 gating 実験 PASS**(2026-05-04、build `207212a`)。option (b) = multi-pass + `gpu_suite->AllocateDeviceMemory` + atomic_min priority buffer 設計が **4400×4400 + MFR + キャッシュクリア後 19 frames** で AE 警告/FrameTask 517 ゼロ稼働を確認。design memo の stop-and-reconsider trigger は発動せず、prep2b.2 以降で line-level blend kernel の line-by-line port に進める。
+**現在地**: Phase 2-A.3 Sub-stage **C-2.5b.2-prep2b.2 foundation landing**(2026-05-04)。`smooth_priority_init` MSL kernel + `MetalBackend::pipeline_priority_init` + `dispatch_smooth_chain` への priority buffer 引数 + FFI version `0x0002_0008` + Effect.cpp 配線完了。`cargo test` 24/24 PASS、`xcodebuild` BUILD SUCCEEDED。視覚出力は prep2b.1 と diff なし(claim/apply kernel は次 session)。next: 実機回帰確認 + claim/apply port。
 
 Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-platform)は Win セッション待ちで前倒し可能。詳細は §「Win 着手前 de-risking チェックポイント」。
 
-**Last update**: 2026-05-04(C-2.5b.2-prep2a 実機 5 点 PASS、commit `084b470` で intermediate buffer 廃止 + combined kernel 化により AE 警告 / FrameTask 517 解消)。
+**Last update**: 2026-05-04(C-2.5b.2-prep2b.2 foundation landing、`smooth_priority_init` kernel + FFI 0x0002_0008、claim/apply は次 session)。
 
 ---
 
@@ -78,8 +78,9 @@ Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-
           - **学び**: AE GPU 経路では metal-rs `device.new_buffer()` ベースの intermediate は AE の synchronisation 視野外。後続 line-level blend(thread 間 write 競合あり)が必要になった時点で multi-pass が必須となるため、その時は `gpu_suite->AllocateDeviceMemory` 経由に切替える方針(ハンドオーバ note: `docs/SUB_STAGE_E_HANDOVER.md` 候補項目)
         - 🟡 **C-2.5b.2-prep2b**: line-level blend の data-parallel 実装(option (b) = multi-pass + gpu_suite-allocated priority buffer + atomic_min、`docs/PHASE_2A_PREP2B_DESIGN_MEMO.md` 参照)
           - ✅ **prep2b.1 gating 実験 PASS(2026-05-04、build `207212a` clean)**: SmartRenderGpu に 2 つの uint32-per-pixel priority buffer を `gpu_suite->AllocateDeviceMemory` で確保 → 既存 chain dispatch → 解放を追加。**4400×4400 footage(19.4M px、priority buffer 計 155 MB per call)+ MFR + 19 frames キャッシュクリア後プレビューで AE 警告ゼロ + FrameTask 517 ゼロ + GPU 負荷確認**。design memo の stop-and-reconsider trigger は発動せず、option (b) を本格採用で前進可能と確定
-          - ⬜ **prep2b.2**: `smooth_blend_mode15_outside` MSL kernel(`link8_square_blend_outside` 直訳、`count_length_two_lines` 既存 device fn 使用、`atomic_min` で write 順序を CPU 等価の "later wins" に解決)+ priority buffer 初期化 kernel + Effect.cpp で kernel 連鎖
-          - ⬜ **prep2b.3〜prep2b.7**: link8_01/02/04 → up_mode_corner → down_mode_corner → lack mode → 突起 mode3、各 ~1 sub-step で line-by-line port
+          - ✅ **prep2b.2 foundation landing(2026-05-04)**: `smooth_priority_init` MSL kernel(2 priority buffer を UINT32_MAX で zero-fill)+ `MetalBackend::pipeline_priority_init` build + `dispatch_smooth_chain` signature 拡張(priority_v / priority_h 追加)+ FFI 0x0002_0007 → 0x0002_0008 bump + Effect.cpp 配線。`cargo test` 24/24 PASS + `xcodebuild` BUILD SUCCEEDED。**claim/apply kernel は本 prep に含めず次 session に分離**(視覚 diff なし、prep2b.1 と同じ出力 + buffer initialised)
+          - ⬜ **prep2b.3**: line-blend claim kernel(各 thread が自分の line を辿り `atomic_min(priority_h[idx], i_index)` で write 担当 ratchet)+ apply kernel(winner thread のみ blend 書き込み)+ mode_flg=15 outside の port = `link8_square_blend_outside` 完全実装
+          - ⬜ **prep2b.4〜prep2b.7**: link8_01/02/04(mode_flg 7/11/13)→ up_mode_corner(mode_flg=3)→ down_mode_corner(mode_flg=5)→ lack mode + 突起 mode3 + 32bpc goldens regression
         - ⬜ **C-2.5b.2 残り**: link8_01/02/04(mode_flg 7/11/13)→ up_mode_corner(mode_flg 3)→ down_mode_corner(mode_flg 5)→ lack mode → 突起 mode3。各 ~50〜100 LOC の MSL に落ちる予定だが、up/down mode は spatial extent scan(行内可変長)があるので serial scan を避ける形に再設計が要る
     - ⬜ **C-2.5c**: regression manifest に `gpu_metal_policy` field 追加、`v1.6.0-32bpc` の goldens に対する Mac Metal output が `gpu_metal_policy` 許容内 PASS
   - ⬜ **C-3**: Mac AE 2025 実機 + `SMOOTH_FORCE_GPU_ERROR` injection で fallback テスト + MFR + GPU stress
