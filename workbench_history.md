@@ -2108,3 +2108,23 @@ prep2b.1 の gating 実験 PASS を受け、option (b) の **基盤 wiring** を
 - dependency license expression に GPL / LGPL / AGPL / MPL 系が含まれないことを確認
 - `git diff --check` PASS
 - `cargo test --manifest-path rust/smooth_core/Cargo.toml --locked --release` は sandbox 内では Metal backend test 2 件が `Metal backend: NotAvailable` で失敗。権限昇格で同一コマンドを再実行し、**24/24 PASS**。既存 warning は `MACOSX_DEPLOYMENT_TARGET=10.11` と `SmoothScalar::from_u32` dead_code のみ。
+
+## Phase 2-A.3 Sub-stage C-2.5b.2-prep2b.2 foundation 実機 UAT PASS(2026-05-04、build `fd2aa05` clean)
+
+**foundation regression テスト 5 点**(prep2b.1 と同形式、視覚 diff なし設計のため重要なのは AE 警告再発の有無 + log の `FrameTask 517` 有無 in test 3):
+
+| # | 確認 | 結果 |
+|---|------|------|
+| 1 | About `rust_core 0.1.0+fd2aa05` clean + `ffi=0x00020008` | **PASS** |
+| 2 | 8/16bpc CPU 通常動作 | **PASS** |
+| 3 | **32bpc + GPU ON + transparent ON**、キャッシュクリア後 19 frames プレビュー | **PASS**(smooth 処理なし + transparent 有効確認、クラッシュ・警告・エラーなし) |
+| 4 | GPU ON + transparent OFF = identity copy | **PASS**(ソース footage と差異なし) |
+| 5 | GPU OFF = CPU 通常 | **PASS**(8/16bit と同等の出力) |
+
+**build identity 検証経緯**(token 浪費事故 + 修正):
+- 最初の build を **commit `38aa349` を作る前の dirty work tree** で実行 → binary に `fa8642c+dirty` が焼き付く
+- UAT 発行時に期待値を `38aa349 clean` と提示 → 実 binary は `fa8642c+dirty` → install + AE 起動後に Hiroshi さんが受入拒否
+- その後 `Document third-party license notices`(HEAD `fd2aa05`)が積まれて clean 化、改めて rebuild → `strings smooth.plugin/Contents/MacOS/smooth | grep "^0\.1\.0+"` で `0.1.0+fd2aa05` 確認 → UAT 再発行 → 全 5 点 PASS
+- memory `feedback_build_version_report.md` に「UAT 発行前は ① commit → ② rebuild → ③ strings で binary embedded sha 確認 → ④ git HEAD と照合」の 4 ステップを必須化
+
+**結論**: prep2b.2 foundation は **視覚 regression ゼロ + AE 警告ゼロ + FrameTask 517 ゼロ** で受入。priority buffer 2-pass dispatch(init pass + combined pass)の wiring が AE synchroniser 視野内で健全に動作することを確認。option (b) の design memo §6 stop-and-reconsider trigger は引き続き未発動。次 session で prep2b.3(claim/apply kernel + `smooth_blend_mode15_outside` の `link8_square_blend_outside` 完全 port + atomic_min 配線)に着手可能。
