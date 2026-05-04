@@ -220,6 +220,95 @@ inline float4 load_strip(float4 p, uint white_opt) {
 }
 
 // ========================================================================
+// C-2.5b.2-prep2b foundation: count_length_two_lines port.
+//
+// Mirrors `count_length_two_lines` in link8.rs: walk two parallel
+// 1-pixel-wide rays starting at (target0_xy, target1_xy) in direction
+// (`step_x, step_y`) up to MAX_LENGTH or until either ray's
+// compare_pixel against its next neighbour fires. Returns the number of
+// steps taken (always positive) plus a flag indicating whether ray 0
+// was the one that broke. Caller's `min` / `max` / `limit_from_here`
+// gate the scan to stay within the layer extent (matches the CPU
+// helper's bounding semantics).
+//
+// Each GPU thread runs its OWN scan when its mode_flg activates a
+// link8 / up_mode / down_mode case. The scan is bounded by MAX_LENGTH
+// so divergence between threads has a predictable upper limit.
+//
+// All neighbour reads go through load_strip so the white_option is
+// applied consistently with the centre kernel — same semantics as
+// the CPU `compare_pixel` running on a post-preprocess buffer.
+//
+// Used by: smooth_combined for mode_flg ∈ {3, 5, 7, 11, 13, 15}
+// (currently only mode_flg=15 wired in; line-level cases land in
+// follow-up commits as the inversion / multi-pass design is finalised).
+
+constant int SMOOTH_MAX_LENGTH = 128;  // matches link8.rs MAX_LENGTH
+
+struct CountLenResult {
+    int  length;
+    bool t0_flg;  // true iff ray 0 broke first
+};
+
+inline CountLenResult count_length_two_lines(
+    device const float4* src,
+    uint src_pitch,
+    int  target0_x, int target0_y,
+    int  target1_x, int target1_y,
+    int  step_x,    int step_y,
+    int  min_bound, int max_bound, int limit_from_here,
+    float range,
+    uint white_opt)
+{
+    CountLenResult result;
+    result.length = 0;
+    result.t0_flg = false;
+
+    // sign(step_*): step magnitudes are always 1 in the CPU helper, the
+    // sign tells us which way length increments. We mirror that by using
+    // step_x | step_y (only one is non-zero per CPU call site) to derive
+    // the sign — a horizontal step has step_y == 0, a vertical step has
+    // step_x == 0.
+    const int axis_step = (step_x != 0) ? step_x : step_y;
+    const int len_diff  = (axis_step > 0) ?  1 : -1;
+
+    int length = 0;
+
+    // Bounded loop: SMOOTH_MAX_LENGTH iterations cap divergence between
+    // threads even if the CPU bounding logic would have allowed more.
+    for (int iter = 0; iter < SMOOTH_MAX_LENGTH; iter++) {
+        const int probe = length + limit_from_here;
+        if (!(min_bound < probe && probe < max_bound)) break;
+
+        const int abs_len = (length >= 0) ? length : -length;
+        const int t0x = target0_x + abs_len * step_x;
+        const int t0y = target0_y + abs_len * step_y;
+        const int t1x = target1_x + abs_len * step_x;
+        const int t1y = target1_y + abs_len * step_y;
+
+        length += len_diff;
+
+        // compare_pixel(t0, t0 + step) — does ray 0 hit a colour change?
+        const float4 t0_a = load_strip(src[(uint)t0y * src_pitch + (uint)t0x], white_opt);
+        const float4 t0_b = load_strip(src[(uint)(t0y + step_y) * src_pitch + (uint)(t0x + step_x)], white_opt);
+        if (compare_pixel(t0_a, t0_b, range)) {
+            result.t0_flg = true;
+            break;
+        }
+
+        // compare_pixel(t1, t1 + step) — does ray 1?
+        const float4 t1_a = load_strip(src[(uint)t1y * src_pitch + (uint)t1x], white_opt);
+        const float4 t1_b = load_strip(src[(uint)(t1y + step_y) * src_pitch + (uint)(t1x + step_x)], white_opt);
+        if (compare_pixel(t1_a, t1_b, range)) {
+            break;
+        }
+    }
+
+    result.length = (length >= 0) ? length : -length;
+    return result;
+}
+
+// ========================================================================
 // C-2.5b.2-prep2a follow-up: smooth_combined kernel.
 //
 // Replaces the three-pass preprocess/detect/blend chain with ONE kernel.
