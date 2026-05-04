@@ -209,6 +209,97 @@ kernel void smooth_detect(
     modes[out_idx] = (uchar)(mode_flg | 0x80u);
 }
 
+// White-key strip helper: read a BGRA pixel and replace it with the null
+// pixel if RGB == (1, 1, 1) and white_opt != 0. Channel layout: BGRA, so
+// .z=red, .y=green, .x=blue (matches the smooth_preprocess kernel).
+inline float4 load_strip(float4 p, uint white_opt) {
+    if (white_opt != 0u && p.z == 1.0f && p.y == 1.0f && p.x == 1.0f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    return p;
+}
+
+// ========================================================================
+// C-2.5b.2-prep2a follow-up: smooth_combined kernel.
+//
+// Replaces the three-pass preprocess/detect/blend chain with ONE kernel.
+// Each thread loads its centre + neighbours from `src`, applies the
+// white-key strip inline at every read, computes mode_flg locally, and
+// writes the smoothed pixel to its own (gid.x, gid.y) in `dst`. No
+// intermediate buffers, no inter-thread dependencies, no memory-pressure
+// allocation per call.
+//
+// Why this replaces the chain: real-device test on build 8001aca still
+// occasionally tripped AE's "smooth did not render anything" warning
+// even with cb.wait_until_completed() — the multi-pass design allocates
+// width×height×16-byte intermediates per dispatch, and under MFR + 4K
+// 32bpc that pressure (≈ 132MB × N threads) intermittently makes Metal
+// or AE's GPU world tracking unhappy. Inlining everything sidesteps the
+// problem at the cost of redundant reads (centre is loaded up to 5x for
+// mode_flg=15 case; neighbours up to 1x each). For the BGRA128 cache,
+// the redundancy is well-served by L1/L2; benchmarks pending.
+//
+// Currently handles only mode_flg=15 (link8_square centre averaging).
+// Other mode_flg values (3, 5, 7, 11, 13) fall through to identity copy
+// from src; line-level blends arrive in subsequent prep steps.
+kernel void smooth_combined(
+    device const float4* src           [[buffer(0)]],
+    device float4*       dst           [[buffer(1)]],
+    constant uint&       src_pitch     [[buffer(2)]],
+    constant uint&       dst_pitch     [[buffer(3)]],
+    constant uint&       width         [[buffer(4)]],
+    constant uint&       height        [[buffer(5)]],
+    constant uint&       logical_width [[buffer(6)]],
+    constant float&      range         [[buffer(7)]],
+    constant uint&       white_opt     [[buffer(8)]],
+    uint2                gid           [[thread_position_in_grid]])
+{
+    if (gid.x >= width || gid.y >= height) return;
+    const uint x = gid.x;
+    const uint y = gid.y;
+
+    // Centre with white strip applied.
+    const float4 c = load_strip(src[y * src_pitch + x], white_opt);
+    float4 out = c;
+
+    // Inner region only — same 1-px inset as the standalone detect kernel.
+    if (x >= 1u && x + 1u < logical_width && y >= 1u && y + 1u < height) {
+        // Right neighbour (post-strip) for the fast_compare gate.
+        const float4 right = load_strip(src[y * src_pitch + (x + 1u)], white_opt);
+        if (fast_compare_pixel(c, right)) {
+            // Build mode_flg from the four cardinal compares (post-strip).
+            const float4 up   = load_strip(src[(y - 1u) * src_pitch + x], white_opt);
+            const float4 down = load_strip(src[(y + 1u) * src_pitch + x], white_opt);
+            const float4 left = load_strip(src[y * src_pitch + (x - 1u)], white_opt);
+
+            uint mode_flg = 0u;
+            if (compare_pixel(c, right, range)) mode_flg |= (1u << 0);
+            if (compare_pixel(c, up,    range)) mode_flg |= (1u << 1);
+            if (compare_pixel(c, down,  range)) mode_flg |= (1u << 2);
+            if (compare_pixel(c, left,  range)) mode_flg |= (1u << 3);
+
+            if (mode_flg == 15u) {
+                // link8_square_execute centre: average four corner blends.
+                const float4 d_ul = load_strip(src[(y - 1u) * src_pitch + (x - 1u)], white_opt);
+                const float4 d_ur = load_strip(src[(y - 1u) * src_pitch + (x + 1u)], white_opt);
+                const float4 d_br = load_strip(src[(y + 1u) * src_pitch + (x + 1u)], white_opt);
+                const float4 d_bl = load_strip(src[(y + 1u) * src_pitch + (x - 1u)], white_opt);
+
+                const float4 t_ul = compare_pixel_equal(c, d_ul, range) ? c : blending_pixel_f(c, d_ul, 0.5f);
+                const float4 t_ur = compare_pixel_equal(c, d_ur, range) ? c : blending_pixel_f(c, d_ur, 0.5f);
+                const float4 t_br = compare_pixel_equal(c, d_br, range) ? c : blending_pixel_f(c, d_br, 0.5f);
+                const float4 t_bl = compare_pixel_equal(c, d_bl, range) ? c : blending_pixel_f(c, d_bl, 0.5f);
+
+                out = (t_ul + t_ur + t_br + t_bl) * 0.25f;
+            }
+            // mode_flg ∈ {3, 5, 7, 11, 13}: identity (= centre post-strip).
+        }
+        // fast_compare passes bypass the algorithm entirely (CPU side too).
+    }
+
+    dst[y * dst_pitch + x] = out;
+}
+
 // ========================================================================
 // C-2.5b.2-prep2a: smooth_blend kernel — partial port.
 //

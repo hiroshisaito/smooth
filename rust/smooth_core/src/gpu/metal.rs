@@ -55,7 +55,15 @@ pub struct MetalBackend {
     pipeline_detect: ComputePipelineState,
     /// Sub-stage C-2.5b.2-prep2a: blend (mode_flg=15 centre pixel only;
     /// other modes / line-level blends arrive in subsequent preps).
+    /// Kept for potential future multi-pass scenarios; the production
+    /// path now uses pipeline_combined to avoid intermediate buffers.
     pipeline_blend: ComputePipelineState,
+    /// Sub-stage C-2.5b.2-prep2a follow-up: combined kernel that does
+    /// preprocess+detect+blend per-pixel without intermediates. This is
+    /// the production path — chain-style dispatchers still exist but
+    /// were observed to occasionally trip AE's "smooth did not render
+    /// anything" warning under MFR + 4K + memory pressure.
+    pipeline_combined: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -94,6 +102,7 @@ impl MetalBackend {
             let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
             let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
             let pipeline_blend       = build_pipeline(&device, &library, "smooth_blend")?;
+            let pipeline_combined    = build_pipeline(&device, &library, "smooth_combined")?;
 
             Ok(MetalBackend {
                 device,
@@ -102,6 +111,7 @@ impl MetalBackend {
                 pipeline_preprocess,
                 pipeline_detect,
                 pipeline_blend,
+                pipeline_combined,
             })
         })
     }
@@ -120,6 +130,7 @@ impl MetalBackend {
             let pipeline_preprocess  = build_pipeline(&device, &library, "smooth_preprocess")?;
             let pipeline_detect      = build_pipeline(&device, &library, "smooth_detect")?;
             let pipeline_blend       = build_pipeline(&device, &library, "smooth_blend")?;
+            let pipeline_combined    = build_pipeline(&device, &library, "smooth_combined")?;
             Ok(MetalBackend {
                 device,
                 queue,
@@ -127,6 +138,7 @@ impl MetalBackend {
                 pipeline_preprocess,
                 pipeline_detect,
                 pipeline_blend,
+                pipeline_combined,
             })
         })
     }
@@ -287,28 +299,17 @@ impl MetalBackend {
         }
         let _ = &ctx.scratch;
 
-        // Intermediate post-preprocess buffer (private storage = GPU-only).
-        let inter_pitch_pixels = width;
-        let inter_bytes = (width as u64) * (height as u64) * 16;
-        let inter = self.device.new_buffer(
-            inter_bytes,
-            MTLResourceOptions::StorageModePrivate,
-        );
-        let modes_bytes = (width as u64) * (height as u64);
-        let modes = self.device.new_buffer(
-            modes_bytes,
-            MTLResourceOptions::StorageModePrivate,
-        );
+        // No intermediate buffers — combined kernel reads src / writes dst.
+        // Sub-stage C-2.5b.2-prep2a follow-up after first install of build
+        // 8001aca: the previous chain (preprocess → detect → blend) allocated
+        // width×height×16-byte intermediates per call, which under MFR + 4K
+        // pressure tripped AE's "smooth did not render anything" warning and
+        // FrameTask 517 errors even with cb.wait_until_completed(). Inlining
+        // the three passes into one kernel removes the allocation entirely.
+        let _ = (src_pitch_pixels, dst_pitch_pixels);  // used below
 
         autoreleasepool(|| -> Result<(), GpuError> {
             let cb: &CommandBufferRef = self.queue.new_command_buffer();
-
-            // Single compute encoder spanning all three passes — matches the
-            // SDK_Invert_ProcAmp.cpp pattern (one encoder, switch pipelines
-            // between dispatches). This is more efficient than three encoders
-            // and avoids any subtle ordering issues that can arise when AE's
-            // internal command-buffer scheduler interacts with multiple
-            // sub-encoders inside one cb.
             let enc = cb.new_compute_command_encoder();
 
             let src = unsafe {
@@ -318,67 +319,30 @@ impl MetalBackend {
                 std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
             };
 
+            enc.set_compute_pipeline_state(&self.pipeline_combined);
+            enc.set_buffer(0, Some(src), 0);
+            enc.set_buffer(1, Some(dst), 0);
+            enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
+            enc.set_bytes(6, 4, &logical_width as *const u32 as *const c_void);
+            enc.set_bytes(7, 4, &range_f32 as *const f32 as *const c_void);
+            enc.set_bytes(8, 4, &white_opt as *const u32 as *const c_void);
+
             let group = MTLSize::new(16, 16, 1);
             let groups = MTLSize::new(
                 ((width + 15) / 16) as u64,
                 ((height + 15) / 16) as u64,
                 1,
             );
-
-            // Pass 1: preprocess src → inter.
-            enc.set_compute_pipeline_state(&self.pipeline_preprocess);
-            enc.set_buffer(0, Some(src),    0);
-            enc.set_buffer(1, Some(&inter), 0);
-            enc.set_bytes(2, 4, &src_pitch_pixels    as *const u32 as *const c_void);
-            enc.set_bytes(3, 4, &inter_pitch_pixels  as *const u32 as *const c_void);
-            enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
-            enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
-            enc.set_bytes(6, 4, &white_opt as *const u32 as *const c_void);
             enc.dispatch_thread_groups(groups, group);
-
-            // Pass 2: detect inter → modes.
-            enc.set_compute_pipeline_state(&self.pipeline_detect);
-            enc.set_buffer(0, Some(&inter), 0);
-            enc.set_buffer(1, Some(&modes), 0);
-            enc.set_bytes(2, 4, &inter_pitch_pixels as *const u32 as *const c_void);
-            enc.set_bytes(3, 4, &width  as *const u32 as *const c_void);
-            enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
-            enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
-            enc.set_bytes(6, 4, &range_f32 as *const f32 as *const c_void);
-            enc.dispatch_thread_groups(groups, group);
-
-            // Pass 3: blend (inter, modes) → dst.
-            enc.set_compute_pipeline_state(&self.pipeline_blend);
-            enc.set_buffer(0, Some(&inter), 0);
-            enc.set_buffer(1, Some(dst),    0);
-            enc.set_buffer(2, Some(&modes), 0);
-            enc.set_bytes(3, 4, &inter_pitch_pixels as *const u32 as *const c_void);
-            enc.set_bytes(4, 4, &dst_pitch_pixels   as *const u32 as *const c_void);
-            enc.set_bytes(5, 4, &width  as *const u32 as *const c_void);
-            enc.set_bytes(6, 4, &height as *const u32 as *const c_void);
-            enc.set_bytes(7, 4, &logical_width as *const u32 as *const c_void);
-            enc.set_bytes(8, 4, &range_f32 as *const f32 as *const c_void);
-            enc.dispatch_thread_groups(groups, group);
-
             enc.end_encoding();
             cb.commit();
-            // Sub-stage C-2.5b.2-prep2a follow-up: wait_until_completed is
-            // here as a safety net, NOT because RFC §3.3.6 was wrong in
-            // general — for plugins that follow the SDK_Invert_ProcAmp
-            // pattern (gpu_suite->AllocateDeviceMemory for intermediates,
-            // single encoder), AE's framework synchronises commit-only.
-            // Our intermediate buffers are allocated via metal-rs's
-            // device.new_buffer() (StorageModePrivate, NOT registered with
-            // AE's gpu_suite tracker), so AE cannot see when the inter /
-            // modes buffers are still in use by a queued command buffer.
-            // Without this wait, a downstream AE thread can read `dst`
-            // before the GPU has actually written it — which surfaces as
-            // the "smooth did not render anything" warning + scattered
-            // FrameTask 517 errors observed on first install of build
-            // c7e164a (2026-05-04). Migrating intermediates to
-            // gpu_suite->AllocateDeviceMemory in a follow-up commit will
-            // let us drop this wait.
-            cb.wait_until_completed();
+            // RFC §3.3.6 contract is now achievable: no intermediates that
+            // AE doesn't know about → cb.commit() alone is sufficient. AE's
+            // framework synchronises the GPU world view via the standard
+            // command-buffer dependency chain.
             Ok(())
         })
     }
