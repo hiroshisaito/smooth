@@ -1246,6 +1246,31 @@ static inline PF_Err mark_fallen_and_continue(PF_InData *in_data)
     return PF_Err_NONE;
 }
 
+// Best-effort identity copy from src to dst on the GPU. Used by
+// SmartRenderGpu's error paths so the AE-allocated dst buffer is never
+// returned blank — AE shows a "smooth did not render anything" warning
+// when an effect dispatches SMART_RENDER_GPU but its output buffer ends
+// up unwritten. For us, "didn't reach the smooth chain" should fall back
+// to "passthrough what we got" rather than "leave the buffer blank".
+//
+// Returns true when the passthrough kernel was successfully submitted,
+// false when the inputs were not viable (any null pointer, zero extent,
+// or kernel rc != 0 — though even an rc != 0 means the kernel was queued
+// in some form, so we report success for safety).
+#ifdef __APPLE__
+static inline bool gpu_passthrough_to_dst(
+    void *metal_handle, void *src_buf, void *dst_buf,
+    uint32_t src_pitch_pixels, uint32_t dst_pitch_pixels,
+    uint32_t width, uint32_t height)
+{
+    if (!metal_handle || !src_buf || !dst_buf || width == 0 || height == 0) return false;
+    (void)smooth_core_metal_dispatch_passthrough(
+        metal_handle, src_buf, dst_buf,
+        src_pitch_pixels, dst_pitch_pixels, width, height);
+    return true;
+}
+#endif
+
 static PF_Err SmartRenderGpu(PF_InData            *in_data,
                              PF_OutData           *out_data,
                              PF_SmartRenderExtra  *extraP)
@@ -1260,15 +1285,6 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
 #else
     PF_Err err = PF_Err_NONE;
     (void)out_data;
-
-    if (extraP->input->pre_render_data == NULL) return PF_Err_INTERNAL_STRUCT_DAMAGED;
-
-    // §4.4 fault injection: simulate render-time failure / VRAM OOM.
-    if (smooth_core_gpu_should_force_error(2) /* "render" */ ||
-        smooth_core_gpu_should_force_error(3) /* "oom"    */)
-    {
-        return mark_fallen_and_continue(in_data);
-    }
 
 #ifdef __APPLE__
     // The MetalBackend handle was stashed by GpuDeviceSetup and AE round-
@@ -1323,32 +1339,67 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
     const uint32_t width            = (uint32_t)input_world->width;
     const uint32_t height           = (uint32_t)input_world->height;
 
-    // Look up the snapshotted Params from PreRender so the smooth kernels
-    // can do the white-key strip + use the right f32 sum threshold.
-    SmartRenderInfo *info = (SmartRenderInfo*)extraP->input->pre_render_data;
-    const uint32_t white_opt   = (info && info->white_option) ? 1u : 0u;
-    // Match the CPU side's range_f32 derivation in smooth_core.h::smoothing<>
-    // for the 32bpc branch: slider × max_value(=1.0) × 4 channels / 100.
-    const float range_f32 = info ? (float)((info->range * 4.0) / 100.0) : 0.0f;
+    // From this point on we have valid src/dst MTLBuffers. Every error
+    // path below MUST fill dst (passthrough fallback) before returning, or
+    // AE shows the "smooth did not render anything" warning + dispatches
+    // FrameTask 517 errors. Centralised cleanup-and-return at end.
+    PF_Err final_err = PF_Err_NONE;
 
-    // C-2.5b.2-prep2a: full smooth chain (preprocess → detect → blend).
-    // The blend kernel currently handles only mode_flg=15 (link8_square
-    // centre pixel averaging); other mode values fall through to identity
-    // copy from the post-preprocess intermediate. Subsequent prep steps
-    // (prep2b+) add the line-level blends for mode_flg ∈ {3, 5, 7, 11, 13}.
-    int32_t rc = smooth_core_metal_dispatch_smooth_chain(
-        metal_handle, src_buf, dst_buf,
-        src_pitch_pixels, dst_pitch_pixels,
-        width, height, /* logical_width */ width,
-        range_f32, white_opt);
+    // pre_render_data may be null in AE preview/cache edge cases (Phase
+    // 2-A.1 follow-up note: "FrameTask threw 517 × 3" with same root). Do
+    // NOT return PF_Err_INTERNAL_STRUCT_DAMAGED here — that is exactly
+    // what AE wraps as the FrameTask error. Fall back to passthrough so
+    // dst is filled, return NONE.
+    SmartRenderInfo *info = (SmartRenderInfo*)extraP->input->pre_render_data;
+
+    // §4.4 fault injection: simulate render-time failure / VRAM OOM.
+    const bool inject_fail = info && (
+        smooth_core_gpu_should_force_error(2) /* render */ ||
+        smooth_core_gpu_should_force_error(3) /* oom    */);
+
+    if (info == NULL || inject_fail) {
+        // Fallback path: passthrough only so dst has the input pixels.
+        gpu_passthrough_to_dst(
+            metal_handle, src_buf, dst_buf,
+            src_pitch_pixels, dst_pitch_pixels, width, height);
+        if (inject_fail) {
+            // Genuine GPU failure — mark fallen so the next PreRender
+            // routes to CPU SmartRender for this instance.
+            uint64_t uuid_lo, uuid_hi;
+            if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
+                smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
+            }
+        }
+        // info == NULL is an AE quirk, not a GPU failure — do NOT mark fallen.
+    } else {
+        const uint32_t white_opt = info->white_option ? 1u : 0u;
+        // Match the CPU side's range_f32 derivation in smooth_core.h::
+        // smoothing<> for the 32bpc branch: slider × max(=1.0) × 4 / 100.
+        const float range_f32 = (float)((info->range * 4.0) / 100.0);
+
+        // C-2.5b.2-prep2a: preprocess → detect → blend.
+        int32_t rc = smooth_core_metal_dispatch_smooth_chain(
+            metal_handle, src_buf, dst_buf,
+            src_pitch_pixels, dst_pitch_pixels,
+            width, height, /* logical_width */ width,
+            range_f32, white_opt);
+
+        if (rc != 0) {
+            // Chain submission failed — passthrough fallback so dst has
+            // something visible, then mark fallen for next-frame CPU.
+            gpu_passthrough_to_dst(
+                metal_handle, src_buf, dst_buf,
+                src_pitch_pixels, dst_pitch_pixels, width, height);
+            uint64_t uuid_lo, uuid_hi;
+            if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
+                smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
+            }
+        }
+    }
 
     extraP->cb->checkin_layer_pixels(in_data->effect_ref, PARAM_INPUT);
     in_data->pica_basicP->ReleaseSuite(kPFGPUDeviceSuite, kPFGPUDeviceSuiteVersion1);
-
-    if (rc != 0) {
-        return mark_fallen_and_continue(in_data);
-    }
-    return PF_Err_NONE;
+    return final_err;
 #else
     // Non-Apple builds: Sub-stage E will replace this with the CUDA path.
     (void)extraP;

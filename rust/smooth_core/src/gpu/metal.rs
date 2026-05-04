@@ -303,83 +303,82 @@ impl MetalBackend {
         autoreleasepool(|| -> Result<(), GpuError> {
             let cb: &CommandBufferRef = self.queue.new_command_buffer();
 
+            // Single compute encoder spanning all three passes — matches the
+            // SDK_Invert_ProcAmp.cpp pattern (one encoder, switch pipelines
+            // between dispatches). This is more efficient than three encoders
+            // and avoids any subtle ordering issues that can arise when AE's
+            // internal command-buffer scheduler interacts with multiple
+            // sub-encoders inside one cb.
+            let enc = cb.new_compute_command_encoder();
+
+            let src = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(src_buf)
+            };
+            let dst = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
+            };
+
+            let group = MTLSize::new(16, 16, 1);
+            let groups = MTLSize::new(
+                ((width + 15) / 16) as u64,
+                ((height + 15) / 16) as u64,
+                1,
+            );
+
             // Pass 1: preprocess src → inter.
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_preprocess);
-                let src = unsafe {
-                    std::mem::transmute::<*mut c_void, &metal::BufferRef>(src_buf)
-                };
-                enc.set_buffer(0, Some(src), 0);
-                enc.set_buffer(1, Some(&inter), 0);
-                enc.set_bytes(2, 4, &src_pitch_pixels    as *const u32 as *const c_void);
-                enc.set_bytes(3, 4, &inter_pitch_pixels  as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &white_opt as *const u32 as *const c_void);
-                let group = MTLSize::new(16, 16, 1);
-                let groups = MTLSize::new(
-                    ((width + 15) / 16) as u64,
-                    ((height + 15) / 16) as u64,
-                    1,
-                );
-                enc.dispatch_thread_groups(groups, group);
-                enc.end_encoding();
-            }
+            enc.set_compute_pipeline_state(&self.pipeline_preprocess);
+            enc.set_buffer(0, Some(src),    0);
+            enc.set_buffer(1, Some(&inter), 0);
+            enc.set_bytes(2, 4, &src_pitch_pixels    as *const u32 as *const c_void);
+            enc.set_bytes(3, 4, &inter_pitch_pixels  as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
+            enc.set_bytes(6, 4, &white_opt as *const u32 as *const c_void);
+            enc.dispatch_thread_groups(groups, group);
 
             // Pass 2: detect inter → modes.
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_detect);
-                enc.set_buffer(0, Some(&inter), 0);
-                enc.set_buffer(1, Some(&modes), 0);
-                enc.set_bytes(2, 4, &inter_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(3, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &range_f32 as *const f32 as *const c_void);
-                let group = MTLSize::new(16, 16, 1);
-                let groups = MTLSize::new(
-                    ((width + 15) / 16) as u64,
-                    ((height + 15) / 16) as u64,
-                    1,
-                );
-                enc.dispatch_thread_groups(groups, group);
-                enc.end_encoding();
-            }
+            enc.set_compute_pipeline_state(&self.pipeline_detect);
+            enc.set_buffer(0, Some(&inter), 0);
+            enc.set_buffer(1, Some(&modes), 0);
+            enc.set_bytes(2, 4, &inter_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(3, 4, &width  as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
+            enc.set_bytes(6, 4, &range_f32 as *const f32 as *const c_void);
+            enc.dispatch_thread_groups(groups, group);
 
             // Pass 3: blend (inter, modes) → dst.
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_blend);
-                let dst = unsafe {
-                    std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
-                };
-                enc.set_buffer(0, Some(&inter), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(&modes), 0);
-                enc.set_bytes(3, 4, &inter_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &dst_pitch_pixels   as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(8, 4, &range_f32 as *const f32 as *const c_void);
-                let group = MTLSize::new(16, 16, 1);
-                let groups = MTLSize::new(
-                    ((width + 15) / 16) as u64,
-                    ((height + 15) / 16) as u64,
-                    1,
-                );
-                enc.dispatch_thread_groups(groups, group);
-                enc.end_encoding();
-            }
+            enc.set_compute_pipeline_state(&self.pipeline_blend);
+            enc.set_buffer(0, Some(&inter), 0);
+            enc.set_buffer(1, Some(dst),    0);
+            enc.set_buffer(2, Some(&modes), 0);
+            enc.set_bytes(3, 4, &inter_pitch_pixels as *const u32 as *const c_void);
+            enc.set_bytes(4, 4, &dst_pitch_pixels   as *const u32 as *const c_void);
+            enc.set_bytes(5, 4, &width  as *const u32 as *const c_void);
+            enc.set_bytes(6, 4, &height as *const u32 as *const c_void);
+            enc.set_bytes(7, 4, &logical_width as *const u32 as *const c_void);
+            enc.set_bytes(8, 4, &range_f32 as *const f32 as *const c_void);
+            enc.dispatch_thread_groups(groups, group);
 
+            enc.end_encoding();
             cb.commit();
-            // RFC §3.3.6: NO waitUntilCompleted. AE handles synchronisation.
-            // The inter / modes buffers are retained by the command buffer
-            // (Metal-rs / Objective-C ARC keeps them alive until the cb
-            // finishes); when this autoreleasepool drops they are released
-            // back to Metal's allocator.
+            // Sub-stage C-2.5b.2-prep2a follow-up: wait_until_completed is
+            // here as a safety net, NOT because RFC §3.3.6 was wrong in
+            // general — for plugins that follow the SDK_Invert_ProcAmp
+            // pattern (gpu_suite->AllocateDeviceMemory for intermediates,
+            // single encoder), AE's framework synchronises commit-only.
+            // Our intermediate buffers are allocated via metal-rs's
+            // device.new_buffer() (StorageModePrivate, NOT registered with
+            // AE's gpu_suite tracker), so AE cannot see when the inter /
+            // modes buffers are still in use by a queued command buffer.
+            // Without this wait, a downstream AE thread can read `dst`
+            // before the GPU has actually written it — which surfaces as
+            // the "smooth did not render anything" warning + scattered
+            // FrameTask 517 errors observed on first install of build
+            // c7e164a (2026-05-04). Migrating intermediates to
+            // gpu_suite->AllocateDeviceMemory in a follow-up commit will
+            // let us drop this wait.
+            cb.wait_until_completed();
             Ok(())
         })
     }
