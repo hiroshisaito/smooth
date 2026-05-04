@@ -126,6 +126,30 @@ MSBuild から `rust/smooth_core/build-windows.bat` が呼ばれ、`+crt-static`
 
 フェーズ単位の詳細開発ログ: [`workbench_history.md`](workbench_history.md)
 
+## 32bpc + GPU 経路の GPU メモリ要件(v1.6.0 出荷予定、現在 Phase 2-A.3 進行中)
+
+32bpc コンポジションで GPU Acceleration を ON にした場合、AE は `PF_PixelFormat_GPU_BGRA128`(16 bytes/pixel)で input/output GPU world を確保します。本 plugin の Mac Metal 経路は per-call で intermediate buffer を**確保しない**(commit `084b470` 以降の単一 kernel 設計)ため、GPU メモリ追加要件は **input/output の 2 buffer × MFR 並行 thread 数** で決まります。
+
+**1 frame in flight あたり**(input + output):
+
+| 解像度 | サイズ |
+|---|---|
+| 1920 × 1080(HD) | **63 MB** |
+| 3840 × 2160(4K UHD) | **253 MB** |
+| 8000 × 8000 | **1.91 GB** |
+
+**4 GB GPU での実用ガイド**:
+
+| 解像度 | MFR=2 | MFR=5 | MFR=16(フル)|
+|---|---|---|---|
+| HD | ✅ | ✅ | ✅ |
+| 4K UHD | ✅ | 🟡(AE のキャッシュ次第)| ❌ |
+| 8000×8000 | 🟡 | ❌ | ❌ |
+
+4K MFR フル使用時は AE の `Edit > Preferences > Memory & Performance` で **Multi-Frame Rendering スレッド数を 4〜8 に制限** すれば 4 GB GPU でも動作可能です。8000×8000 など超高解像度は 16 GB+ GPU を推奨します。
+
+詳細な算出根拠と AE のキャッシュ込みの見積もりは [`workbench_history.md`](workbench_history.md) の「GPU メモリ要件算出」節を参照。
+
 ## 開発ノート
 
 - 各 Phase/Step は commit 前に [`workbench_history.md`](workbench_history.md) へ追記するルール(同ファイル冒頭に明記)

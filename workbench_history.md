@@ -1875,3 +1875,56 @@ PF_GetPixelData16 → U_ReportFailedVerification
 - libsmooth_core.a が Metal frameworks に依存するようになったので、Win build 環境でも `-lobjc` を要求しない(`#[cfg(target_os = "macos")]` で gate 済)。Win 側は CUDA framework 依存になるはずで、Sub-stage E で同様の OS 別 link flag を Win build script に追加する必要あり
 - `metal-rs` の `transmute::<*mut c_void, &MetalRef>` パターンは AE-owned MTLDevice を非所有で扱うのに有効。CUDA 側でも同様の `&CudaContextRef` wrapper を `cudarc` から借用する設計を design-freeze review で確認する
 
+---
+
+## GPU メモリ要件算出(2026-05-04、Sub-stage C-2.5b.2-prep2a 実機 PASS 後)
+
+**背景**: prep2a の chain 設計(per-call で StorageModePrivate intermediate buffer 確保)が 4K + MFR で AE 警告 + FrameTask 517 を起こし、commit `084b470` で intermediate buffer **完全廃止 + 単一 `smooth_combined` kernel** に切替。これにより plugin 側の per-call GPU メモリ追加要件が **0**(temp register のみ)になった。本記録は実機テスト中に Hiroshi さんから出た「4 GB GPU でどこまで対応できるか」への定量回答。
+
+**前提**:
+- 32bpc GPU 経路は AE が `PF_PixelFormat_GPU_BGRA128`(16 bytes/pixel)で input/output GPU world を確保
+- plugin(combined kernel)は per-call で intermediate buffer を**確保しない**(commit `084b470` 以降)
+- AE は MFR で複数 frame を同時 render(log で `Render threads used: 5` 等を確認、最大は CPU コア数まで)
+- 各 render thread が独立した input/output GPU world を保持
+
+**buffer サイズ算出**(BGRA128 = 4 channel × 4 bytes = 16 bytes/pixel):
+
+| 解像度 | 1 buffer | input + output(1 frame in flight)|
+|---|---|---|
+| 1920 × 1080(HD) | 31.6 MB | **63.3 MB** |
+| 3840 × 2160(4K UHD) | 126.6 MB | **253.1 MB** |
+| 8000 × 8000 | 976.6 MB | **1.91 GB** |
+
+**MFR 並行 thread 数 × 解像度マトリクス**:
+
+| 解像度 | 1 thread | 5 threads | 16 threads(フル MFR) |
+|---|---|---|---|
+| 1920 × 1080 | 63 MB | 316 MB | 1.01 GB |
+| 3840 × 2160 | 253 MB | **1.27 GB** | 4.05 GB |
+| 8000 × 8000 | 1.91 GB | 9.55 GB | **30.6 GB** |
+
+**AE 自身の GPU 消費**:
+- Source frame cache(MC Cache、AE の Memory & Performance 設定)
+- Comp work buffer
+- Layer cache(他 effect の中間結果)
+- MTLDevice / Metal pipeline state(数 MB、無視可)
+- 実測値は AE のキャッシュ設定次第だが、**作業中 comp の input/output buffer + キャッシュで GPU メモリの 30〜50% を AE が使う**目安
+
+**4 GB GPU 実用上限**:
+
+| 解像度 | MFR=2(省) | MFR=5(中) | MFR=16(フル) |
+|---|---|---|---|
+| 1920 × 1080 | ✅ 余裕 | ✅ 余裕 | ✅ 余裕 |
+| 3840 × 2160 | ✅(0.5 GB+AE)| 🟡(1.3 GB+AE、ギリギリ)| ❌(4 GB+AE 超)|
+| 8000 × 8000 | 🟡(2 GB+AE)| ❌(10 GB)| ❌(30 GB)|
+
+**実用ガイドライン**:
+- **HD 32bpc**: 4 GB GPU で問題なし(全 MFR モード OK)
+- **4K 32bpc**: 4 GB ではフル MFR(16 threads)厳しい。AE 設定で「Multi-Frame Rendering」スレッド数を 4〜8 に制限(`Edit > Preferences > Memory & Performance`)で動作可能
+- **8000×8000**: 4 GB では MFR=1 以外無理。プロ用 16 GB+ クラスを推奨
+- 8 GB GPU なら 4K MFR=8、16 GB なら 8000×8000 MFR=4 程度まで
+
+**Sub-stage E(Win CUDA)向けハンドオーバ note**:
+- 上記表は plugin が intermediate を確保しない前提。**Sub-stage C-2.5b.2-prep2b 以降で line-level blend が必要になり multi-pass を再導入する場合は、`gpu_suite->AllocateDeviceMemory` 経由で AE 管理 buffer を使う**(metal-rs `device.new_buffer()` 直接確保は AE synchronisation 視野外で AE 警告を招くことを実機テストで確認済、commit `c7e164a` → `8001aca` → `084b470` の系譜)
+- CUDA 側でも同じ原則(`gpu_suite->AllocateDeviceMemory` は CUDA で `cuMemAlloc` 経由)。Sub-stage E で line-level pass を実装する場合は最初から AE 管理を採用
+
