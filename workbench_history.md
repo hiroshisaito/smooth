@@ -2083,3 +2083,28 @@ prep2b.1 の gating 実験 PASS を受け、option (b) の **基盤 wiring** を
 
 **次 session 着手予定**: prep2b.3(claim/apply kernel + mode_flg=3 / 5 / 7 / 11 / 13 の line-blend port)。FFI signature は prep2b.2 で確定したので、追加変更なしに kernel 中身だけ port していける設計。
 
+## License / Release Notice Audit(2026-05-04)
+
+**目的**: `LICENSE` / `README.md` / 依存コードを確認し、現行 smooth fork を Apache-2.0 のまま配布できるか、配布時に必要な third-party notice と SDK/toolchain 除外ルールを整理する。
+
+**実施**:
+- `cargo tree --locked --target x86_64-pc-windows-msvc --edges normal,no-proc-macro` と macOS universal 両 target(`aarch64-apple-darwin` / `x86_64-apple-darwin`)で runtime Rust 依存を確認
+- `cargo metadata --locked --offline --filter-platform ...` で各 target の proc-macro / build-script 依存も確認
+- `.gitignore` から `rust/smooth_core/Cargo.lock` の ignore を外し、依存監査の再現性を確保
+- `LICENSE` に upstream LoiLo smooth の Apache-2.0 継承、third-party license compatibility summary、trademark notice を追記
+- `THIRD_PARTY_LICENSES.md` を新設し、runtime / build-time Rust crates、Unicode License v3、SDK/toolchain/test-only dependency の扱いを明文化
+- `README.md` / `win/BUILD_WINDOWS.md` / `docs/WINDOWS_BUILD_ID_INTEGRATION.md` に、配布 zip は staging directory 方式で `LICENSE` と `THIRD_PARTY_LICENSES.md` を同梱し、`references/` 配下の Adobe After Effects SDK や vendor toolchain 類は含めないルールを追記
+
+**結論**:
+- 現行 production/build Rust 依存に GPL / LGPL / AGPL / MPL 系は見当たらず、MIT / Apache-2.0 / dual license / Unicode-3.0 の permissive license 範囲
+- smooth 本体は Apache-2.0 のまま配布可能
+- 再配布時の必須運用は `LICENSE` + `THIRD_PARTY_LICENSES.md` の同梱、`Cargo.lock` の追跡、vendor SDK/toolchain の配布物除外
+
+**未実施**:
+- 既存 GitHub Release assets の再パックと SHA256 更新は未実施。既存 release note の gold SHA を壊さないため、今回の変更は新規/再作成する配布 zip のルールとして扱う。
+
+**再検証(2026-05-04 16:43 JST)**:
+- `THIRD_PARTY_LICENSES.md` の package/version/license 表と、Windows x64 + macOS arm64/x86_64 の `cargo metadata --locked --offline --filter-platform ...` から得た依存集合の差分が空であることを確認
+- dependency license expression に GPL / LGPL / AGPL / MPL 系が含まれないことを確認
+- `git diff --check` PASS
+- `cargo test --manifest-path rust/smooth_core/Cargo.toml --locked --release` は sandbox 内では Metal backend test 2 件が `Metal backend: NotAvailable` で失敗。権限昇格で同一コマンドを再実行し、**24/24 PASS**。既存 warning は `MACOSX_DEPLOYMENT_TARGET=10.11` と `SmoothScalar::from_u32` dead_code のみ。

@@ -57,8 +57,15 @@ AE 2025 を起動 → 新規合成 → エフェクト → `LoiLo > smooth`。ra
 
 ## 6. 配布 zip 作成
 
-```cmd
-powershell Compress-Archive -Path win\Release\x64\smooth.aex -DestinationPath win\release\smooth.Win.1.5.0.AE2025.x64.zip
+リポジトリ root で PowerShell を開き、配布用の一時 staging directory だけを zip 化する。`references/` 配下の Adobe After Effects SDK、展開ツール、その他 vendor SDK/toolchain 類は配布物に含めない。
+
+```powershell
+Remove-Item -Recurse -Force win\release\package -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force win\release\package | Out-Null
+Copy-Item win\Release\x64\smooth.aex win\release\package\
+Copy-Item LICENSE win\release\package\
+Copy-Item THIRD_PARTY_LICENSES.md win\release\package\
+Compress-Archive -Path win\release\package\* -DestinationPath win\release\smooth.Win.1.5.0.AE2025.x64.zip -Force
 ```
 
 ## 既知事項 / トラブルシュート

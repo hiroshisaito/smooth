@@ -147,10 +147,17 @@ git rev-parse --short HEAD
 
 ### 6. 配布 zip 更新(必要なら)
 
-```cmd
-powershell Compress-Archive -Path win\Release\x64\smooth.aex -DestinationPath win\release\smooth.Win.1.5.0.AE2025.x64.zip -Force
-certutil -hashfile win\release\smooth.Win.1.5.0.AE2025.x64.zip SHA256
-certutil -hashfile win\Release\x64\smooth.aex SHA256
+配布物は staging directory に `smooth.aex`、`LICENSE`、`THIRD_PARTY_LICENSES.md` だけを集めて zip 化する。`references/` 配下の Adobe After Effects SDK、展開ツール、その他 vendor SDK/toolchain 類は含めない。
+
+```powershell
+Remove-Item -Recurse -Force win\release\package -ErrorAction SilentlyContinue
+New-Item -ItemType Directory -Force win\release\package | Out-Null
+Copy-Item win\Release\x64\smooth.aex win\release\package\
+Copy-Item LICENSE win\release\package\
+Copy-Item THIRD_PARTY_LICENSES.md win\release\package\
+Compress-Archive -Path win\release\package\* -DestinationPath win\release\smooth.Win.1.5.0.AE2025.x64.zip -Force
+Get-FileHash win\release\smooth.Win.1.5.0.AE2025.x64.zip -Algorithm SHA256
+Get-FileHash win\Release\x64\smooth.aex -Algorithm SHA256
 ```
 
 新しい SHA256 を workbench_history.md の Phase 2-D git-state テーブルに追記(Phase 2-D クローズ時の SHA `24FEFCFA...` から更新される想定)。

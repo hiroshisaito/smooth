@@ -42,6 +42,8 @@
 | macOS (x86_64 のみ) | `smooth.Mac.1.5.1.AE2025.x86_64.zip` |
 | Windows x64 | `smooth.Win.1.5.0.AE2025.x64.zip`(中身は v1.5.1 相当、ファイル名は Phase 2-D ビルド時の命名を SHA 固定のため保持 — リリースノート参照) |
 
+新規/再作成する配布 zip にはプラグイン本体に加えて `LICENSE` と `THIRD_PARTY_LICENSES.md` を同梱します。`references/` 配下の Adobe After Effects SDK、展開ツール、その他 vendor SDK/toolchain 類は配布物に含めません。
+
 ## インストール
 
 ### macOS
@@ -73,6 +75,8 @@ AE を再起動して任意のレイヤーに `LoiLo > smooth` を適用、Effec
 
 - [Adobe After Effects SDK 25.6.61](https://developer.adobe.com/console/servicesandapis)(`references/AfterEffectsSDK_25.6_61_<mac|win>/` 配下に配置)
 - [Rust stable 1.95 以上](https://rustup.rs/)(`rust/smooth_core/rust-toolchain.toml` で固定)
+
+`references/` はローカルビルド用の配置場所です。SDK/toolchain の再配布条件は各 vendor の利用規約に従い、通常の smooth ソース配布・バイナリ配布には含めません。
 
 ### macOS
 
@@ -112,6 +116,7 @@ MSBuild から `rust/smooth_core/build-windows.bat` が呼ばれ、`+crt-static`
 ├── rust/smooth_core/              # Rust コア: preprocess + smoothing + FFI
 ├── Mac/                           # Xcode project + リリース配布物(gitignored)
 ├── win/                           # VS2022 project + リリース配布物(gitignored)
+├── THIRD_PARTY_LICENSES.md        # Rust 依存関係と SDK/toolchain の third-party notices
 ├── RELEASE_NOTES-v1.5.x.md        # 各リリースの詳細 + SHA256 ゴールド
 ├── workbench_history.md           # Phase/Step 単位の開発ログ(日本語)
 └── docs/                          # 運用ドキュメント(build-id 検証手順等)
@@ -159,6 +164,8 @@ MSBuild から `rust/smooth_core/build-windows.bat` が呼ばれ、`+crt-static`
 ## ライセンス
 
 Apache License 2.0([upstream](https://github.com/loilo-inc/smooth) から継承)。[`LICENSE`](LICENSE) 参照。
+
+Rust 依存関係は MIT / Apache-2.0 / MIT OR Apache-2.0 系の permissive license が中心で、build-time の `unicode-ident` は Unicode License v3 notice も必要です。詳細な third-party notices は [`THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md) に記載しています。
 
 ## クレジット
 
