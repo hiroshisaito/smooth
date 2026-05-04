@@ -119,3 +119,52 @@ Rationale: (i) it's the only option that achieves bit-identical CPU↔GPU output
    - **2026-05-04 split note**: prep2b.2 was implemented in 2 commits because the wiring + atomic kernel landed at different sessions. **prep2b.2a** (commit `fd2aa05`) added the priority-buffer init kernel + FFI extension + dispatcher 2-pass plumbing (no behaviour change, foundation regression UAT PASS). **prep2b.2b** is the kernel itself per the original §6 specification. After prep2b.2b lands, the pair together fulfils the original prep2b.2 deliverable; subsequent steps (prep2b.3 = link8_01/02/04, etc.) are unchanged from the §6 roadmap below.
 
 **Stop-and-reconsider trigger**: if prep2b.1 (just adding two `uint32`/pixel intermediates) re-triggers the "smooth did not render anything" warning under MFR + 4K 32bpc on real device, then the gpu_suite path is *also* memory-pressure-sensitive, and the only remaining route is option (a) inversion — at which point we accept "visually equivalent, not bit-identical", document the divergence policy, and budget 8–14 sessions instead of 5–7. Specifically: if commit-N's prep2b.1 produces the AE warning on the same 4K 32bpc test that commit `8001aca` failed and `084b470` fixed, switch tracks.
+
+---
+
+## 7. 2026-05-04: option (b) 打ち切り + Path β (option a, 改訂版) pivot
+
+prep2b.2b は 3 連続実機 FAIL で option (b) を打ち切り。外部レビュー受領後、改訂された Path β (per-output writer selection) に pivot 確定。
+
+**FAIL 系譜**:
+- commit `ac408f7` (monolithic claim/apply, AllocateDeviceMemory): AE 「smooth did not render anything」+ FrameTask 517、`3cea31b` で revert
+- commit `920e80e` (tile-dispatch claim/apply, AllocateDeviceMemory): 同症状再発、`7e4ed29` で revert
+- commit `6f3a605` (CreateGPUWorld variant): silent fail で passthrough fallback (GPU では smooth 効果なし)、`fead128` で revert
+
+prep2b.1 自体は通った(allocate + 即 free だけ kernel 未使用)が、prep2b.2b で kernel が atomic を使い始めた途端に FAIL。**§6 stop-and-reconsider trigger は 3 度発動した** と見なす。
+
+**外部レビュー(2026-05-04)で判明した盲点**:
+1. command buffer error の async 捕捉漏れ → silent fail bug
+2. tile dispatch in single command buffer は driver/AE 視点で 1 cb、watchdog reset しない
+3. atomic_min direction は CPU last-writer-wins と逆向き(動いても画ズレリスク)
+4. 「AE は multi-pass 非対応」は誤要約。SDK_Invert_ProcAmp が 2 kernel + 1 cb を実装。正確には「smooth の data-dependent atomic chain + 一時 buffer + 非同期完了の組み合わせが AE/Metal の実用 envelope 外」
+5. Path β でも bit-identical を完全諦めなくてよい — per-output writer selection で CPU row-major order を再現できる可能性
+
+詳細: memory `feedback_gpu_design_review_lessons.md` + workbench_history.md 2026-05-04 該当節
+
+**Path β v2 設計方針(per-output writer selection、bit-identical 保留)**:
+
+- **核心**: thread = 1 出力 pixel(centre ではない)。各 thread が自分を書きうる候補 centre を限定範囲で gather scan、CPU row-major 順の最終 writer を選び、その writer の blend 値を計算
+- **候補空間の刈り込み**: 半径 130 正方形全探索ではなく、**4 cardinal ray + MAX_LENGTH=128 each direction**(line blend が cardinal ray のみの性質を活用、4×128=512 candidates max per pixel)
+- **CPU 等価性**: writer key = `(cy * width + cx, block_id, line_position)` の lexicographic max が CPU 順序の最終 writer。block_id 順は inside (0) < block 1 (1) < block 2 (2) < block 3 (3) < block 4 (4) で同 centre 内の overwrite 順を再現
+- **早期打ち切り**: ray 上の centre が mode_flg=15 でなければ skip
+- **atomic / intermediate buffer なし**: 1-pass dispatch、メモリ問題ゼロ、watchdog 安全
+- **silent fail 防止**: command buffer に completed handler を追加して error を Rust→C++ に伝播
+
+**進め方(レビュワー指針)**:
+1. **対象を狭く**: まず mode_flg=15 outside だけ per-output 方式で実装(prep2b.2c 相当)
+2. **CPU writer-id map 検証**: tiny synthetic fixture で「CPU はどの centre が最後に書いたか」を出す reference を作り、GPU writer-id と比較
+3. **bit-identical 諦めは fallback**: writer-id 一致を最初の目標、画素値一致まで届かない場合のみ「視覚的同等」へ後退
+
+**新 roadmap(prep2b.2c〜)**:
+- prep2b.2c: per-output kernel for mode_flg=15 outside + writer-id map 検証 fixture
+- prep2b.3: 同パターンで mode_flg=15 inside を統合(centre 4-corner avg も per-output 視点で書く)
+- prep2b.4〜7: link8_01/02/04 → up_mode_corner → down_mode_corner → lack mode + 突起 mode3 + 32bpc goldens regression
+- session 予算: option (b) 打ち切りで失った 3 session の上に Path β v2 で +5〜8 session 想定
+
+**option (b) 復路用の未実施診断**(将来戻る判断が出た場合):
+- 診断 A: `waitUntilCompleted` + commandBuffer error logging + free/dispose を completion 後に移す build
+- 診断 B: 単純 atomic stress kernel(`count_length` 外す)だけの build
+- 診断 C: command buffer を tile/chunk 単位で分割する build
+
+3 つすべて FAIL なら option (b) を確実に打ち切れる根拠になる。今回は 3 連続 UAT FAIL の重みを優先して診断省略で pivot 採用。

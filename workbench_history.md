@@ -2177,3 +2177,66 @@ prep2b.1 の gating 実験 PASS を受け、option (b) の **基盤 wiring** を
 **Memory rule 追加**(2026-05-04):
 - `feedback_outside_advice_option.md`: 行き詰まり時は他 LLM / 人間プログラマ / WebSearch に助言を求めて良い(Hiroshi さん指示)
 
+## Phase 2-A.3 prep2b.2b 連続 FAIL + 外部レビュー + Path β pivot 確定(2026-05-04)
+
+prep2b.2b は 3 連続実機 UAT FAIL で打ち切り、Path β(per-output writer selection)に pivot 確定:
+
+**FAIL 系譜**:
+1. **commit `ac408f7` (monolithic claim/apply)**: AE 警告「smooth did not render anything」+ FrameTask 517、`3cea31b` で revert
+2. **commit `920e80e` (tile-dispatch claim/apply)**: 同症状再発、`7e4ed29` で revert
+3. **commit `6f3a605` (CreateGPUWorld variant)**: AE 警告は出ないが「GPU では smooth 効果なし」(dispatch rc 系の silent fail で passthrough fallback、log は FrameTask 517 多数)、`fead128` で revert
+
+**外部レビュー(2026-05-04 受領)で判明した私の analysis 盲点**:
+
+1. **command buffer error の async 捕捉漏れ**: Rust 側 `commit()` 直後 `Ok(())` 即返却で C++ は成功扱い。GPU timeout / fail を `mark_fallen` できない silent fail bug
+2. **tile dispatch の watchdog 効果不明**: 同一 command buffer に多数 tile を積んでも driver/AE 視点では「長い 1 command buffer」、watchdog reset されない可能性
+3. **atomic_min は CPU と逆方向**: CPU `process_row_range` は row-major last-writer-wins、現実装は first-writer-wins。動いても画ズレリスク
+4. **「AE は multi-pass 非対応」は誤要約**: SDK_Invert_ProcAmp.cpp は 2 kernel + 1 cb を実装。正確には「smooth の data-dependent atomic chain + 一時 buffer + 非同期完了の組み合わせが AE/Metal の実用 envelope 外」
+5. **Path β でも bit-identical を諦めなくてよい可能性**: per-output writer selection で「自分を書きうる候補 centre を列挙 + CPU row-major 順で最後に書く writer を選ぶ」設計なら理論的に CPU 等価
+
+**レビュワー診断 3 種(option (b) 確定打ち切り前の最終確認、未実施で打ち切り採用)**:
+- 診断 A: `waitUntilCompleted` + commandBuffer error logging + free/dispose を completion 後に移す build → timeout vs lifetime/sync 切り分け
+- 診断 B: 単純 atomic stress kernel(`count_length` 外す) → atomic 自体の AE/Metal 相性確認
+- 診断 C: command buffer を tile 単位で分割 + 各 commit → 1 cb 長時間化が原因か確認
+
+3 つすべて FAIL なら確実に option (b) 打ち切り根拠になる。今回は **3 連続 UAT FAIL の重みを優先して診断省略で pivot 採用**(Hiroshi さんと外部レビュワー双方が pivot 推奨)。option (b) に戻る判断が出る場合は将来この 3 診断から始める。
+
+## Path β v2 設計方針(per-output writer selection、bit-identical 保留)
+
+**核心アイデア**: thread = 1 出力 pixel(centre ではない)。各 thread が自分を書きうる候補 centre を限定範囲で gather scan、CPU row-major 順で最後に書くはずの winner を選び、その winner の blend 値を計算して dst[my pixel] のみ書き込み。
+
+**CPU 等価性の保ち方**:
+- 各 output pixel について「自分を書きうる候補」を列挙: 自分自身(mode_flg=15 inside) + 4 cardinal ray 上の centre(blocks 1-4 outside)
+- 各候補について実際に line が自分まで届くか、count_length_two_lines を centre 視点で再計算して検証
+- writer key = (cy * width + cx, block_id, line_position) の lexicographic order で最大値が CPU 順序の最終 writer
+- その winner の blend 値を計算して書き込む
+
+**candidate 削減**:
+- 4 cardinal ray のみ走査(MAX_LENGTH=128 each direction、4×128=512 candidates max per pixel)
+- 半径 130 正方形全探索ではなく、line blend が cardinal ray のみの性質を活用
+- 早期打ち切り: ray を辿って centre が mode_flg=15 でなければ skip
+
+**メリット**:
+- atomic 不要、intermediate buffer 不要、1-pass dispatch
+- AE 視点で SDK サンプル相当の単純パターン
+- メモリ pressure 問題ゼロ
+- watchdog 安全(per-pixel 計算量 bounded)
+- silent fail risk なし(Path β v1 で課題だった async error 捕捉も追加実装)
+
+**残るリスク**:
+- 1 pixel あたり worst-case 計算量大(候補 512 × per-candidate 検証 ~100 ops = 50K ops)
+- 19M pixel × 50K ops = 1T op ≒ Apple silicon で 100-500ms 想定
+- 実装複雑度高(prep2b.2b の 2-3 倍の MSL コード量)
+
+**進め方**(レビュワー指針):
+1. **対象を狭く**: 全 mode 一度にやらず、まず mode_flg=15 outside だけ per-output 方式で実装(prep2b.2c 相当)
+2. **CPU writer-id map 検証**: tiny synthetic fixture で「CPU はどの centre が最後に書いたか」を出す reference を作り、GPU writer-id と比較してから色比較
+3. **bit-identical 諦めは fallback**: writer-id 一致を最初の目標、画素値一致まで届かない場合のみ「視覚的同等」へ後退
+
+**修正済みドキュメント**(2026-05-04):
+- `docs/PHASE_2A_PREP2B_DESIGN_MEMO.md`: option (a) を Path β として再定義予定(本セッション後段)
+- memory `feedback_gpu_design_review_lessons.md`: GPU 設計の盲点を全部記録、今後の判断で必須参照
+
+**Memory rule 追加**(2026-05-04):
+- `feedback_gpu_design_review_lessons.md`: command buffer error の async 捕捉、tile dispatch と watchdog の関係、atomic 方向と CPU semantics、Path β 進め方
+

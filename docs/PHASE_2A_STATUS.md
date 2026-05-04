@@ -2,11 +2,15 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.3 Sub-stage **C-2.5b.2-prep2b.2a foundation 実機 UAT PASS**(2026-05-04、build `fd2aa05` clean)。design memo の prep2b.2 を 2 段に分割した前段で、foundation regression 5 点全 PASS、AE 警告ゼロ + FrameTask 517 ゼロ + 視覚 regression なしを確認。priority buffer 2-pass dispatch wiring が AE synchroniser 視野内で健全動作。next: **prep2b.2b** = design memo prep2b.2 後段 = `smooth_blend_mode15_outside` MSL kernel(`link8_square_blend_outside` 直訳 + `atomic_min` で write 順序解決)。memo §6 roadmap 通り prep2b.3 以降は link8_01/02/04 → up_mode_corner → down_mode_corner → lack mode + 32bpc goldens regression。
+**現在地**: Phase 2-A.3 Sub-stage **C-2.5b.2-prep2b.2b 連続 FAIL → option (b) 打ち切り → Path β pivot 確定**(2026-05-04、build `fead128` clean = prep2b.2a 同等の動作する状態)。
+
+prep2b.2b は 3 連続 FAIL(monolithic / tile-dispatch / CreateGPUWorld variant)で打ち切り。外部レビュー受領 + Hiroshi さん判断で Path β(per-output writer selection)へ pivot 確定。詳細は workbench_history.md 該当節 + memory `feedback_gpu_design_review_lessons.md` 参照。
+
+next: **prep2b.2c**(Path β 命名)= per-output kernel で mode_flg=15 outside の line-blend 実装。CPU row-major writer-id を再現する設計、bit-identical を最初から放棄せず writer-id 一致を最初の目標。レビュワー指針通り tiny synthetic fixture で writer-id map 検証から進める。
 
 Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-platform)は Win セッション待ちで前倒し可能。詳細は §「Win 着手前 de-risking チェックポイント」。
 
-**Last update**: 2026-05-04(C-2.5b.2-prep2b.2a foundation 実機 UAT PASS + prep2b 番号付け memo 整合化、prep2b.2b に着手予定)。
+**Last update**: 2026-05-04(prep2b.2b 3 連続 FAIL → option (b) 打ち切り → Path β pivot 確定。prep2b.2c で per-output writer selection 設計に着手予定)。
 
 ---
 
@@ -79,9 +83,9 @@ Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-
         - 🟡 **C-2.5b.2-prep2b**: line-level blend の data-parallel 実装(option (b) = multi-pass + gpu_suite-allocated priority buffer + atomic_min、`docs/PHASE_2A_PREP2B_DESIGN_MEMO.md` 参照)
           - ✅ **prep2b.1 gating 実験 PASS(2026-05-04、build `207212a` clean)**: SmartRenderGpu に 2 つの uint32-per-pixel priority buffer を `gpu_suite->AllocateDeviceMemory` で確保 → 既存 chain dispatch → 解放を追加。**4400×4400 footage(19.4M px、priority buffer 計 155 MB per call)+ MFR + 19 frames キャッシュクリア後プレビューで AE 警告ゼロ + FrameTask 517 ゼロ + GPU 負荷確認**。design memo の stop-and-reconsider trigger は発動せず、option (b) を本格採用で前進可能と確定
           - ✅ **prep2b.2a foundation landing + 実機 UAT PASS(2026-05-04、build `fd2aa05` clean)**: design memo の prep2b.2 を 2 段に分割した前段。`smooth_priority_init` MSL kernel(2 priority buffer を UINT32_MAX で zero-fill)+ `MetalBackend::pipeline_priority_init` build + `dispatch_smooth_chain` signature 拡張(priority_v / priority_h 追加)+ FFI 0x0002_0007 → 0x0002_0008 bump + Effect.cpp 配線。`cargo test` 24/24 PASS + `xcodebuild` BUILD SUCCEEDED。**foundation regression 5 点(About / 8&16bpc / 32bpc+GPU ON+transparent ON 19 frames プレビュー / GPU ON+transparent OFF / GPU OFF)全 PASS** = AE 警告ゼロ + FrameTask 517 ゼロ + 視覚 diff なし。priority buffer 2-pass dispatch wiring が AE synchroniser 視野内で健全動作することを実機確認
-          - ⬜ **prep2b.2b**: design memo prep2b.2 後段 = `smooth_blend_mode15_outside` MSL kernel = `link8_square_blend_outside`(link8.rs:390-405)直訳 + `count_length_two_lines`(既存 device fn)使用 + dst への書き込みは `atomic_min` を priority buffer に対して(キー = source linear index `y * width + x`)で行い CPU 等価の write 順序を解決。`smooth_combined` の mode_flg=15 outside ケースを置換する形で配線
-          - ⬜ **prep2b.3**: link8_01/02/04(mode_flg 7/11/13)= `link8_execute` の line-blend 部分(memo §6 の roadmap 通り)
-          - ⬜ **prep2b.4〜prep2b.7**: up_mode_corner(mode_flg=3)→ down_mode_corner(mode_flg=5)→ lack mode + 突起 mode3 + 32bpc goldens regression
+          - ❌ **prep2b.2b option (b) 打ち切り(2026-05-04)**: 3 連続 FAIL(monolithic claim/apply `ac408f7` / tile-dispatch `920e80e` / CreateGPUWorld variant `6f3a605`)で option (b) = atomic_min priority buffer 設計を打ち切り。外部レビュー(2026-05-04)で「smooth の data-dependent atomic chain は AE/Metal 実用 envelope 外」と確認。詳細 workbench_history.md + memory `feedback_gpu_design_review_lessons.md`
+          - ⬜ **prep2b.2c (Path β)**: design memo §6 stop-and-reconsider trigger 発動後の fallback = per-output writer selection。thread = output pixel、自分を書きうる候補 centre を 4 cardinal ray + MAX_LENGTH=128 範囲で gather scan、CPU row-major 順で最後に書く writer を選びその blend 値を計算。atomic 不要、intermediate buffer 不要、1-pass dispatch。最初は **mode_flg=15 outside だけを対象に試作**、tiny synthetic fixture で CPU writer-id map と GPU writer-id を比較して動作確認 → 色比較。bit-identical を最初から放棄せず、writer-id 一致を最初の目標(レビュワー指針)
+          - ⬜ **prep2b.3〜以降**: prep2b.2c が動作確認できたら同パターンで mode_flg ∈ {3, 5, 7, 11, 13} の各 case を追加、最後に 32bpc goldens regression
         - ⬜ **C-2.5b.2 残り**: link8_01/02/04(mode_flg 7/11/13)→ up_mode_corner(mode_flg 3)→ down_mode_corner(mode_flg 5)→ lack mode → 突起 mode3。各 ~50〜100 LOC の MSL に落ちる予定だが、up/down mode は spatial extent scan(行内可変長)があるので serial scan を避ける形に再設計が要る
     - ⬜ **C-2.5c**: regression manifest に `gpu_metal_policy` field 追加、`v1.6.0-32bpc` の goldens に対する Mac Metal output が `gpu_metal_policy` 許容内 PASS
   - ⬜ **C-3**: Mac AE 2025 実機 + `SMOOTH_FORCE_GPU_ERROR` injection で fallback テスト + MFR + GPU stress
