@@ -46,17 +46,7 @@ pub extern "C" fn smooth_core_version() -> u32 {
     //              reverted as 3cea31b due to GPU watchdog timeout under MFR+4K).
     //              CPU semantics ported from link8_square_blend_outside; atomic_min
     //              priority resolution per design memo §6.
-    // 0x0002_000b: dispatch_smooth_chain takes priority_pitch_pixels (BGRA128
-    //              pixel stride) for prep2b.2b CreateGPUWorld variant. The
-    //              priority intermediates are allocated by the C++ side via
-    //              gpu_suite->CreateGPUWorld (SDK-canonical, matches
-    //              SDK_Invert_ProcAmp.cpp). They are PF_PixelFormat_GPU_BGRA128
-    //              effect worlds whose memory we interpret as atomic_uint*; we
-    //              use only the first uint32 of each BGRA128 pixel.
-    //              priority_pitch_pixels = rowbytes / 16. Replaces the
-    //              AllocateDeviceMemory path which appears not to return a
-    //              Metal-bindable buffer for compute kernel atomic ops.
-    0x0002_000b
+    0x0002_000a
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -490,18 +480,12 @@ mod metal_ffi {
     /// make it onto the queue" signal as the simpler dispatchers. Caller
     /// marks the instance fallen on non-zero per RFC §4.4 採用 (i).
     ///
-    /// `priority_v_buf` / `priority_h_buf` are AE GPU-world MTLBuffers
-    /// (gpu_suite->CreateGPUWorld + GetGPUWorldData) of pixel format
-    /// PF_PixelFormat_GPU_BGRA128 (16 bytes / pixel). They MUST be
-    /// non-null. The caller disposes them via DisposeGPUWorld after this
-    /// call returns. The kernels interpret the underlying memory as
-    /// `atomic_uint*` and use only the first uint32 of each BGRA128
-    /// pixel as the priority slot (the other 3 uints are unused).
-    ///
-    /// `priority_pitch_pixels` is the row stride in BGRA128 pixels
-    /// (= AE-reported rowbytes / 16). Both priority_v and priority_h are
-    /// allocated with identical CreateGPUWorld parameters so they share
-    /// the same pitch.
+    /// `priority_v_buf` / `priority_h_buf` are AE-allocated MTLBuffers
+    /// (gpu_suite->AllocateDeviceMemory) of at least `width*height*4`
+    /// bytes each. They MUST be non-null. The caller frees them via
+    /// gpu_suite->FreeDeviceMemory after this call returns. They are
+    /// initialised by the priority_init kernel here; prep2b.3+ kernels
+    /// will consume them for line-blend write-conflict resolution.
     ///
     /// SAFETY: same as dispatch_passthrough — `handle` is a live
     /// MetalBackend, src/dst/priority_* are MTLBuffer pointers from AE's
@@ -515,7 +499,6 @@ mod metal_ffi {
         priority_h_buf: *mut c_void,
         src_pitch_pixels: u32,
         dst_pitch_pixels: u32,
-        priority_pitch_pixels: u32,
         width: u32,
         height: u32,
         logical_width: u32,
@@ -533,7 +516,6 @@ mod metal_ffi {
             &mut ctx, src_buf, dst_buf,
             priority_v_buf, priority_h_buf,
             src_pitch_pixels, dst_pitch_pixels,
-            priority_pitch_pixels,
             width, height, logical_width,
             range_f32, white_opt, line_weight,
         );

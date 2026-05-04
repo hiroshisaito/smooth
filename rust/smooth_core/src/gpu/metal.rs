@@ -352,19 +352,18 @@ impl MetalBackend {
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
-        src_buf:               *mut c_void,
-        dst_buf:               *mut c_void,
-        priority_v_buf:        *mut c_void,
-        priority_h_buf:        *mut c_void,
-        src_pitch_pixels:      u32,
-        dst_pitch_pixels:      u32,
-        priority_pitch_pixels: u32,
-        width:                 u32,
-        height:                u32,
-        logical_width:         u32,
-        range_f32:             f32,
-        white_opt:             u32,
-        line_weight:           f32,
+        src_buf:           *mut c_void,
+        dst_buf:           *mut c_void,
+        priority_v_buf:    *mut c_void,
+        priority_h_buf:    *mut c_void,
+        src_pitch_pixels:  u32,
+        dst_pitch_pixels:  u32,
+        width:             u32,
+        height:            u32,
+        logical_width:     u32,
+        range_f32:         f32,
+        white_opt:         u32,
+        line_weight:       f32,
     ) -> Result<(), GpuError> {
         if src_buf.is_null() || dst_buf.is_null() {
             return Err(GpuError::Dispatch("null src/dst buffer".into()));
@@ -408,9 +407,8 @@ impl MetalBackend {
                 enc.set_compute_pipeline_state(&self.pipeline_priority_init);
                 enc.set_buffer(0, Some(pri_v), 0);
                 enc.set_buffer(1, Some(pri_h), 0);
-                enc.set_bytes(2, 4, &priority_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(3, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(2, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &height as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(groups, group);
                 enc.end_encoding();
             }
@@ -446,20 +444,19 @@ impl MetalBackend {
             let encode_tiled_pass = |pipeline: &ComputePipelineState| {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(pipeline);
-                // Bindings 0..12 are constant across tiles; encode once.
+                // Bindings 0..11 are constant across tiles; encode once.
                 enc.set_buffer(0, Some(src), 0);
                 enc.set_buffer(1, Some(dst), 0);
                 enc.set_buffer(2, Some(pri_v), 0);
                 enc.set_buffer(3, Some(pri_h), 0);
                 enc.set_bytes(4, 4, &src_pitch_pixels as *const u32 as *const c_void);
                 enc.set_bytes(5, 4, &dst_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &priority_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(8, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(9, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(10, 4, &range_f32 as *const f32 as *const c_void);
-                enc.set_bytes(11, 4, &white_opt as *const u32 as *const c_void);
-                enc.set_bytes(12, 4, &line_weight as *const f32 as *const c_void);
+                enc.set_bytes(6, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(7, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(8, 4, &logical_width as *const u32 as *const c_void);
+                enc.set_bytes(9, 4, &range_f32 as *const f32 as *const c_void);
+                enc.set_bytes(10, 4, &white_opt as *const u32 as *const c_void);
+                enc.set_bytes(11, 4, &line_weight as *const f32 as *const c_void);
 
                 let mut tile_y: u32 = 0;
                 while tile_y < height {
@@ -468,7 +465,7 @@ impl MetalBackend {
                         let tw = (TILE_SIZE).min(width  - tile_x);
                         let th = (TILE_SIZE).min(height - tile_y);
                         let tile_origin: [u32; 2] = [tile_x, tile_y];
-                        enc.set_bytes(13, 8, tile_origin.as_ptr() as *const c_void);
+                        enc.set_bytes(12, 8, tile_origin.as_ptr() as *const c_void);
                         let tile_groups = MTLSize::new(
                             ((tw + 15) / 16) as u64,
                             ((th + 15) / 16) as u64,

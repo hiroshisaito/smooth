@@ -301,28 +301,14 @@ int32_t smooth_core_metal_dispatch_preprocess(
  * (~2s); see metal.rs for the rationale (commit ac408f7 monolithic
  * version triggered watchdog timeout at 4400² and was reverted).
  *
- * priority_v_buf / priority_h_buf are AE GPU-world MTLBuffer pointers
- * (gpu_suite->CreateGPUWorld + GetGPUWorldData) of pixel format
- * PF_PixelFormat_GPU_BGRA128. SDK-canonical pattern matching
- * SDK_Invert_ProcAmp.cpp:858-866. The earlier AllocateDeviceMemory path
- * was rejected at UAT (commit ac408f7) — its docstring lists
- * cuMemAlloc/clCreateBuffer/CreateCommittedResource only (no Metal
- * mention) and no AE SDK sample uses it; strong evidence its return
- * value is not a Metal-bindable buffer for compute kernel atomic ops.
- *
- * The kernels interpret the underlying memory as `atomic_uint*` and use
- * only the first uint32 of each BGRA128 pixel (4 uints/pixel) — the
- * other 3 are unused. Memory cost: 16 bytes/pixel × 2 buffers (vs
- * 8 bytes/pixel × 2 in the AllocateDeviceMemory variant); 4400² ≈ 620
- * MB; 4K UHD ≈ 253 MB; 8000² ≈ 2 GB. Caller disposes via
- * DisposeGPUWorld after this call returns.
- *
- * priority_pitch_pixels is the row stride in BGRA128 pixels
- * (= AE-reported rowbytes / 16). Both priority_v and priority_h are
- * created with identical CreateGPUWorld parameters so they share pitch.
+ * priority_v_buf / priority_h_buf are AE-allocated MTLBuffer pointers
+ * (gpu_suite->AllocateDeviceMemory) of at least width*height*4 bytes
+ * each. They MUST be non-null. Caller frees via FreeDeviceMemory after
+ * this call returns.
  *
  * line_weight is the per-blend line weighting used by the outside-line
- * blend kernels. CPU encodes it as `(slider_value / 2.0 + 0.5)`.
+ * blend kernels. CPU encodes it as `(slider_value / 2.0 + 0.5)` (see
+ * Effect.cpp::SmoothCore<>().run() core_params.line_weight).
  *
  * Blend coverage:
  *   - mode_flg = 15 inside: smooth_combined writes centre 4-corner avg.
@@ -345,7 +331,6 @@ int32_t smooth_core_metal_dispatch_smooth_chain(
     void    *priority_h_buf,
     uint32_t src_pitch_pixels,
     uint32_t dst_pitch_pixels,
-    uint32_t priority_pitch_pixels,
     uint32_t width,
     uint32_t height,
     uint32_t logical_width,
