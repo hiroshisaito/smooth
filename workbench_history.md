@@ -1990,3 +1990,46 @@ prep2b.1 で **2 つの uint32/pixel priority buffer 追加(AE 管理 32 MB at 4
 
 **設計 memo 全文**: `docs/PHASE_2A_PREP2B_DESIGN_MEMO.md`(commit `9f82613`、agent 分析の生成果物。以降のセッションで Sub-stage E 担当者が参照する想定)。
 
+---
+
+## Phase 2-A.3 Sub-stage C-2.5b.2-prep2b.1 gating 実験 PASS(2026-05-04、commit `207212a`)
+
+**目的**: design memo §6 の "stop-and-reconsider trigger" を 1 commit で早期判定。option (b) の核心仮説「`gpu_suite->AllocateDeviceMemory` 経由の uint32-per-pixel priority buffer は AE 警告再発を起こさない」を実機実証する gating 実験。
+
+**実装**(commit `207212a`、Effect.cpp `SmartRenderGpu` のみ変更):
+- 2 つの priority buffer(各 `width × height × sizeof(uint32_t)` byte)を `gpu_suite->AllocateDeviceMemory` で確保
+- buffer は **kernel に bind せず、即座に `FreeDeviceMemory` で解放**(prep2b.1 の役割は allocation pressure の有無確認のみ)
+- 確保失敗時は passthrough fallback + mark fallen で defensive
+- Rust 側変更なし、FFI 変更なし、kernel 変更なし → CPU regression 28/28 不変、cargo 24/24 不変
+
+**実機テスト条件**(Hiroshi さん 2026-05-04):
+- footage: 4400 × 4400 pixels(19.4 M pixels、4K UHD = 8.3 M pixels の 2.3 倍の重量級)
+- 32 bpc Comp + GPU Acceleration ON + transparent ON
+- **キャッシュクリア後 19 frames プレビュー再生**(MFR で複数 frame 並行 dispatch、cache hit 抜きの実 GPU 負荷確認)
+- per-call priority buffer 2 個 = 4400² × 4 byte × 2 ≈ **155 MB**
+- AE input/output GPU world(BGRA128)= 4400² × 16 × 2 ≈ 619 MB
+- MFR 5 thread 想定で **約 3.9 GB の GPU 圧力**
+
+**結果**: **PASS**
+- AE 警告ゼロ(commit `c7e164a` で 1 回 + commit `8001aca` でも残った "smooth did not render anything" 警告は再発せず)
+- log で `FrameTask threw 517` ゼロ
+- GPU 負荷が実際にかかっていることを確認
+- prep2a 同等の出力(white 透明化 + smooth は mode_flg=15 corner のみ、line-level blend は未実装)
+
+**結論**: design memo §6 の stop-and-reconsider trigger は **発動せず**。option (b) = multi-pass + `gpu_suite->AllocateDeviceMemory` + atomic_min priority buffer の設計を **本格採用で前進確定**。prep2b.2 以降は kernel への priority buffer bind + atomic_min 配線 + 各 line-level blend helper の line-by-line port。
+
+**この実験が示したこと**:
+- AE 自身が管理する gpu_suite buffer は AE GPU world synchroniser の視野内にあり、metal-rs `device.new_buffer()` で発生した「AE が dst 読み取り時に未書込判定」問題は起きない
+- 4400×4400 級の重量 footage + MFR でも 155 MB の追加 buffer は問題なく allocate/free 可能(4 GB GPU の budget で MFR=5 まで安全圏)
+- **commit 1 つで重要分岐判定が出せる設計**は機能した(設計 memo 通り)
+
+**次セッション以降の進路**(option (b) 確定):
+- prep2b.2: `smooth_blend_mode15_outside` MSL kernel(`link8_square_blend_outside` 直訳)+ atomic_min で write 順序解決 + Effect.cpp での kernel 連鎖配線。CPU `link8_square_execute` の完全実装
+- prep2b.3: link8_01/02/04(mode_flg 7/11/13)= `link8_execute` の line-blend 部分
+- prep2b.4: up_mode_corner(mode_flg=3)
+- prep2b.5: down_mode_corner(mode_flg=5)
+- prep2b.6: lack_mode + 突起 mode3
+- prep2b.7: 32bpc goldens regression で CPU と bit-identical 確認(`gpu_metal_policy = identical` を狙う)
+
+**Sub-stage E ハンドオーバ note**: prep2b.1 gating 実験は AE gpu_suite が Mac で機能することを確認しただけ。Win CUDA 側は **同 design パターンを reuse する前提だが、`PF_GPUDeviceSuite1::AllocateDeviceMemory` が Win CUDA で同等の synchroniser 視野挙動になるか** は Sub-stage E の最初の検証項目。万一 Win 側で同 issue が再発したら CUDA 専用の解決策(`cuMemAlloc` + `cuStreamSynchronize`)に切替える可能性。
+

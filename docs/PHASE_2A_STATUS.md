@@ -2,7 +2,7 @@
 
 常時参照用。各 Step 完了ごとに更新。詳細は [`PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md) + [`workbench_history.md`](../workbench_history.md)。
 
-**現在地**: Phase 2-A.3 Sub-stage **C-2.5b.2-prep2a** 完了 — Mac 実機 5 点 PASS(build `084b470` clean、ffi=0x00020007)。GPU 経路で **mode_flg=15 ピクセルの corner blend が動作**(初の "GPU で smooth が走る" 状態)+ 警告/`FrameTask 517` 解消(intermediate buffer 廃止 + 単一 kernel `smooth_combined` 化)。次は **Phase 2-A.3 Sub-stage C-2.5b.2-prep2b** 以降(link8_01/02/04、up_mode/down_mode corner、line-level blends)。
+**現在地**: Phase 2-A.3 Sub-stage **C-2.5b.2-prep2b.1 gating 実験 PASS**(2026-05-04、build `207212a`)。option (b) = multi-pass + `gpu_suite->AllocateDeviceMemory` + atomic_min priority buffer 設計が **4400×4400 + MFR + キャッシュクリア後 19 frames** で AE 警告/FrameTask 517 ゼロ稼働を確認。design memo の stop-and-reconsider trigger は発動せず、prep2b.2 以降で line-level blend kernel の line-by-line port に進める。
 
 Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-platform)は Win セッション待ちで前倒し可能。詳細は §「Win 着手前 de-risking チェックポイント」。
 
@@ -76,7 +76,10 @@ Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-
           - **修正(commit `084b470`)**: preprocess + detect + blend を **1 つの MSL kernel `smooth_combined` に inline** + `load_strip` device function で各 read 時に white-key strip を即時適用。intermediate buffer **完全廃止**、`cb.wait_until_completed()` も不要化(削除済)、各 thread は src から最大 9 read + dst に 1 write のみ
           - **実機 5 点 PASS(build `084b470` clean)**: (1) About `rust_core 0.1.0+084b470` ffi=0x00020007 = **PASS**、(2) 8/16bpc CPU 非劣化 = **PASS**、(3) **32bpc + GPU ON + transparent ON: 警告なし + FrameTask 517 なし + white 透明化 + corner blend 動作** = **PASS**(prep2a の本来の意図が達成、memory pressure 問題解消)、(4) GPU ON + transparent OFF で identity copy = **PASS**、(5) GPU OFF で CPU 通常動作 = **PASS**
           - **学び**: AE GPU 経路では metal-rs `device.new_buffer()` ベースの intermediate は AE の synchronisation 視野外。後続 line-level blend(thread 間 write 競合あり)が必要になった時点で multi-pass が必須となるため、その時は `gpu_suite->AllocateDeviceMemory` 経由に切替える方針(ハンドオーバ note: `docs/SUB_STAGE_E_HANDOVER.md` 候補項目)
-        - ⬜ **C-2.5b.2-prep2b**: `link8_square_blend_outside` の line-level blend を data-parallel 化(各 thread は自分の pixel しか書かない設計)。`count_length_two_lines` を MSL device function に、`link8_square` 完全実装
+        - 🟡 **C-2.5b.2-prep2b**: line-level blend の data-parallel 実装(option (b) = multi-pass + gpu_suite-allocated priority buffer + atomic_min、`docs/PHASE_2A_PREP2B_DESIGN_MEMO.md` 参照)
+          - ✅ **prep2b.1 gating 実験 PASS(2026-05-04、build `207212a` clean)**: SmartRenderGpu に 2 つの uint32-per-pixel priority buffer を `gpu_suite->AllocateDeviceMemory` で確保 → 既存 chain dispatch → 解放を追加。**4400×4400 footage(19.4M px、priority buffer 計 155 MB per call)+ MFR + 19 frames キャッシュクリア後プレビューで AE 警告ゼロ + FrameTask 517 ゼロ + GPU 負荷確認**。design memo の stop-and-reconsider trigger は発動せず、option (b) を本格採用で前進可能と確定
+          - ⬜ **prep2b.2**: `smooth_blend_mode15_outside` MSL kernel(`link8_square_blend_outside` 直訳、`count_length_two_lines` 既存 device fn 使用、`atomic_min` で write 順序を CPU 等価の "later wins" に解決)+ priority buffer 初期化 kernel + Effect.cpp で kernel 連鎖
+          - ⬜ **prep2b.3〜prep2b.7**: link8_01/02/04 → up_mode_corner → down_mode_corner → lack mode → 突起 mode3、各 ~1 sub-step で line-by-line port
         - ⬜ **C-2.5b.2 残り**: link8_01/02/04(mode_flg 7/11/13)→ up_mode_corner(mode_flg 3)→ down_mode_corner(mode_flg 5)→ lack mode → 突起 mode3。各 ~50〜100 LOC の MSL に落ちる予定だが、up/down mode は spatial extent scan(行内可変長)があるので serial scan を避ける形に再設計が要る
     - ⬜ **C-2.5c**: regression manifest に `gpu_metal_policy` field 追加、`v1.6.0-32bpc` の goldens に対する Mac Metal output が `gpu_metal_policy` 許容内 PASS
   - ⬜ **C-3**: Mac AE 2025 実機 + `SMOOTH_FORCE_GPU_ERROR` injection で fallback テスト + MFR + GPU stress
