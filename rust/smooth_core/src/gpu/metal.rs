@@ -64,24 +64,13 @@ pub struct MetalBackend {
     /// were observed to occasionally trip AE's "smooth did not render
     /// anything" warning under MFR + 4K + memory pressure.
     pipeline_combined: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2b.2a: priority-buffer init kernel that
+    /// Sub-stage C-2.5b.2-prep2b.2: priority-buffer init kernel that
     /// fills the two `width × height × uint32` AE-allocated priority
     /// buffers with UINT32_MAX. Required before the line-blend kernels
-    /// (claim/apply, landing in prep2b.2b+) so atomic_min reduces to
+    /// (claim/apply, landing in prep2b.3+) so atomic_min reduces to
     /// "lowest source-i-index that touched this pixel" without a
     /// separate "untouched" sentinel.
     pipeline_priority_init: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2b.2b: claim phase for mode_flg=15 outside
-    /// line-blends. Each thread = candidate centre; if mode_flg==15, it
-    /// walks its 4 active outside-line calls and atomic_fetch_min on the
-    /// touched output pixels' priority slots (priority_h for horizontal
-    /// lines, priority_v for vertical lines).
-    pipeline_blend_mode15_outside_claim: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2b.2b: apply phase. Mirror of claim — the
-    /// same threads re-walk their 4 outside-line calls; for each touched
-    /// output pixel, read the priority and conditionally write the blend
-    /// only if this centre's i_index won the claim.
-    pipeline_blend_mode15_outside_apply: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -122,8 +111,6 @@ impl MetalBackend {
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
             let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
-            let pipeline_blend_mode15_outside_claim = build_pipeline(&device, &library, "smooth_blend_mode15_outside_claim")?;
-            let pipeline_blend_mode15_outside_apply = build_pipeline(&device, &library, "smooth_blend_mode15_outside_apply")?;
 
             Ok(MetalBackend {
                 device,
@@ -134,8 +121,6 @@ impl MetalBackend {
                 pipeline_blend,
                 pipeline_combined,
                 pipeline_priority_init,
-                pipeline_blend_mode15_outside_claim,
-                pipeline_blend_mode15_outside_apply,
             })
         })
     }
@@ -156,8 +141,6 @@ impl MetalBackend {
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
             let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
-            let pipeline_blend_mode15_outside_claim = build_pipeline(&device, &library, "smooth_blend_mode15_outside_claim")?;
-            let pipeline_blend_mode15_outside_apply = build_pipeline(&device, &library, "smooth_blend_mode15_outside_apply")?;
             Ok(MetalBackend {
                 device,
                 queue,
@@ -167,8 +150,6 @@ impl MetalBackend {
                 pipeline_blend,
                 pipeline_combined,
                 pipeline_priority_init,
-                pipeline_blend_mode15_outside_claim,
-                pipeline_blend_mode15_outside_apply,
             })
         })
     }
@@ -296,37 +277,26 @@ impl MetalBackend {
         })
     }
 
-    /// Sub-stage C-2.5b.2-prep2b.2b: smooth chain dispatcher with priority
-    /// buffers + mode_flg=15 outside line-blend kernels. Encodes 4 passes
-    /// on a single command buffer:
-    ///   1. priority_init: zero-fill priority_v / priority_h to UINT32_MAX
-    ///   2. smooth_combined: preprocess + detect + mode_flg=15 inside
-    ///      (centre 4-corner avg). All other mode_flg values pass through
-    ///      from src.
-    ///   3. blend_mode15_outside_claim: each thread that is a mode_flg=15
-    ///      centre walks its 4 outside-line calls and runs atomic_min on
-    ///      the touched output pixels' priority slots (priority_h for
-    ///      horizontal lines, priority_v for vertical lines).
-    ///   4. blend_mode15_outside_apply: each thread that is a mode_flg=15
-    ///      centre re-walks the same calls; for each touched output
-    ///      pixel, reads priority and conditionally writes the blend.
+    /// Sub-stage C-2.5b.2-prep2b.2: smooth chain dispatcher with priority
+    /// buffers. Runs `smooth_priority_init` (zero-fill of the two
+    /// AE-allocated `width × height × uint32` priority buffers, set to
+    /// UINT32_MAX) followed by `smooth_combined` (preprocess+detect+blend
+    /// for mode_flg=15). All passes go on a single command buffer; the
+    /// init pass is encoded before the combined pass so Metal pipelines
+    /// the dependency chain.
     ///
     /// `priority_v` / `priority_h` are AE-allocated MTLBuffers (see
     /// gpu_suite->AllocateDeviceMemory in Effect.cpp). They MUST be
     /// non-null and at least `width * height * 4` bytes; the caller owns
     /// them and frees via gpu_suite->FreeDeviceMemory after the dispatch.
+    /// They are initialised here even though prep2b.2 doesn't yet bind
+    /// them to a working kernel — this lands the wiring so prep2b.3+
+    /// claim/apply kernels can drop in without further FFI changes.
     ///
-    /// `line_weight` is the per-blend line weighting (CPU-side encoding:
-    /// `(slider_value / 2.0 + 0.5)`) used by the outside-line blend
-    /// kernels.
-    ///
-    /// Blend coverage:
-    ///   - mode_flg = 15 inside: pipeline_combined handles centre 4-corner
-    ///     avg.
-    ///   - mode_flg = 15 outside: pipelines_blend_mode15_outside_*
-    ///     handle line-blends via atomic_min priority resolution.
-    ///   - mode_flg ∈ {3, 5, 7, 11, 13}: still identity copy from src
-    ///     (added in prep2b.3+).
+    /// The blend pass (in pipeline_combined) currently handles only
+    /// mode_flg = 15 (link8_square centre pixel). Other mode_flg values
+    /// fall through to identity copy from src; line-level blends arrive
+    /// in prep2b.3+ as the claim/apply kernels are added.
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
@@ -341,7 +311,6 @@ impl MetalBackend {
         logical_width:     u32,
         range_f32:         f32,
         white_opt:         u32,
-        line_weight:       f32,
     ) -> Result<(), GpuError> {
         if src_buf.is_null() || dst_buf.is_null() {
             return Err(GpuError::Dispatch("null src/dst buffer".into()));
@@ -391,9 +360,10 @@ impl MetalBackend {
                 enc.end_encoding();
             }
 
-            // Pass 2: combined — preprocess + detect + mode_flg=15 inside
-            // (centre 4-corner avg). Priority buffers are not bound here;
-            // they are consumed by passes 3+4 below.
+            // Pass 2: combined — preprocess+detect+blend per pixel.
+            // Priority buffers are not yet bound here (prep2b.3+ replaces
+            // pipeline_combined or adds claim/apply passes that consume
+            // them via atomic_min / read-back).
             {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.pipeline_combined);
@@ -406,51 +376,6 @@ impl MetalBackend {
                 enc.set_bytes(6, 4, &logical_width as *const u32 as *const c_void);
                 enc.set_bytes(7, 4, &range_f32 as *const f32 as *const c_void);
                 enc.set_bytes(8, 4, &white_opt as *const u32 as *const c_void);
-                enc.dispatch_thread_groups(groups, group);
-                enc.end_encoding();
-            }
-
-            // Pass 3: claim — each candidate centre with mode_flg=15
-            // atomic_min's the touched output pixels' priority slots so
-            // the lowest source-i_index (= first scan-order centre) wins.
-            // No dst writes here.
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_blend_mode15_outside_claim);
-                enc.set_buffer(0, Some(src), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(pri_v), 0);
-                enc.set_buffer(3, Some(pri_h), 0);
-                enc.set_bytes(4, 4, &src_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &dst_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(8, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(9, 4, &range_f32 as *const f32 as *const c_void);
-                enc.set_bytes(10, 4, &white_opt as *const u32 as *const c_void);
-                enc.set_bytes(11, 4, &line_weight as *const f32 as *const c_void);
-                enc.dispatch_thread_groups(groups, group);
-                enc.end_encoding();
-            }
-
-            // Pass 4: apply — each centre re-walks its 4 outside calls
-            // and writes blend output pixels for which it won the claim
-            // (priority[idx] == its centre_index).
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_blend_mode15_outside_apply);
-                enc.set_buffer(0, Some(src), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_buffer(2, Some(pri_v), 0);
-                enc.set_buffer(3, Some(pri_h), 0);
-                enc.set_bytes(4, 4, &src_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &dst_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(8, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(9, 4, &range_f32 as *const f32 as *const c_void);
-                enc.set_bytes(10, 4, &white_opt as *const u32 as *const c_void);
-                enc.set_bytes(11, 4, &line_weight as *const f32 as *const c_void);
                 enc.dispatch_thread_groups(groups, group);
                 enc.end_encoding();
             }

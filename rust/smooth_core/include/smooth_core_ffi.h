@@ -290,31 +290,24 @@ int32_t smooth_core_metal_dispatch_preprocess(
     uint32_t height,
     uint32_t white_opt);
 
-/* Dispatch the full smooth chain (Sub-stage C-2.5b.2-prep2b.2b):
+/* Dispatch the full smooth chain (Sub-stage C-2.5b.2-prep2b.2):
  *   priority_init(priority_v, priority_h -> UINT32_MAX) ->
- *   smooth_combined(src -> dst, mode_flg=15 inside) ->
- *   smooth_blend_mode15_outside_claim(atomic_min on priority slots) ->
- *   smooth_blend_mode15_outside_apply(conditional dst writes per
- *     priority winner)
+ *   smooth_combined(src -> dst, mode_flg=15 only)
  * in a single command buffer.
  *
  * priority_v_buf / priority_h_buf are AE-allocated MTLBuffer pointers
  * (gpu_suite->AllocateDeviceMemory) of at least width*height*4 bytes
  * each. They MUST be non-null. Caller frees via FreeDeviceMemory after
- * this call returns.
+ * this call returns. Currently only the priority_init pass binds them;
+ * prep2b.3+ claim/apply kernels will consume them for line-blend
+ * write-conflict resolution via atomic_min.
  *
- * line_weight is the per-blend line weighting used by the outside-line
- * blend kernels. CPU encodes it as `(slider_value / 2.0 + 0.5)` (see
- * Effect.cpp::SmoothCore<>().run() core_params.line_weight) — pass the
- * same encoded value here.
- *
- * Blend coverage:
- *   - mode_flg = 15 inside: smooth_combined writes centre 4-corner avg.
- *   - mode_flg = 15 outside: claim+apply kernels write line-blends with
- *     atomic_min priority resolution (lowest source-i_index wins per
- *     design memo §6).
- *   - mode_flg ∈ {3, 5, 7, 11, 13}: identity copy from src (added in
- *     prep2b.3+).
+ * The blend pass currently handles only mode_flg = 15 (link8_square centre
+ * pixel averaging). All other mode_flg values fall through to identity
+ * copy from src. Visually this means the GPU path applies the white-key
+ * strip + corner-pixel averaging at isolated-mode pixels but not the
+ * staircase line smoothing yet — subsequent prep steps add the line-
+ * level cases.
  *
  * range_f32 is the f32 sum-threshold (= raw slider * 4 / 100 for max=1.0,
  * matching Params::range_f32 on the C++ side).
@@ -333,8 +326,7 @@ int32_t smooth_core_metal_dispatch_smooth_chain(
     uint32_t height,
     uint32_t logical_width,
     float    range_f32,
-    uint32_t white_opt,
-    float    line_weight);
+    uint32_t white_opt);
 #endif /* __APPLE__ */
 
 #ifdef __cplusplus

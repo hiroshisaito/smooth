@@ -1376,10 +1376,6 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // Match the CPU side's range_f32 derivation in smooth_core.h::
         // smoothing<> for the 32bpc branch: slider × max(=1.0) × 4 / 100.
         const float range_f32 = (float)((info->range * 4.0) / 100.0);
-        // Match the CPU side's line_weight derivation in
-        // SmartRender<>().smoothing(): (info->line_weight / 2.0 + 0.5).
-        // Used by the mode_flg=15 outside line-blend kernels (prep2b.2b).
-        const float line_weight = (float)(info->line_weight / 2.0 + 0.5);
 
         // Sub-stage C-2.5b.2-prep2b.2: allocate two uint32-per-pixel
         // priority buffers via gpu_suite->AllocateDeviceMemory and pass
@@ -1423,7 +1419,7 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
                 priority_v, priority_h,
                 src_pitch_pixels, dst_pitch_pixels,
                 width, height, /* logical_width */ width,
-                range_f32, white_opt, line_weight);
+                range_f32, white_opt);
 
             gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
             gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
