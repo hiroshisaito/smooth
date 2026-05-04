@@ -1377,22 +1377,66 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // smoothing<> for the 32bpc branch: slider × max(=1.0) × 4 / 100.
         const float range_f32 = (float)((info->range * 4.0) / 100.0);
 
-        // C-2.5b.2-prep2a: preprocess → detect → blend.
-        int32_t rc = smooth_core_metal_dispatch_smooth_chain(
-            metal_handle, src_buf, dst_buf,
-            src_pitch_pixels, dst_pitch_pixels,
-            width, height, /* logical_width */ width,
-            range_f32, white_opt);
-
-        if (rc != 0) {
-            // Chain submission failed — passthrough fallback so dst has
-            // something visible, then mark fallen for next-frame CPU.
+        // Sub-stage C-2.5b.2-prep2b.1 (gating experiment): allocate two
+        // uint32-per-pixel priority buffers via gpu_suite->AllocateDevice
+        // Memory. These will hold "lowest source-i-index that has written
+        // here" once prep2b.2+ wires the line-level blend kernels with
+        // atomic_min for CPU-equivalent write ordering. For now they are
+        // allocated and immediately freed — the experiment's question is
+        // simply: does AE accept this extra ≈ 2 × 4 × W × H byte allocation
+        // (= ≤ 66 MB at 4K, ≤ 488 MB at 8000²) without re-triggering the
+        // "smooth did not render anything" warning that c7e164a's metal-rs
+        // self-allocated intermediates produced?
+        //
+        // If this gating test PASSes (no AE warning, no FrameTask 517 on
+        // 4K MFR-stress), proceed with prep2b.2 (wire kernels). If FAIL,
+        // PHASE_2A_PREP2B_DESIGN_MEMO.md says flip to option (a) inversion.
+        const A_u_long dev_idx = extraP->input->device_index;
+        const size_t   priority_bytes = (size_t)width * (size_t)height * sizeof(uint32_t);
+        void *priority_v = NULL;
+        void *priority_h = NULL;
+        PF_Err pri_err = gpu_suite->AllocateDeviceMemory(
+            in_data->effect_ref, dev_idx, priority_bytes, &priority_v);
+        if (!pri_err) {
+            pri_err = gpu_suite->AllocateDeviceMemory(
+                in_data->effect_ref, dev_idx, priority_bytes, &priority_h);
+        }
+        if (pri_err || !priority_v || !priority_h) {
+            // Allocation failed under memory pressure. Free what we got,
+            // passthrough fallback, mark fallen so the next PreRender
+            // routes this instance to CPU.
+            if (priority_v) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
+            if (priority_h) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
             gpu_passthrough_to_dst(
                 metal_handle, src_buf, dst_buf,
                 src_pitch_pixels, dst_pitch_pixels, width, height);
             uint64_t uuid_lo, uuid_hi;
             if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
                 smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
+            }
+        } else {
+            // C-2.5b.2-prep2a chain (mode_flg=15 only). The priority
+            // buffers are held during this call but not yet bound to any
+            // kernel — that is prep2b.2's job.
+            int32_t rc = smooth_core_metal_dispatch_smooth_chain(
+                metal_handle, src_buf, dst_buf,
+                src_pitch_pixels, dst_pitch_pixels,
+                width, height, /* logical_width */ width,
+                range_f32, white_opt);
+
+            // Free the gating-experiment buffers in the same call before
+            // we return — AE's gpu_suite expects symmetric alloc/free.
+            gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
+            gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
+
+            if (rc != 0) {
+                gpu_passthrough_to_dst(
+                    metal_handle, src_buf, dst_buf,
+                    src_pitch_pixels, dst_pitch_pixels, width, height);
+                uint64_t uuid_lo, uuid_hi;
+                if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
+                    smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
+                }
             }
         }
     }
