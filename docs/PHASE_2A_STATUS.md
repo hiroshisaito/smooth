@@ -80,6 +80,7 @@ Phase 2-A.2(32bpc + manifest 化)は Step 1〜4 完了、Step 5(Mac↔Win cross-
         - ⬜ **C-2.5b.2 残り**: link8_01/02/04(mode_flg 7/11/13)→ up_mode_corner(mode_flg 3)→ down_mode_corner(mode_flg 5)→ lack mode → 突起 mode3。各 ~50〜100 LOC の MSL に落ちる予定だが、up/down mode は spatial extent scan(行内可変長)があるので serial scan を避ける形に再設計が要る
     - ⬜ **C-2.5c**: regression manifest に `gpu_metal_policy` field 追加、`v1.6.0-32bpc` の goldens に対する Mac Metal output が `gpu_metal_policy` 許容内 PASS
   - ⬜ **C-3**: Mac AE 2025 実機 + `SMOOTH_FORCE_GPU_ERROR` injection で fallback テスト + MFR + GPU stress
+    - **GPU メモリ不足時の回避策・安全策**(2026-05-04 Hiroshi さん指示で要検討バックログ): C-3 / D / F のいずれかで対処予定。`SMOOTH_FORCE_GPU_ERROR=oom` 注入による once-fallen-always-fall fallback の実機検証(C-3)、`MTLDevice::recommendedMaxWorkingSetSize` ベースの pre-emptive GPU 経路 decline(D)、4 GB GPU で 4K MFR フル稼働の UAT 検証(F)。算出根拠は workbench_history.md「GPU メモリ要件算出」節参照
 - ⬜ **Step 4 (Sub-stage D)**: UI DISABLED wiring + GPU 検出機構 + About
 - ⬜ **Step 5 (Sub-stage E)**: Win CUDA backend 本実装 + Effect.cpp CUDA path
 - ⬜ **Step 6 (Sub-stage F)**: Full UAT + 性能測定 + v1.6.0 配布
