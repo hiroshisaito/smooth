@@ -1,8 +1,8 @@
-# smooth 1.5.0 Windows ビルド手順(Phase 2-C + 2-D 対応)
+# smooth 1.6.0 Windows ビルド手順(32bpc 対応 + Multi-Frame Rendering、CPU only)
 
 **対象マシン**: Windows 10/11 + Visual Studio 2022 以降 + Adobe After Effects 2025 SDK + Rust stable。
 
-Mac 側は既に Phase 2-C (Rust コア化) 済み。Windows 側も同じコードを走らせるため、**Rust staticlib のビルドが必須**です。
+Mac 側で完成したコード(Rust core + 32bpc f32 path + SmartRender + MFR)を Windows 側でビルドする手順。**Rust staticlib のビルドが必須**です。
 
 ## 前提ツール
 
@@ -65,7 +65,7 @@ New-Item -ItemType Directory -Force win\release\package | Out-Null
 Copy-Item win\Release\x64\smooth.aex win\release\package\
 Copy-Item LICENSE win\release\package\
 Copy-Item THIRD_PARTY_LICENSES.md win\release\package\
-Compress-Archive -Path win\release\package\* -DestinationPath win\release\smooth.Win.1.5.0.AE2025.x64.zip -Force
+Compress-Archive -Path win\release\package\* -DestinationPath win\release\smooth.Win.1.6.0.AE2025.x64.zip -Force
 ```
 
 ## 既知事項 / トラブルシュート
