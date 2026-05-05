@@ -32,7 +32,6 @@
 # Phase 2-A Sub-stage A disposable PoC (lives at ../smooth-spike-poc/, symlinked)
 /spike-poc
 
-# Phase 2-A.3 GPU 関連ドキュメント(2026-05-05 中止確定、Phase 2-A は 32bpc CPU only で
-# close)。当時の設計 RFC / 調査ノート / status / prep2b design memo を local 参照用に
-# 保持(workbench_history.md からの参照価値はあるが repo には載せない)。
-/docs/_archive_gpu/
+# Local-only archive folder for historical design notes that are kept on
+# disk for personal reference but not part of the distributed repo.
+/docs/_local_archive/

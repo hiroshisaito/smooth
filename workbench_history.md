@@ -1,5 +1,26 @@
 # smooth-mod-v1.5.0 Workbench History
 
+> **Windows handoff 注意(2026-05-05)**:
+>
+> 本ファイルは v1.5.0 / v1.5.1 / v1.6.0 リリース準備までの開発全工程ログです。
+> 本プロジェクトは **CPU only**(8/16/32bpc 対応、MFR 対応、SmartRender 対応)
+> として運用されます。リポジトリ内の active な実装・doc は CPU 経路のみ。
+>
+> 本ログには 2026 年 4 月〜5 月に Phase 2-A.3 として GPU 化を試行した
+> 経緯が時系列で残っていますが、**この方向は 2026-05-05 に中止確定**しました。
+> よって以下の節は **歴史記録**であり、現リポジトリの active な状態を表す
+> ものではありません:
+>
+> - "Phase 2-A.3 Sub-stage A〜C-2.5"(GPU spike / scaffold / Metal backend)
+> - "prep2b" / "prep2c" 系の各 prep 試行と FAIL 記録
+> - "Phase 2-A close 判定"(中止理由のまとめ)
+>
+> これらの記録は将来の参考(AE SDK が将来進化した場合の再挑戦時に参照)の
+> ために残置していますが、Windows side の作業や v1.6.0 出荷準備では
+> **active な doc / コードのみを正本**としてください(`README.md`、
+> `docs/CAPTURE_32BPC_RUNBOOK.md`、`docs/EXTERNAL_REVIEW_REQUEST.md`、
+> `docs/WINDOWS_BUILD_ID_INTEGRATION.md`、`tests/README.md`)。
+
 本ファイルは smooth-mod-v1.5.0 の開発工程を一元記録するログです。
 成功・失敗問わずステップ単位で追記し、意思決定と試行の過程を残します。
 

@@ -1,10 +1,9 @@
 # Phase 2-A.2 Step 3: backfill manifest for the v1.4.0-ae2025 goldens.
 #
-# Schema is documented in docs/PHASE_2A_GPU_RFC.md §3.2.6. Format is TOML
-# (parseable from Python 3.11+ via stdlib `tomllib`).
+# Format is TOML (parseable from Python 3.11+ via stdlib `tomllib`).
 #
 # The .raw fixture files referenced below are NOT committed to git
-# (.gitignore keeps them out — see RFC §3.2.5 sizing rationale). Use
+# (.gitignore keeps them out — file size is large per suite). Use
 # tests/fetch_goldens.sh to populate this directory or to verify SHA256
 # of locally-staged files. The artifact_url field is empty until Step 4
 # uploads tar.zst to a GitHub Release; until then, fetch_goldens.sh runs

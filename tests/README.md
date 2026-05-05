@@ -72,7 +72,7 @@ See `bench.h` `DumpHeader` for the exact layout.
 
 ## Manifest schema (`tests/goldens/<suite>/manifest.toml`)
 
-Documented in `docs/PHASE_2A_GPU_RFC.md` §3.2.6. Two policy slots — `mac_reference_policy` (Mac CPU bit-for-bit) vs `cross_platform_policy` (Mac↔Win tolerance) — kept separate so a near-ID exception for one doesn't accidentally relax the other. Per-frame `policy_overrides` exists for cases like frame 135 (Phase 1 strip-parallel boundary residual). Future 32bpc suite adds an `f32_abs` metric variant.
+Two policy slots — `mac_reference_policy` (Mac CPU bit-for-bit) vs `cross_platform_policy` (Mac↔Win tolerance) — kept separate so a near-ID exception for one doesn't accidentally relax the other. Per-frame `policy_overrides` exists for cases like frame 135 (Phase 1 strip-parallel boundary residual). The 32bpc suite adds an `f32_abs` metric variant.
 
 ## SMDP file format
 
@@ -90,7 +90,7 @@ tests/synthesize_32bpc_goldens.sh
 tests/run_regression.sh   # 28/28 PASS expected
 ```
 
-Why synthetic: see [`docs/CAPTURE_32BPC_RUNBOOK.md`](../docs/CAPTURE_32BPC_RUNBOOK.md). RFC §3.2.6 declares the CPU 32bpc implementation as the reference, so the suite's role is "does smooth_core stay deterministic across builds and platforms?" rather than "does it match an independent oracle?".
+Why synthetic: see [`docs/CAPTURE_32BPC_RUNBOOK.md`](../docs/CAPTURE_32BPC_RUNBOOK.md). The CPU 32bpc implementation IS the reference (no independent oracle), so the suite's role is "does smooth_core stay deterministic across builds and platforms?" rather than "does it match an independent oracle?".
 
 ### Alternative path: AE EXR import (HDR test material only)
 

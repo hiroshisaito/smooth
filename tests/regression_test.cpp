@@ -193,11 +193,11 @@ int main(int argc, char** argv) {
         // For PF_PixelFloat fixtures, byte-domain max_abs is meaningless
         // (a single-LSB mantissa flip can produce arbitrary byte values).
         // Reinterpret the buffers as f32 streams and report the largest
-        // |out - expected| in the value domain. The tolerance matches
-        // docs/PHASE_2A_GPU_RFC.md §3.2.6 cross_platform_policy for f32:
-        // 1e-5 absolute. Phase 1's strip-parallel boundary residual on
-        // frame 135 sits well under this when goldens were captured in
-        // SMOOTH_PARALLEL=0 mode (serial baseline).
+        // |out - expected| in the value domain. The cross-platform
+        // tolerance for f32 is 1e-5 absolute (Mac↔Win). Phase 1's
+        // strip-parallel boundary residual on frame 135 sits well under
+        // this when goldens were captured in SMOOTH_PARALLEL=0 mode
+        // (serial baseline).
         const float* out_f32 = reinterpret_cast<const float*>(out.data());
         const float* exp_f32 = reinterpret_cast<const float*>(expected.pixels.data());
         const size_t n_floats = expected.pixels.size() / sizeof(float);
@@ -219,9 +219,9 @@ int main(int argc, char** argv) {
         //                                (32/255 ≈ 0.125), enough to absorb the
         //                                strip-parallel decision-flip residual
         //                                that frame 135 inherits from Phase 1.
-        // RFC §3.2.6's stricter cross-platform threshold (f32_abs <= 1e-5) is
-        // applied separately at Mac↔Win comparison time (manifest-driven, not
-        // here); this hardcoded rule is the local-Mac NEAR-ID acceptance gate.
+        // The stricter cross-platform threshold (f32_abs <= 1e-5) is applied
+        // separately at Mac↔Win comparison time (manifest-driven, not here);
+        // this hardcoded rule is the local-Mac NEAR-ID acceptance gate.
         const bool within_tol = (f32_diff_pct < 0.01) && (max_f32_abs <= 0.125f);
         std::printf("%s frame=%u w=%u h=%u bpc=32 floats=%zu/%zu (%.4f%%) max_f32_abs=%.3e\n",
                     within_tol ? "NEAR-ID  " : "DIFF     ",

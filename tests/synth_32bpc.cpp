@@ -9,8 +9,8 @@
 //
 // Why no AE
 // ---------
-// docs/PHASE_2A_GPU_RFC.md §3.2.6 declares the CPU 32bpc implementation
-// itself as the reference for v1.6.0-32bpc goldens. With that license,
+// The CPU 32bpc implementation itself is the reference for v1.6.0-32bpc
+// goldens (no independent oracle). With that license,
 // driving the capture from existing v1.4.0 inputs sidesteps two
 // blockers we discovered late in Step 4b prep: (a) the v1.4.0 .aep
 // project file was never committed and one of its source layers

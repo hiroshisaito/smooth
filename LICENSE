@@ -225,44 +225,12 @@ redistributions.
 
 Production Rust dependencies common to macOS and Windows:
 
-    cfg-if 1.0.4              MIT OR Apache-2.0
     crossbeam-deque 0.8.6     MIT OR Apache-2.0
     crossbeam-epoch 0.9.18    MIT OR Apache-2.0
     crossbeam-utils 0.8.21    MIT OR Apache-2.0
-    dashmap 6.1.0             MIT
     either 1.15.0             MIT OR Apache-2.0
-    getrandom 0.4.2           MIT OR Apache-2.0
-    hashbrown 0.14.5          MIT OR Apache-2.0
-    lock_api 0.4.14           MIT OR Apache-2.0
-    once_cell 1.21.4          MIT OR Apache-2.0
-    parking_lot_core 0.9.12   MIT OR Apache-2.0
     rayon 1.12.0              MIT OR Apache-2.0
     rayon-core 1.13.0         MIT OR Apache-2.0
-    scopeguard 1.2.0          MIT OR Apache-2.0
-    smallvec 1.15.1           MIT OR Apache-2.0
-    thiserror 1.0.69          MIT OR Apache-2.0
-    uuid 1.23.1               Apache-2.0 OR MIT
-
-Additional production Rust dependency on Windows:
-
-    windows-link 0.2.1        MIT OR Apache-2.0
-
-Additional production Rust dependencies on macOS:
-
-    bitflags 1.3.2            MIT/Apache-2.0
-    bitflags 2.11.1           MIT OR Apache-2.0
-    block 0.1.6               MIT
-    core-foundation 0.9.4     MIT OR Apache-2.0
-    core-foundation-sys 0.8.7 MIT OR Apache-2.0
-    core-graphics-types 0.1.3 MIT OR Apache-2.0
-    foreign-types 0.5.0       MIT/Apache-2.0
-    foreign-types-shared 0.3.1 MIT/Apache-2.0
-    libc 0.2.185              MIT OR Apache-2.0
-    log 0.4.29                MIT OR Apache-2.0
-    malloc_buf 0.0.6          MIT
-    metal 0.27.0              MIT OR Apache-2.0
-    objc 0.2.7                MIT
-    objc_exception 0.1.2      MIT
 
 Detailed third-party notices, including source/build-time Rust dependencies and
 the Unicode License v3 notice used by unicode-ident, are maintained in
@@ -271,10 +239,10 @@ source or binary redistributions.
 
 SDKs, toolchains, and test-only dependencies:
 
-Adobe After Effects SDK, Apple Xcode/macOS SDK, Microsoft Visual Studio,
-Microsoft Windows SDK, and NVIDIA CUDA references are SDK or toolchain
-dependencies governed by their respective vendor terms. The normal smooth source
-and plugin binary distributions do not redistribute those SDKs.
+Adobe After Effects SDK, Apple Xcode/macOS SDK, Microsoft Visual Studio, and
+Microsoft Windows SDK are SDK or toolchain dependencies governed by their
+respective vendor terms. The normal smooth source and plugin binary
+distributions do not redistribute those SDKs.
 
 Python packages used by tests or fixture generation, such as Pillow, NumPy, and
 OpenEXR, are not part of the smooth plugin binaries. If they are redistributed
@@ -293,14 +261,11 @@ LoiLo is a trademark or registered trademark of LoiLo Inc.
 Adobe and After Effects are trademarks or registered trademarks of Adobe Inc. in
 the United States and/or other countries.
 
-Apple, macOS, Xcode, and Metal are trademarks of Apple Inc., registered in the
+Apple, macOS, and Xcode are trademarks of Apple Inc., registered in the
 United States and other countries and regions.
 
 Microsoft, Windows, and Visual Studio are trademarks or registered trademarks of
 Microsoft Corporation in the United States and/or other countries.
-
-NVIDIA and CUDA are trademarks or registered trademarks of NVIDIA Corporation in
-the United States and/or other countries.
 
 Rust and Cargo are trademarks of the Rust Foundation.
 

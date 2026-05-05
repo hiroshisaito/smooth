@@ -47,21 +47,6 @@ echo "==> build Rust smooth_core (universal)"
 
 SMOOTH_PARALLEL="${SMOOTH_PARALLEL:-1}"
 
-# Phase 2-A.3 C-2.5a: libsmooth_core.a now references Objective-C runtime
-# and Metal framework symbols on macOS (smooth_core_metal_* FFI). The CPU
-# regression harnesses don't call those symbols, but the linker still needs
-# them resolved. -lobjc + Foundation/Metal/QuartzCore covers what metal-rs
-# pulls in transitively. On non-Apple platforms these are unset and the
-# compiler picks them up from the host SDK.
-case "$(uname -s)" in
-  Darwin)
-    GPU_LINK_FLAGS="-lobjc -framework Foundation -framework Metal -framework QuartzCore"
-    ;;
-  *)
-    GPU_LINK_FLAGS=""
-    ;;
-esac
-
 echo "==> build regression harness (SMOOTH_PARALLEL=$SMOOTH_PARALLEL)"
 clang++ -std=c++17 -O2 \
     -DSMOOTH_PARALLEL=$SMOOTH_PARALLEL \
@@ -73,7 +58,6 @@ clang++ -std=c++17 -O2 \
     "$ROOT/tests/regression_test.cpp" \
     "$ROOT/util.cpp" \
     "$RUST_LIB" \
-    $GPU_LINK_FLAGS \
     -o "$BIN" || { echo "build failed"; exit 1; }
 
 echo "==> build synthetic white_option harness"
@@ -87,7 +71,6 @@ clang++ -std=c++17 -O2 \
     "$ROOT/tests/test_white_option.cpp" \
     "$ROOT/util.cpp" \
     "$RUST_LIB" \
-    $GPU_LINK_FLAGS \
     -o "$WHITE_BIN" || { echo "white-option build failed"; exit 1; }
 
 echo "==> run synthetic white_option tests"

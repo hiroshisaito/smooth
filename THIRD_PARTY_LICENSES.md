@@ -8,7 +8,7 @@ See `LICENSE` for the project license text, upstream LoiLo notice, and trademark
 notice. Include both `LICENSE` and this file with source and binary
 redistributions.
 
-This inventory was verified on 2026-05-04 from:
+This inventory was verified on 2026-05-05 from:
 
 - `rust/smooth_core/Cargo.lock`
 - `cargo tree --locked --target x86_64-pc-windows-msvc --edges normal,no-proc-macro`
@@ -41,76 +41,20 @@ targets. License expressions are taken from Cargo package metadata.
 
 | Package | Version | License | Notice holder / project |
 | --- | --- | --- | --- |
-| cfg-if | 1.0.4 | MIT OR Apache-2.0 | Alex Crichton |
 | crossbeam-deque | 0.8.6 | MIT OR Apache-2.0 | crossbeam-rs project |
 | crossbeam-epoch | 0.9.18 | MIT OR Apache-2.0 | crossbeam-rs project |
 | crossbeam-utils | 0.8.21 | MIT OR Apache-2.0 | crossbeam-rs project |
-| dashmap | 6.1.0 | MIT | Acrimon |
 | either | 1.15.0 | MIT OR Apache-2.0 | bluss |
-| getrandom | 0.4.2 | MIT OR Apache-2.0 | The Rand Project Developers |
-| hashbrown | 0.14.5 | MIT OR Apache-2.0 | Amanieu d'Antras |
-| lock_api | 0.4.14 | MIT OR Apache-2.0 | Amanieu d'Antras |
-| once_cell | 1.21.4 | MIT OR Apache-2.0 | Aleksey Kladov |
-| parking_lot_core | 0.9.12 | MIT OR Apache-2.0 | Amanieu d'Antras |
 | rayon | 1.12.0 | MIT OR Apache-2.0 | rayon-rs project |
 | rayon-core | 1.13.0 | MIT OR Apache-2.0 | rayon-rs project |
-| scopeguard | 1.2.0 | MIT OR Apache-2.0 | bluss |
-| smallvec | 1.15.1 | MIT OR Apache-2.0 | The Servo Project Developers |
-| thiserror | 1.0.69 | MIT OR Apache-2.0 | David Tolnay |
-| uuid | 1.23.1 | Apache-2.0 OR MIT | uuid-rs project |
-
-### Additional Windows Runtime Dependency
-
-| Package | Version | License | Notice holder / project |
-| --- | --- | --- | --- |
-| windows-link | 0.2.1 | MIT OR Apache-2.0 | Microsoft windows-rs project |
-
-### Additional macOS Runtime Dependencies
-
-| Package | Version | License | Notice holder / project |
-| --- | --- | --- | --- |
-| bitflags | 1.3.2 | MIT/Apache-2.0 | The Rust Project Developers |
-| bitflags | 2.11.1 | MIT OR Apache-2.0 | The Rust Project Developers |
-| block | 0.1.6 | MIT | Steven Sheldon |
-| core-foundation | 0.9.4 | MIT OR Apache-2.0 | The Servo Project Developers |
-| core-foundation-sys | 0.8.7 | MIT OR Apache-2.0 | The Servo Project Developers |
-| core-graphics-types | 0.1.3 | MIT OR Apache-2.0 | The Servo Project Developers |
-| foreign-types | 0.5.0 | MIT/Apache-2.0 | Steven Fackler |
-| foreign-types-shared | 0.3.1 | MIT/Apache-2.0 | Steven Fackler |
-| libc | 0.2.185 | MIT OR Apache-2.0 | The Rust Project Developers |
-| log | 0.4.29 | MIT OR Apache-2.0 | The Rust Project Developers |
-| malloc_buf | 0.0.6 | MIT | Steven Sheldon |
-| metal | 0.27.0 | MIT OR Apache-2.0 | gfx-rs developers |
-| objc | 0.2.7 | MIT | Steven Sheldon |
-| objc_exception | 0.1.2 | MIT | Steven Sheldon |
-
-## Source and Build-Time Rust Dependencies
-
-These crates are used by proc macros or build scripts when building from
-source. They are not shipped as independent runtime libraries in the plugin
-binary, but their notices should be preserved for source distributions.
-
-| Package | Version | License | Notice holder / project |
-| --- | --- | --- | --- |
-| cc | 1.2.61 | MIT OR Apache-2.0 | Alex Crichton / rust-lang cc-rs project |
-| find-msvc-tools | 0.1.9 | MIT OR Apache-2.0 | rust-lang cc-rs project |
-| foreign-types-macros | 0.2.3 | MIT/Apache-2.0 | Steven Fackler |
-| paste | 1.0.15 | MIT OR Apache-2.0 | David Tolnay |
-| proc-macro2 | 1.0.106 | MIT OR Apache-2.0 | David Tolnay / Alex Crichton |
-| quote | 1.0.45 | MIT OR Apache-2.0 | David Tolnay |
-| shlex | 1.3.0 | MIT OR Apache-2.0 | comex, Fenhl, Adrian Taylor, Alex Touchet, Daniel Parks, Garrett Berg |
-| syn | 2.0.117 | MIT OR Apache-2.0 | David Tolnay |
-| thiserror-impl | 1.0.69 | MIT OR Apache-2.0 | David Tolnay |
-| unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | David Tolnay / Unicode, Inc. |
 
 ## SDKs, Toolchains, Test Dependencies, and Local Tools
 
-Adobe After Effects SDK, Apple Xcode/macOS SDK, Microsoft Visual Studio,
-Microsoft Windows SDK, and NVIDIA CUDA references are SDK or toolchain
-dependencies governed by their respective vendor terms. They are expected to
-exist locally under `references/` or vendor install locations for builds, but
-normal smooth source and plugin binary distributions must not redistribute
-those SDKs.
+Adobe After Effects SDK, Apple Xcode/macOS SDK, Microsoft Visual Studio, and
+Microsoft Windows SDK are SDK or toolchain dependencies governed by their
+respective vendor terms. They are expected to exist locally under
+`references/` or vendor install locations for builds, but normal smooth source
+and plugin binary distributions must not redistribute those SDKs.
 
 Python packages used only by tests or fixture generation, such as Pillow, NumPy,
 and OpenEXR, are not part of the smooth plugin binaries. If those packages are

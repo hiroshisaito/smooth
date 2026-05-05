@@ -25,8 +25,7 @@ Adobe After Effects 向けスムージングプラグイン **smooth** のメン
 ## 変更点(1.4.0-ae2025 からの差分)
 
 ### 機能改善
-- **行ブロック並列化**(`std::thread`、hardware_concurrency() 連動)
-  - Smart Render GPU ではなく CPU スレッドベース
+- **行ブロック並列化**(`std::thread`、hardware_concurrency() 連動、CPU スレッドベース)
   - 環境変数相当の `SMOOTH_PARALLEL=0` でコンパイル時に並列オフ可能(デバッグ向け)
 - **AE SDK 非依存のコアモジュール** `smooth_core.h` を新設
   - 旧 `Effect.cpp::smoothing<>()` の約 430 行を純関数 `smooth_core::process<T>()` に分離

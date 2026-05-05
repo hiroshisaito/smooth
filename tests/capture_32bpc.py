@@ -14,9 +14,7 @@
 # (SMOOTH_BENCH=1 build), which writes SMDP straight from the render
 # call. For 32bpc we instead require AE Render Queue --> EXR export so
 # that re-capture does not need a custom build of the plugin: anyone
-# with AE 2025 + Python + OpenEXR can rebuild the goldens. See
-# docs/PHASE_2A_GPU_RFC.md S3.2.5 step 2 for the rationale and S3.2.6
-# for the manifest schema this script produces fixtures for.
+# with AE 2025 + Python + OpenEXR can rebuild the goldens.
 #
 # PIPELINE
 # --------
