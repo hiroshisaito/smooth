@@ -2428,3 +2428,51 @@ UAT plan:
 
 レビュワー指摘の通り、AE GPU suite + Metal cb + completion/free は同じ層にまとめるのが堅い。短期は Rust-owned metadata buffer で診断、長期は C++/Obj-C++ shim 化を design memo §10 / §11 で検討予定。
 
+## Phase 2-A.3 prep2c-step1.1 UAT 結果 + step1.2 (Rust-owned metadata)(2026-05-05)
+
+**step1.1 (commit `d158511`) UAT 結果**:
+
+Phase A(cap=32 + INFLIGHT_LIMIT=1):
+- Run 1(cache 22%): 20 frames、**1 × 517** at frame 19456、per-thread 0.24s
+- Run 2(cache 4%、最も honest): 20 frames、**0 × 517**、per-thread 2.67s(serial GPU で 5 thread 待機)
+- Run 3(全 cache): 0 × 517
+
+Phase B(cap=32、env なし):
+- Run 1(全 cache): 0 × 517
+- Run 2(cache 5%、最も honest): 17 rendered + **3 × 517** at frame 3072/4096/5120、per-thread 1.72s
+
+**重要観測**:
+- INFLIGHT_LIMIT=1 で 517 が **3 → 1 に減少** = **metadata lifetime が確かに contributor**(レビュワー仮説裏付け)
+- ただし完全には消えない(Phase A Run 1 で 1 件残存) = lifetime 以外の要因も残存
+- **🔴 視覚 FAIL は両 Phase で継続** = 別問題として残る
+
+### step1.2 実装(本コミット)
+
+**Rust-owned metadata buffer**(レビュワー診断 2 採用):
+
+C++/Rust 境界での lifetime 管理の責務分裂を構造的に解消:
+- 旧: C++ が `gpu_suite->AllocateDeviceMemory` で metadata 確保 → Rust が raw pointer bind + commit() → Rust Ok(()) 即返却 → C++ が `FreeDeviceMemory` 即時呼出 → GPU は async 読中で AE FrameTask 破綻
+- 新: Rust が `device.new_buffer(width*height, MTLResourceOptions::StorageModePrivate)` で内部確保 → encoder.set_buffer で metal-rs が retain → cb 完了まで自動保持 → cb 完了後に解放(Metal/Obj-C runtime が管理)
+
+C++/Rust 境界を渡る metadata pointer がなくなり、寿命管理は Metal runtime が完結。**INFLIGHT_LIMIT=1 を使わない production path でも安全**。
+
+**変更**:
+- `metal.rs::dispatch_smooth_chain`: `metadata_buf: *mut c_void` 引数を削除、内部で `self.device.new_buffer(metadata_bytes, StorageModePrivate)` で確保。Buffer は `let metadata_buf: Buffer` でローカル保持、encoder.set_buffer で metal-rs が retain → cb 完了時に Metal が release → 関数終了時に Rust drop しても Metal 側の retain count で生存継続
+- `lib.rs` FFI: `smooth_core_metal_dispatch_smooth_chain` から `metadata_buf` 削除、smooth_core_version 0x0002_000f → **0x0002_0010**
+- `smooth_core_ffi.h`: signature 同期 + step1.2 仕様 doc
+- `Effect.cpp`: SmartRenderGpu から `gpu_suite->AllocateDeviceMemory` / `FreeDeviceMemory` 呼出を削除、dispatch 呼出も simplify
+
+**期待効果**:
+- 517 が大幅減 / ゼロ化(lifetime 起因分が消える)
+- production path で env var 不要(INFLIGHT_LIMIT=1 は診断専用、unset で運用)
+- StorageModePrivate = GPU-only memory で kernel read 高速化
+
+**残課題(視覚 FAIL)**:
+- step1.1 で white_opt fix 済だが視覚 FAIL 継続 = white-key 不整合以外の何かが視覚に影響
+- 仮説: (a) early-out scan が広すぎる/狭すぎる (b) cap=32 で line blend が短すぎて見た目が大きく違う (c) metadata の値読み取り問題
+- step1.2 build で再 UAT 後、視覚 FAIL の具体的状態を Hiroshi さんに確認(全く効果なし / 部分的 / 警告ダイアログ等)
+
+**build / test 結果**:
+- `cargo test --release` 24/24 PASS
+- `xcodebuild -scheme smooth -configuration Release` BUILD SUCCEEDED
+

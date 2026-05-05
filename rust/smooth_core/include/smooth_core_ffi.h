@@ -333,14 +333,13 @@ int32_t smooth_core_metal_dispatch_preprocess(
  * AE and AE may report `FrameTask 517` independently. Pass 0/0 to opt
  * out (e.g., from unit tests).
  *
- * `metadata_buf` (FFI 0x0002_000f+, prep2c-step1) is an AE-managed
- * device memory pointer of `width * height` bytes (1 byte per pixel),
- * allocated by the caller via `PF_GPUDeviceSuite::AllocateDeviceMemory`
- * before this call and freed after. Pass 1 (smooth_detect) writes
- * mode_flg + fast_compare bit per pixel; pass 2 (smooth_per_pixel)
- * reads it. Must not be NULL. The two passes write DIFFERENT buffers
- * (metadata vs dst) — matches the SDK_Invert_ProcAmp 2-kernel pattern
- * and avoids the prep2c v1 issue where two kernels both wrote dst.
+ * step1.2 (FFI 0x0002_0010+, 2026-05-05): metadata buffer is
+ * Rust-owned. Caller no longer needs to allocate a metadata buffer or
+ * pass one through this call. Inside Rust the buffer is allocated via
+ * `device.new_buffer(StorageModePrivate)` and retained by metal-rs
+ * through the cb's encoder bindings until the cb completes. Removed
+ * `metadata_buf` parameter from the signature compared to FFI
+ * 0x0002_000f.
  *
  * Cap is read at run time from env var `SMOOTH_GPU_MAX_LENGTH`
  * (default 32, clamped to [4, 128]). Bounds (a) the cap-range cardinal
@@ -361,7 +360,6 @@ int32_t smooth_core_metal_dispatch_smooth_chain(
     void    *handle,
     void    *src_buf,
     void    *dst_buf,
-    void    *metadata_buf,
     uint32_t src_pitch_pixels,
     uint32_t dst_pitch_pixels,
     uint32_t width,

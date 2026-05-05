@@ -316,11 +316,20 @@ impl MetalBackend {
     /// MAX_LENGTH cardinal-ray scans (worst case ~540K ops/pixel,
     /// average much less due to early break on first match per block).
     ///
-    /// Sub-stage C-2.5b.2-prep2c-step1 (2026-05-05): metadata-driven
-    /// Hybrid Path β. Two-pass dispatch in a single command buffer:
+    /// Sub-stage C-2.5b.2-prep2c-step1.2 (2026-05-05): Rust-owned
+    /// metadata buffer variant. metadata is allocated via
+    /// `device.new_buffer` (StorageModePrivate) inside this function;
+    /// Metal retains it through the cb's encoder bindings, so it stays
+    /// alive across `commit()` until completion. No C++ involvement in
+    /// the metadata lifetime — eliminates the Rust/C++ boundary
+    /// lifetime question raised by the external review (2026-05-05):
+    /// previously C++ called `gpu_suite->AllocateDeviceMemory` and then
+    /// `FreeDeviceMemory` immediately after this function returned,
+    /// while the GPU was still potentially reading metadata.
+    ///
+    /// Two-pass dispatch in a single command buffer:
     ///   pass 1 — `smooth_detect` writes 1 byte/pixel mode_flg metadata
-    ///            into `metadata_buf` (AE-managed, allocated by C++ via
-    ///            `PF_GPUDeviceSuite::AllocateDeviceMemory`).
+    ///            into the Rust-allocated buffer.
     ///   pass 2 — `smooth_per_pixel` reads src + metadata, performs a
     ///            cap-range cardinal scan early-out for flat regions,
     ///            and runs full per-output writer selection bounded by
@@ -332,33 +341,24 @@ impl MetalBackend {
     /// "smooth did not render anything" warning previously triggered on
     /// designs with two kernels both writing dst (prep2c v1) — that
     /// pitfall does not apply here because pass 1 only writes
-    /// `metadata_buf` and pass 2 is the sole writer to `dst`.
+    /// metadata and pass 2 is the sole writer to `dst`.
     ///
     /// `gpu_max_length` is read at run time from env var
     /// `SMOOTH_GPU_MAX_LENGTH` (default 32). Pass 16 / 32 / 64 to
-    /// trade quality for speed without rebuilding. The cap bounds:
-    ///   - the cardinal early-out scan distance (4 × cap metadata reads)
-    ///   - the Phase 1/2/3 search radius for candidate centres
-    ///   - the inner `count_length_two_lines` line scan
-    /// CPU equivalence is broken at the cap — step2 will share the
-    /// same cap with the CPU path under the GPU profile flag.
+    /// trade quality for speed without rebuilding.
     ///
     /// `uuid_lo` / `uuid_hi` identify the AE sequence instance. The
-    /// silent-fail completed handler is preserved from prep2c diag —
-    /// on GPU error it logs + calls `mark_fallen` for next-frame CPU
-    /// fallback. The current frame cannot be rescued (already returned
-    /// 0 to AE).
+    /// silent-fail completed handler is preserved — on GPU error it
+    /// logs + calls `mark_fallen` for next-frame CPU fallback.
     ///
     /// Env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` is preserved as a
     /// diagnostic toggle (Mutex + wait_until_completed). Production
-    /// path leaves it unset — wait_until_completed inside SmartRender
-    /// pushes the call duration past AE's per-frame budget.
+    /// path leaves it unset.
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
         src_buf:           *mut c_void,
         dst_buf:           *mut c_void,
-        metadata_buf:      *mut c_void,
         src_pitch_pixels:  u32,
         dst_pitch_pixels:  u32,
         width:             u32,
@@ -370,13 +370,26 @@ impl MetalBackend {
         uuid_lo:           u64,
         uuid_hi:           u64,
     ) -> Result<(), GpuError> {
-        if src_buf.is_null() || dst_buf.is_null() || metadata_buf.is_null() {
-            return Err(GpuError::Dispatch("null src/dst/metadata buffer".into()));
+        if src_buf.is_null() || dst_buf.is_null() {
+            return Err(GpuError::Dispatch("null src/dst buffer".into()));
         }
         if width == 0 || height == 0 {
             return Err(GpuError::Dispatch("zero extent".into()));
         }
         let _ = &ctx.scratch;
+
+        // step1.2: allocate metadata buffer Rust-side via metal-rs.
+        // StorageModePrivate = GPU-only memory (faster for kernel reads
+        // than Shared). Metal retains the buffer through the encoder
+        // bindings, keeping it alive across commit() until cb completes
+        // — even if Rust drops `metadata_buf` the moment this function
+        // returns. The dispatch outcome is therefore independent of
+        // C++/Rust boundary timing for the metadata lifetime.
+        let metadata_bytes = (width as u64) * (height as u64);
+        let metadata_buf: Buffer = self.device.new_buffer(
+            metadata_bytes,
+            MTLResourceOptions::StorageModePrivate,
+        );
 
         // Read SMOOTH_GPU_MAX_LENGTH env var per dispatch (cheap, allows
         // run-time cap sweep without rebuild). Parse failures fall back
@@ -409,9 +422,9 @@ impl MetalBackend {
             let dst = unsafe {
                 std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
             };
-            let metadata = unsafe {
-                std::mem::transmute::<*mut c_void, &metal::BufferRef>(metadata_buf)
-            };
+            // Rust-owned metadata: pass the BufferRef directly without
+            // a transmute through *mut c_void.
+            let metadata: &metal::BufferRef = &metadata_buf;
 
             let group = MTLSize::new(16, 16, 1);
             let groups = MTLSize::new(

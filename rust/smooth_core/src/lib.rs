@@ -85,7 +85,21 @@ pub extern "C" fn smooth_core_version() -> u32 {
     //              both wrote dst. CPU equivalence at the cap is broken;
     //              step2 will share the cap with the CPU path under the
     //              GPU profile flag. See PHASE_2A_PREP2B_DESIGN_MEMO.md §10.
-    0x0002_000f
+    // 0x0002_0010: step1.2 (2026-05-05) — `metadata_buf` parameter REMOVED.
+    //              metadata is now Rust-owned (allocated via
+    //              `device.new_buffer(StorageModePrivate)` inside
+    //              dispatch_smooth_chain), kept alive through the cb's
+    //              encoder bindings until completion. C++ no longer needs
+    //              to call `gpu_suite->AllocateDeviceMemory` /
+    //              `FreeDeviceMemory` for metadata. This eliminates the
+    //              Rust/C++ boundary lifetime question raised by the
+    //              external review: previously C++ freed metadata
+    //              immediately after this function returned while the
+    //              GPU might still be reading it. Step1.1 (FFI 0x0002_000f)
+    //              also fixed smooth_detect's white_opt / load_strip
+    //              omission for transparent ON cases. See
+    //              PHASE_2A_PREP2B_DESIGN_MEMO.md §10.
+    0x0002_0010
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -532,21 +546,26 @@ mod metal_ffi {
     /// subsequent frames take the CPU path. Caller may pass 0/0 to
     /// opt out of fallen-state propagation (e.g., from unit tests).
     ///
-    /// `metadata_buf` (FFI 0x0002_000f+) is an AE-managed device
-    /// memory pointer of `width * height` bytes (1 byte per pixel),
-    /// allocated by the C++ caller via `PF_GPUDeviceSuite::AllocateDeviceMemory`
-    /// and freed after this call returns. The smooth_detect pass writes
-    /// it; the smooth_per_pixel pass reads it. Must NOT be NULL.
+    /// step1.2 (FFI 0x0002_0010+, 2026-05-05): metadata is Rust-owned,
+    /// allocated inside `dispatch_smooth_chain` via
+    /// `device.new_buffer(StorageModePrivate)`. Caller no longer needs
+    /// to allocate a metadata buffer or pass it through this FFI —
+    /// metal-rs retains the buffer through the cb's encoder bindings,
+    /// so it survives across `commit()` until completion regardless of
+    /// when this function returns. This eliminates the C++/Rust
+    /// boundary lifetime question that was causing FrameTask 517 with
+    /// the FFI 0x0002_000f variant: previously C++ called
+    /// `gpu_suite->FreeDeviceMemory` immediately after this function
+    /// returned while the GPU might still be reading metadata.
     ///
     /// SAFETY: same as dispatch_passthrough — `handle` is a live
-    /// MetalBackend, src/dst/metadata are MTLBuffer pointers from AE's
+    /// MetalBackend, src/dst are MTLBuffer pointers from AE's
     /// GPU suite, pitches are in pixels (= rowbytes/16 for BGRA128).
     #[no_mangle]
     pub unsafe extern "C" fn smooth_core_metal_dispatch_smooth_chain(
         handle: *mut c_void,
         src_buf: *mut c_void,
         dst_buf: *mut c_void,
-        metadata_buf: *mut c_void,
         src_pitch_pixels: u32,
         dst_pitch_pixels: u32,
         width: u32,
@@ -565,7 +584,7 @@ mod metal_ffi {
             Err(_) => return -2,
         };
         let dispatch = backend.dispatch_smooth_chain(
-            &mut ctx, src_buf, dst_buf, metadata_buf,
+            &mut ctx, src_buf, dst_buf,
             src_pitch_pixels, dst_pitch_pixels,
             width, height, logical_width,
             range_f32, white_opt, line_weight,
