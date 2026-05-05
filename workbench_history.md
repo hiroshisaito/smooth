@@ -2690,3 +2690,86 @@ memcpy(scratch, in_ptr, scratch_bytes);
 - AE process 終了時に thread 終了で自動解放
 
 変更箇所: `Effect.cpp` の 1 関数のみ、+`#include <vector>` `<cstdint>` 追加。
+
+### 追記: Render Queue crash report 化と 517 解釈訂正(2026-05-05)
+
+詳細レポートを [`docs/AE_RENDER_QUEUE_CRASH_2026-05-05.md`](docs/AE_RENDER_QUEUE_CRASH_2026-05-05.md) に分離。
+
+重要な訂正: AE SDK 25.6 の `AE_Effect.h` では `PF_Err_INTERNAL_STRUCT_DAMAGED = 512`、`PF_Interrupt_CANCEL = 517`。したがって AE log の `FrameTask threw 517` は internal-struct-damaged ではなくキャンセル/割り込み系の症状として読むべき。build `27f6365` の `Effect.cpp::smoothing()` における大判 scratch buffer の per-call `malloc/free` churn は初期の plugin 側候補だったが、下記の smooth 削除テストで今回の直接原因から除外。HEAD `3eedf86` の `thread_local std::vector<uint8_t>` 化は防御策として残す。
+
+
+### Test 5 FAIL の最終切り分け結果(2026-05-05、Hiroshi さん確認)
+
+**重要決着**: 同じ comp で **smooth エフェクトを削除して Render Queue → 同様にクラッシュ**
+
+→ **plugin 起因ではなく、crash は footage / comp 起因**
+
+#### 判定理由
+
+1. crash dump が完全同一の `dvacore + 0x28ad5` で SIGSEGV(2 回連続、決定論的)
+2. dvacore = Adobe Digital Video Core(media decoder + composition pipeline 含む)
+3. smooth エフェクトを削除しても crash 継続 = plugin 関与なし
+4. Hiroshi さん仮説「フッテージにエラーフレームがある可能性」と整合
+5. codec(H.264 / TIFF / ProRes)/ bpc(8/16/32)完全独立で再現 = decode side の問題
+
+#### v1.6.0 release への影響
+
+**影響なし**。plugin は本問題と無関係。
+
+- Test 1〜4 PASS(About v1.6.0、8/16bpc、32bpc + transparent ON で黄色 ⚠️ なし、32bpc + transparent OFF)
+- Test 5 FAIL は **AE / footage の問題**で plugin と独立
+- thread_local scratch fix(`3eedf86`)は **防御策として残置**(将来の heap pressure 対策、害なし)
+
+#### 残作業
+
+- **健全な test footage で Test 5 再実施**(AE 標準 Solid layer + smooth + Render Queue で動作確認)
+  - PASS → v1.6.0 release 候補確定、Mac zip 化 + SHA256 fill → release 準備完了
+- 元 footage は別 issue として Hiroshi さん側で「source 検査 / re-import / proxy 化」等で対処(plugin 修正は不要)
+
+### Test 5 再実施 PASS(2026-05-05、完全新規 AE project)
+
+**最終原因**: テストに使い回していた AE project の破損。
+
+完全に新しい AE project で Render Queue + MFR を再確認し、正常にレンダリング完走。`KOJI_SMOOTH` の MFR 動作確認も取れた。
+
+**最終判定**:
+- 旧 test project: smooth 有無に関係なく crash → project 破損起因
+- 新規 project: Render Queue + MFR PASS
+- v1.6.0 plugin 側の追加修正不要
+- release UAT Test 5 は PASS に更新
+
+今後のリリース UAT は、使い回し project ではなく新規作成 project / 健全性確認済み project で実施する。
+
+
+### 訂正(2026-05-05、Hiroshi さん再確認)
+
+上記の「smooth 無効でも crash」「footage 起因」は **誤報告**。
+
+**最終真相**:
+- 元 AE project に破損(Project file / Cache / 何らかの内部状態)があり、その固有状態で AE 25.6.5x3 が dvacore 内 deterministic SIGSEGV を起こす
+- **新規 AE Project + smooth 適用 + 32bpc + MFR + Render Queue → 完全動作**
+- **plugin v1.6.0 (`3eedf86`) は問題なし**、release 続行可能
+
+#### release readiness 評価
+
+| Test | 結果 |
+|---|---|
+| Test 1 (About v1.6.0) | PASS(build 27f6365 で確認済)|
+| Test 2 (8/16bpc) | PASS |
+| Test 3 (32bpc + transparent ON、黄色 ⚠️ なし)| PASS |
+| Test 4 (32bpc + transparent OFF) | PASS |
+| Test 5 (新規 project で 32bpc + smooth + MFR + Render Queue)| **PASS** |
+
+→ **v1.6.0 release 候補確定**(`3eedf86`)
+
+#### 残作業
+
+1. Mac universal/arm64/x86_64 binary の build + zip 化
+2. SHA256 取得 → `RELEASE_NOTES-v1.6.0.md` の TBD 実値置換
+3. Windows team へ HEAD `3eedf86` 引き渡し
+4. (別 issue、release blocker ではない)Hiroshi さん側の元 test project の state corruption 調査は別途
+5. (別 issue)thread_local scratch fix(`3eedf86`)は誤った仮説に基づく fix だが defensive code として残置(per-call malloc/free が大量に走る path を回避するのは依然として性能上正しい、害なし)
+
+#### Hiroshi さん作成の external crash report
+
+`docs/AE_RENDER_QUEUE_CRASH_2026-05-05.md`(untracked)に Hiroshi さん側で integration ログとして整理済(本 commit では git に取り込まない、Hiroshi さん判断で別途 add 可)。
