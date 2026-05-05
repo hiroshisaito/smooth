@@ -12,9 +12,9 @@ tests/run_regression.sh   # 28/28 PASS expected
 
 ## Why synthetic, not AE EXR
 
-`docs/PHASE_2A_GPU_RFC.md` §3.2.6 declares the CPU 32bpc implementation
-itself as the reference for v1.6.0-32bpc — there is no independent
-oracle to compare against. With that license, deriving the suite from
+The Phase 2-A.2 design declares the CPU 32bpc implementation itself as
+the reference for v1.6.0-32bpc — there is no independent oracle to
+compare against. With that license, deriving the suite from
 the v1.4.0 inputs (promoted u8/u16 → f32) eliminates two blockers we
 hit during the original Step 4b plan:
 

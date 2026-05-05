@@ -2476,3 +2476,81 @@ C++/Rust 境界を渡る metadata pointer がなくなり、寿命管理は Meta
 - `cargo test --release` 24/24 PASS
 - `xcodebuild -scheme smooth -configuration Release` BUILD SUCCEEDED
 
+
+
+## Phase 2-A.3 prep2c-step1.2 UAT 結果(2026-05-05、commit `bc1d8bc`)
+
+**実測**: AE 警告ダイアログ出現 + smooth 効果視覚不可(transparent のみ機能)。FrameTask 517 が **計 13 件**(d158511 step1.1 Phase B の 3 件から **逆に増加**)。
+
+ログ抜粋(複数 preview cycle):
+- Run 1(2 thread): 20 frames、0 fail、per-thread 0.34s
+- Run 3(2 thread): 20 frames、0 fail、per-thread 1.55s
+- Run 4(3 thread): 11 + **2 fail**、per-thread 1.38s
+- Run 6(4 thread): 6 + **4 fail**、per-thread 0.88s
+- Run 7(3 thread): 8 + **3 fail**、per-thread 0.39s
+- 他多数
+
+**重要観測**:
+- `[smooth GPU] command buffer FAILED` は依然ゼロ → Metal cb 自体は成功、AE 側で 517 化
+- **MFR thread 数と 517 が強く相関**(2 thread = 0 fail、3-4 thread = 多発)
+- time=0 frame でも 517 発生 = 「特に重い frame だけ」では説明できない、AE 全体の time budget / resource tracking が広く引っかかっている
+- d158511(AE-managed metadata、Phase B 3 件) → bc1d8bc(Rust-owned metadata、13 件)= **per-frame `device.new_buffer(StorageModePrivate)` 確保が AE 管理外リソースとして逆に悪化している可能性**
+
+### 外部レビュー第 5 弾(2026-05-05)で得た判定
+
+- bc1d8bc は **FAIL**(judgement matrix で 517 ≥ 3 = step2 進めない)
+- 「C++ 即時 FreeDeviceMemory が主因」仮説は弱まる(metadata lifetime fix で逆に悪化)
+- 支配要因は **workload / AE SmartRender 時間予算 / per-frame direct Metal buffer allocation のいずれか**
+- bc1d8bc を step2 の土台にするのは危険、Rust-owned per-frame allocation 方針自体を要再考
+
+### 次の切り分け(レビュワー推奨)
+
+bc1d8bc のまま env var だけで 2 path 切り分け:
+
+1. `SMOOTH_GPU_MAX_LENGTH=16`、INFLIGHT なし: 517 が大幅に減るなら **workload 主因** → cap 16/24 で step2 設計
+2. `SMOOTH_GPU_MAX_LENGTH=32 SMOOTH_GPU_INFLIGHT_LIMIT=1`: 517 が大幅に減るなら **per-frame allocation / MFR parallel / async lifetime** が絡む → buffer pool or AE-managed (with proper async free) に再 architect
+
+両方とも 517 残るなら → step1.3 metadata 拡張(corner_flg + line lengths を precompute)or prep2a foundation 構造への regress(line blend 削除)を Hiroshi さん判断。
+
+
+## Phase 2-A close 判定 — GPU 中止確定、32bpc CPU only で v1.6.0 出荷(2026-05-05、Hiroshi さん最終決定)
+
+5 回の根本設計 pivot(option (a) / (b) / Path β / step1 metadata / step1.2 Rust-owned)で全て同種の壁(AE/Metal practical envelope の上限 + smooth アルゴリズムの GPU 不適性)に当たり、本セッションの **bc1d8bc step1.2 で 13 × 517** が観測されたことで、線量的にも Phase 2-A.3 GPU 化を継続する根拠が失われた。
+
+**Hiroshi さん判断**:
+- Phase 2-A は **32bpc CPU only で close**
+- v1.6.0 = 32bpc 対応(従来 8/16bpc から f32 path 拡張)
+- **GPU は今後対応しない**(永久撤退、v1.7+ 等での再挑戦も見送り)
+
+**論理的根拠**(納得済):
+- smooth は実装が短くても **GPU が苦手な性質を 4 つ重ねて持つ** アルゴリズム(scatter pattern + 後勝ちセマンティクス + データ依存可変長 loop + AE GPU SDK envelope 外)
+- 「実装が短い ≠ GPU 親和性が高い」 — Photoshop の Pixel-art smoothing 系も CPU only である業界実例と整合
+- prep2a foundation(mode_flg=15 inside だけ)は実機 PASS 確認済だが smooth の主効果は line blend 側にあり、part-GPU では出荷機能として弱い
+
+**ドキュメント整理**(本コミットで実施):
+- `docs/_archive_gpu/` 作成、以下 4 doc を移動 + `.gitignore` で release から除外:
+  - `PHASE_2A_GPU_RESEARCH.md`
+  - `PHASE_2A_GPU_RFC.md`
+  - `PHASE_2A_PREP2B_DESIGN_MEMO.md`
+  - `PHASE_2A_STATUS.md`(GPU 中心の status board のためアーカイブ)
+- 残る tracked doc から GPU 言及を除去:
+  - `README.md`: 「32bpc + GPU 経路の GPU メモリ要件」節削除
+  - `docs/EXTERNAL_REVIEW_REQUEST.md`: GPU 関連の必読 doc 参照、観点、対象外項目を整理
+  - `docs/CAPTURE_32BPC_RUNBOOK.md`: 単一の GPU_RFC 参照を一般化
+- workbench_history.md は **そのまま残す**(GPU 試行の経緯と教訓は将来の参考価値あり、Hiroshi さん明示指示)
+
+**コード側の残課題**(本コミット範囲外、別判断):
+- `Effect.cpp` の `SmartRenderGpu` / `GpuDeviceSetup` / `GpuDeviceSetdown` selector
+- `rust/smooth_core/src/gpu/` モジュール一式(Metal backend + FFI + tests)
+- `rust/smooth_core/include/smooth_core_ffi.h` の Mac Metal FFI 群
+- これらは v1.6.0 出荷前に削除するか、dormant として残置するか Hiroshi さん判断待ち
+
+**v1.6.0 出荷前の残作業(暫定リスト)**:
+- (a) GPU コード削除 or dormant 化判断
+- (b) Phase 2-A.2 Step 5(Win cross-platform 32bpc 検証)実施
+- (c) v1.6.0 RELEASE_NOTES 作成
+- (d) version.h を 1.5.0 → 1.6.0 bump
+- (e) Mac/Win 両方で AE 2025 実機 32bpc 動作確認
+- (f) GitHub Release 作成 + 配布 zip
+
+Phase 2-A.3 GPU 関連の試行ログ(本セッション以前の prep2b.2a foundation PASS から step1.2 FAIL まで)は本ファイル内に時系列で残存。再挑戦時の前提として将来参照可能。

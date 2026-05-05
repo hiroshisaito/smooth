@@ -24,8 +24,8 @@
   - C++/Rust FFI(`rust/smooth_core/include/smooth_core_ffi.h`)
 - 履歴: Phase 1 で C++ コアを Rust 移植 + rayon 並列化 → v1.5.0 出荷。
   Phase 2-B で MFR(Multi-Frame Rendering)対応 → v1.5.1 出荷。
-  現在は **Phase 2-A** で SmartRender + 32bpc + GPU 化(Mac Metal / Win CUDA)を
-  進めて **v1.6.0** 出荷を目指している段階。
+  現在は **Phase 2-A** で SmartRender + 32bpc 対応を進めて **v1.6.0** 出荷
+  (CPU only)を目指している段階。
 
 ## 2. アーキテクチャ概観
 
@@ -47,7 +47,6 @@ rust/smooth_core/ (staticlib)
   ├── preprocess.rs     白抜き + bbox 検出
   ├── process.rs        スキャン + ブレンド
   ├── types.rs          SmoothPixel / SmoothScalar trait
-  ├── gpu/              GPU backend trait + Metal / CUDA stub(Phase 2-A.3 進行中)
   └── tests             cargo test 15 cases
 ```
 
@@ -57,9 +56,6 @@ rust/smooth_core/ (staticlib)
   serial に切替可能、回帰テストで両モード PASS が要件)。
 - SmartRender(AE の 2 段階 PreRender → Render 経路)対応は Phase 2-A.1 で完了、
   legacy `Render` は後方互換のため残置。
-- GPU 経路は **32bpc 専用**(`PF_OutFlag2_SUPPORTS_GPU_RENDER_F32` のみ存在、
-  8/16bpc 用の GPU flag は SDK にない)。Mac Metal を先行実装、Win CUDA を
-  後追いする計画。
 
 ## 3. テスト・回帰戦略
 
@@ -73,7 +69,7 @@ rust/smooth_core/ (staticlib)
 - **manifest schema** (`tests/goldens/<suite>/manifest.toml`): `mac_reference_policy`
   (Mac CPU bit-identical)と `cross_platform_policy`(Mac↔Win 許容)を分離し、
   per-frame `policy_overrides` で例外を表現(frame 135 の Phase 1 strip-parallel
-  境界残差が代表例)。schema は [`docs/PHASE_2A_GPU_RFC.md` §3.2.6](PHASE_2A_GPU_RFC.md) で固定。
+  境界残差が代表例)。Phase 2-A.2 Step 3 で確定。
 - **fixture の所在**: `tests/goldens/<suite>/*.raw` は `.gitignore` で commit 除外
   (1 suite あたり 502 MB 〜 1 GB 級)、`manifest.toml` のみ tracked。
   fresh clone から `tests/fetch_goldens.sh` または `tests/synthesize_32bpc_goldens.sh`
@@ -85,32 +81,16 @@ rust/smooth_core/ (staticlib)
 レビュアーは以下を **この順** で読むことを強く推奨:
 
 1. [`README.md`](../README.md) — プラグインの利用者向け概要(短い)
-2. **[`docs/PHASE_2A_GPU_RFC.md`](PHASE_2A_GPU_RFC.md)** — Phase 2-A 全体の設計 RFC
-   (1066 行、必須)。特に下記節:
-   - §1 Summary(目的・スコープ・出荷形態・非目標)
-   - §2 確定事項(ステージ分割 / Framework 選定 / Fallback policy /
-     2 層分離データ構造 / UI / Reference 実装)
-   - §3.1 Phase 2-A.1 SmartRender、§3.2 Phase 2-A.2 32bpc、§3.3 Phase 2-A.3 GPU
-     のうち、レビュー対象の Phase 節を精読
-   - §3.3.7 Sub-stage E (Win CUDA) pre-flight design-freeze checkpoint
-     (Win CUDA 着手前の設計凍結ルール)
-   - §4 Spike 項目(実測で決着させた研究結果)
-   - §5 Risks / Fallback 出荷パス
-3. [`docs/PHASE_2A_STATUS.md`](PHASE_2A_STATUS.md) — 進捗ボード。**現在地** と
-   各 Step の ✅ / 🟡 / ⬜ 表示でレビュー対象範囲を確認できる
-4. [`docs/PHASE_2A_GPU_RESEARCH.md`](PHASE_2A_GPU_RESEARCH.md) — RFC の根拠と
-   なった事前研究。RFC 中で `研究 doc §X.Y` と参照されている箇所の
-   出典なので、該当箇所だけスポット参照すれば足りる
-5. [`docs/CAPTURE_32BPC_RUNBOOK.md`](CAPTURE_32BPC_RUNBOOK.md) — 32bpc goldens の
+2. [`docs/CAPTURE_32BPC_RUNBOOK.md`](CAPTURE_32BPC_RUNBOOK.md) — 32bpc goldens の
    取得 / 再生成手順(Phase 2-A.2 関連レビュー時のみ必要)
-6. **[`workbench_history.md`](../workbench_history.md)** — 1700+ 行の作業ログ。
+3. **[`workbench_history.md`](../workbench_history.md)** — 作業ログ。
    各 Phase / Step の実施記録 + 失敗例 + 根拠付きの設計判断。
    レビュー対象 Step の節を **時系列で前後 1〜2 Step 分** 読むと文脈が掴める
-   (「なぜこの選択をしたか」が RFC ではなくここに残っている例が多い)
-7. レビュー対象のコード差分(個別レビューの「対象範囲」節で指定)
+   (「なぜこの選択をしたか」がここに残っている例が多い)
+4. レビュー対象のコード差分(個別レビューの「対象範囲」節で指定)
 
-依頼書を渡された段階で 1〜4 と必要な 6 を読み終え、設計判断の why が
-理解できるようになっていることを期待。読了所要は初回 2〜3 時間程度。
+依頼書を渡された段階で 1〜3 を読み終え、設計判断の why が理解できる
+ようになっていることを期待。読了所要は初回 1〜2 時間程度。
 
 ## 5. レビュー観点の優先度
 
@@ -121,8 +101,6 @@ rust/smooth_core/ (staticlib)
 | 高 | 並列化の正当性 | rayon strip-parallel の境界残差、`SMOOTH_PARALLEL=0` で deterministic、frame 135 NEAR-ID の根拠 |
 | 高 | 32bpc f32 ハンドリング | overbright (>1.0) / NaN / Inf / subnormal の各経路、AE の max_value=1.0 仮定 |
 | 中 | regression coverage | manifest schema 整合、fixture 再生成性、tolerance 設定の妥当性 |
-| 中 | GPU backend 設計 | GpuBackend trait が Mac Metal / Win CUDA / future DX12 の差異を吸収できる形か(Phase 2-A.3 進行中なので未完) |
-| 中 | once-fallen-always-fall fallback | sequence_data UUID + DashMap の 2 層構造、SETUP/RESETUP 区間 sticky の実装妥当性 |
 | 低 | コード品質 / コメント | 名前付け、コメントの過不足、テスト用 tooling の robust 度 |
 
 ## 6. レビュー対象範囲(個別依頼ごとに記入)
@@ -161,7 +139,6 @@ rust/smooth_core/ (staticlib)
 ## 8. レビュー対象外(外部リソースを使わせない範囲)
 
 - 8/16bpc コア演算アルゴリズム(Phase 1 で確定済み、本範囲では touch しない)
-- Win CUDA 実装(Phase 2-A.3 Sub-stage E、未着手)
 - AE SDK そのもののバグ報告(Adobe 側 issue tracker で扱う)
 - パフォーマンス最適化(機能 freeze 後に別途)
 - shipping パッケージング / コードサイニング / インストーラ

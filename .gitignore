@@ -18,11 +18,10 @@
 # the canonical schema + 14-frame parameter seed).
 /tests/capture_config_32bpc.toml
 
-# Phase 2-A.2 Step 3: goldens are NOT committed (502 MB+ per suite — see
-# docs/PHASE_2A_GPU_RFC.md §3.2.5 sizing rationale). Layout: keep the parent
-# tracked, ignore everything inside, then carve back out the per-suite
-# manifest files. The unignore order matters — Git does not descend into a
-# fully-ignored parent, so the parent + per-suite directories must be
+# Phase 2-A.2 Step 3: goldens are NOT committed (502 MB+ per suite). Layout:
+# keep the parent tracked, ignore everything inside, then carve back out the
+# per-suite manifest files. The unignore order matters — Git does not descend
+# into a fully-ignored parent, so the parent + per-suite directories must be
 # explicitly unignored before the manifest pattern can take effect.
 !/tests/goldens/
 /tests/goldens/**
@@ -32,3 +31,8 @@
 
 # Phase 2-A Sub-stage A disposable PoC (lives at ../smooth-spike-poc/, symlinked)
 /spike-poc
+
+# Phase 2-A.3 GPU 関連ドキュメント(2026-05-05 中止確定、Phase 2-A は 32bpc CPU only で
+# close)。当時の設計 RFC / 調査ノート / status / prep2b design memo を local 参照用に
+# 保持(workbench_history.md からの参照価値はあるが repo には載せない)。
+/docs/_archive_gpu/
