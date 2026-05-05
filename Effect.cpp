@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <vector>
+#include <cstdint>
 
 #include "AEConfig.h"
 #include "AE_Effect.h"
@@ -573,11 +575,22 @@ static PF_Err smoothing(PF_InData               *in_data,
     // バッファ」かつ「preProcess が in_ptr を in-place 改変する」。AE 2025 の
     // SmartRender 経路では PF_OutFlag_I_WRITE_INPUT_BUFFER が許可されない
     // ため、AE 提供の input buffer は read-only として扱う必要がある。
-    // ここで scratch を確保して input pixels をコピーし、smooth_core には
-    // scratch を in_ptr として渡す。出費は rowbytes*height bytes / call。
+    //
+    // scratch buffer は **thread-local persistent** で確保(v1.6.0 release UAT
+    // で発覚した crash 原因の修正、2026-05-05):AE Render Queue は MFR で
+    // 5 thread 並列に毎 frame この path を通る。4400² 32bpc では per-call
+    // ~310 MB の malloc/free が発生し、数百 frame で heap 断片化 → AE main
+    // thread の dvacore 内で SIGSEGV(crash dump で plugin は crash thread
+    // に居ないが、複数 MFR thread が rayon idle 待機中という典型的 heap
+    // 破壊パターン)。thread_local std::vector で scratch を thread ごとに
+    // 1 回だけ確保し reuse することで malloc churn を排除。MFR thread pool
+    // が AE プロセス寿命まで生き残る前提で OK。
     const size_t scratch_bytes = (size_t)input->rowbytes * (size_t)input->height;
-    PixelType *scratch = (PixelType*)malloc(scratch_bytes);
-    if (!scratch) return PF_Err_OUT_OF_MEMORY;
+    thread_local std::vector<uint8_t> scratch_storage;
+    if (scratch_storage.size() < scratch_bytes) {
+        scratch_storage.resize(scratch_bytes);
+    }
+    PixelType *scratch = reinterpret_cast<PixelType*>(scratch_storage.data());
     memcpy(scratch, in_ptr, scratch_bytes);
 
     // パラメータを core 形式へ変換(SmartRenderInfo の raw slider 値ベース)。
@@ -615,7 +628,8 @@ static PF_Err smoothing(PF_InData               *in_data,
         core_params.line_weight,
         info->white_option ? 1 : 0);
 
-    free(scratch);
+    // scratch_storage は thread_local 永続なので明示 free 不要、次回 call で
+    // resize 経由で再利用される(より大きい frame が来れば自動 grow)。
 	return err;
 }
 

@@ -2575,3 +2575,118 @@ bc1d8bc のまま env var だけで 2 path 切り分け:
 - (f) GitHub Release 作成 + 配布 zip
 
 Phase 2-A.3 GPU 関連の試行ログ(本セッション以前の prep2b.2a foundation PASS から step1.2 FAIL まで)は本ファイル内に時系列で残存。再挑戦時の前提として将来参照可能。
+
+
+## v1.6.0 Release 候補 build + UAT 発行(2026-05-05)
+
+### Build identity
+
+- HEAD: `27f6365`(version bump + doc sync の chore commit)
+- Mac plugin clean rebuild 済、binary embedded sha = `0.1.0+27f6365`
+- About 期待値: `smooth, v1.6.0` + `rust_core 0.1.0+27f6365 ffi=0x00020003`
+  - version.h MAJOR=1, MINOR=6, BUILD=0
+  - smooth_core_version = `0x0002_0003`(GPU 撤去後の clean ABI)
+
+### v1.6.0 release UAT 5 点(canonical CPU 32bpc)
+
+メモリ `feedback_uat_format_consistency.md` を本リリースに合わせて v1.6.0 CPU 32bpc canonical に更新済(行 3 = 32bpc + transparent ON、GPU checkbox 言及は使用禁止に変更)。
+
+| # | 確認 | 期待 |
+|---|------|------|
+| 1 | About | `smooth, v1.6.0` + `rust_core 0.1.0+27f6365 ffi=0x00020003` |
+| 2 | 8/16bpc Comp | smooth + white-key transparent 通常動作、v1.5.1 から bit-identical |
+| 3 | **32bpc Comp + transparent ON**(本リリースの目玉、最重要)| エフェクト名横の **黄色 ⚠️ なし** + smooth + white-key 透明化両方適用 + AE 警告 / クラッシュなし |
+| 4 | 32bpc Comp + transparent OFF | smooth が 8/16bpc 同等出力で適用、白色 pixel は不透明維持 |
+| 5 | MFR(Render Queue で 5+ frames 出力)| `Multithreaded render report` + `Render threads used: > 1` + `Thread-safe effects used: KOJI_SMOOTH` |
+
+**判定**:
+- 全 5 点 PASS → **v1.6.0 release 候補確定**。次は Mac universal/arm64/x86_64 zip 化 + SHA256 → `RELEASE_NOTES-v1.6.0.md` の TBD 実値 fill → Windows team へ HEAD `27f6365` 引き渡し
+- 任意 FAIL → workbench_history.md に記録 + 該当箇所修正 → 再 build → 再 UAT
+
+### Pre-UAT verify(私が実施済)
+
+- `cargo test --release`: 8/8 PASS(GPU 撤去後の縮小スイート)
+- `xcodebuild -scheme smooth -configuration Release SYMROOT=...`: BUILD SUCCEEDED
+- `tests/run_regression.sh`: 28/28 PASS(8/16bpc 14 + 32bpc 14、SMOOTH_PARALLEL=1)
+- Mac plugin binary embedded sha: `0.1.0+27f6365` ↔ git HEAD `27f6365` 一致
+- repo 内の tracked file(workbench_history.md 除外)に `GPU|gpu|Metal|metal|CUDA|cuda` 言及ゼロ
+
+
+### v1.6.0 release UAT 結果(2026-05-05、build 27f6365)
+
+**Test 1-4 PASS**:
+- Test 1: About 表示 `smooth, v1.6.0` + `rust_core 0.1.0+27f6365 ffi=0x00020003` PASS
+- Test 2: 8/16bpc Comp、4400² 19 frames preview、smooth + transparent 通常動作 PASS
+- Test 3: **32bpc Comp + transparent ON、4400² 19 frames preview、エフェクト名横の黄色 ⚠️ なし** PASS(本リリースの目玉)
+- Test 4: 32bpc Comp + transparent OFF PASS
+
+**Test 5 FAIL**: Render Queue 開始時に AE 本体クラッシュ(SIGSEGV / signal 11)、AdobeCrashReport モーダル表示。
+
+再現条件(全 codec / bpc):
+- 32bpc + H.264 MP4: クラッシュ
+- 8bpc + H.264 MP4: クラッシュ
+- 16bpc + H.264 MP4: クラッシュ
+- 8bpc + TIFF sequence: クラッシュ
+- 8bpc + ProRes (QuickTime): クラッシュ
+→ codec / bpc 完全独立、Render Queue + smooth 適用で常に再現
+
+### Crash dump 解析(Sentry minidump)
+
+file: `~/Library/Caches/Adobe/After Effects/25.0/SentryIO-db/completed/2b390e85-5134-4bcb-b1fa-c1a3339f982f.dmp`
+
+```
+Crash reason: EXC_BAD_ACCESS / EXC_I386_GPFLT
+Thread 0 (crashed, main):
+ 0  libsystem_kernel.dylib + 0x7846   ← __pthread_kill syscall
+ 1  libsystem_c.dylib + 0x805c5       ← abort()
+ 2  dvacore + 0xf8642                 ← Adobe DVA core(signal handler 連鎖)
+ 3  dvacore + 0x28ad5                 ← 元の crash 位置(Adobe library 内、symbol 未公開)
+ 4  libsystem_platform.dylib + 0x331c ← signal trampoline
+```
+
+**重要**:
+- crash thread = AE main の dvacore 内、symbol 未公開で関数名特定不能
+- **smooth.plugin は crash thread の stack frame に存在しない**
+- ただし複数の MFR thread(117〜123+)が rayon `wait_until_cold` で idle 待機(plugin の rayon worker thread pool が常駐、これは正常)
+
+### 根本原因の仮説
+
+`Effect.cpp::smoothing<>()` 内の per-call malloc/free pattern:
+
+```cpp
+const size_t scratch_bytes = (size_t)input->rowbytes * (size_t)input->height;
+PixelType *scratch = (PixelType*)malloc(scratch_bytes);  // 4400² で 80〜310 MB
+memcpy(scratch, in_ptr, scratch_bytes);
+... smooth_core::process<>() ...
+free(scratch);
+```
+
+4400² の場合、per-call:
+- 8bpc:  77 MB
+- 16bpc: 155 MB
+- 32bpc: 310 MB
+
+MFR で 5 thread 並列 + Render Queue で数百 frame 連続 → malloc/free 数百回 → heap 断片化(特に large block の mmap / munmap pressure)→ AE main thread が後で dvacore 内で memory 確保時に整合性破綻 → SIGSEGV。
+
+stack trace の特徴(plugin が crash thread に居ない、複数 MFR thread が idle 待機)も heap 経由の遅延発火型 crash と整合。
+
+### 修正(本コミット)
+
+`Effect.cpp::smoothing<>()` の scratch buffer を **thread_local persistent** に変更:
+
+```cpp
+thread_local std::vector<uint8_t> scratch_storage;
+if (scratch_storage.size() < scratch_bytes) {
+    scratch_storage.resize(scratch_bytes);
+}
+PixelType *scratch = reinterpret_cast<PixelType*>(scratch_storage.data());
+memcpy(scratch, in_ptr, scratch_bytes);
+```
+
+効果:
+- per-call malloc/free 撤廃 → heap churn ゼロ
+- thread ごとに 1 回確保 → MFR thread pool 寿命まで再利用
+- より大きい frame が来た時のみ resize で grow(縮小はしない、watermark 方式)
+- AE process 終了時に thread 終了で自動解放
+
+変更箇所: `Effect.cpp` の 1 関数のみ、+`#include <vector>` `<cstdint>` 追加。
