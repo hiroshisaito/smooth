@@ -64,14 +64,17 @@ pub struct MetalBackend {
     /// were observed to occasionally trip AE's "smooth did not render
     /// anything" warning under MFR + 4K + memory pressure.
     pipeline_combined: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2c (Path β v2): per-output writer
-    /// selection kernel for mode_flg=15 outside line blends. Each
-    /// thread = one output pixel; the thread scans 4 cardinal rays for
-    /// candidate centres that might write to this pixel, picks the CPU
-    /// row-major last-writer, and writes that writer's blend value.
-    /// No atomics, no intermediate buffers — replaces the prior option
-    /// (b) atomic_min priority chain (which FAILed at real-device UAT).
-    pipeline_blend_mode15_outside_per_output: ComputePipelineState,
+    /// Sub-stage C-2.5b.2-prep2c (Path β v2 retry): unified per-pixel
+    /// kernel that handles outside writer selection + mode_flg=15
+    /// inside (4-corner avg) + identity passthrough in ONE thread.
+    /// Each thread writes dst exactly once. Replaces the earlier
+    /// 2-kernel design (smooth_combined + outside_per_output) which
+    /// FAILed at real-device UAT — likely because the second kernel
+    /// only conditionally wrote dst, confusing AE's render tracking.
+    /// SDK_Invert_ProcAmp pattern uses 1 kernel writing dst (or
+    /// multiple kernels each writing DIFFERENT buffers); this kernel
+    /// matches that pattern.
+    pipeline_per_pixel: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -111,8 +114,8 @@ impl MetalBackend {
             let pipeline_detect         = build_pipeline(&device, &library, "smooth_detect")?;
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
-            let pipeline_blend_mode15_outside_per_output =
-                build_pipeline(&device, &library, "smooth_blend_mode15_outside_per_output")?;
+            let pipeline_per_pixel =
+                build_pipeline(&device, &library, "smooth_per_pixel")?;
 
             Ok(MetalBackend {
                 device,
@@ -122,7 +125,7 @@ impl MetalBackend {
                 pipeline_detect,
                 pipeline_blend,
                 pipeline_combined,
-                pipeline_blend_mode15_outside_per_output,
+                pipeline_per_pixel,
             })
         })
     }
@@ -142,8 +145,8 @@ impl MetalBackend {
             let pipeline_detect         = build_pipeline(&device, &library, "smooth_detect")?;
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
-            let pipeline_blend_mode15_outside_per_output =
-                build_pipeline(&device, &library, "smooth_blend_mode15_outside_per_output")?;
+            let pipeline_per_pixel =
+                build_pipeline(&device, &library, "smooth_per_pixel")?;
             Ok(MetalBackend {
                 device,
                 queue,
@@ -152,7 +155,7 @@ impl MetalBackend {
                 pipeline_detect,
                 pipeline_blend,
                 pipeline_combined,
-                pipeline_blend_mode15_outside_per_output,
+                pipeline_per_pixel,
             })
         })
     }
@@ -280,28 +283,24 @@ impl MetalBackend {
         })
     }
 
-    /// Sub-stage C-2.5b.2-prep2c (Path β v2): smooth chain dispatcher
-    /// with per-output writer selection for mode_flg=15 line blends.
-    /// Runs 2 passes within a single command buffer:
-    ///   1. smooth_combined — preprocess + detect + mode_flg=15 inside
-    ///      (centre 4-corner avg). All other mode_flg values pass
-    ///      through from src.
-    ///   2. smooth_blend_mode15_outside_per_output — for each output
-    ///      pixel, scan 4 cardinal rays for candidate centres that
-    ///      would write here via link8_square_blend_outside in CPU
-    ///      scan order, pick the row-major last-writer, write that
-    ///      writer's blend value. Pixels not written by any outside
-    ///      blend are left untouched (smooth_combined's output kept).
+    /// Sub-stage C-2.5b.2-prep2c (Path β v2 retry): smooth chain
+    /// dispatcher using ONE unified kernel `smooth_per_pixel`. Each
+    /// thread = 1 output pixel; the kernel handles outside writer
+    /// selection + mode_flg=15 inside (4-corner avg) + identity
+    /// passthrough in a single thread, writing dst exactly once.
     ///
-    /// No atomics, no intermediate buffers — replaces the option (b)
-    /// atomic_min priority chain (which FAILed at real-device UAT).
+    /// History: the previous 2-kernel design (smooth_combined +
+    /// smooth_blend_mode15_outside_per_output) ran in 2 separate
+    /// compute encoders — both wrote dst — and AE flagged "smooth did
+    /// not render anything" despite the kernels completing without
+    /// errors. SDK_Invert_ProcAmp.cpp uses 1 kernel writing dst (or
+    /// multiple kernels writing DIFFERENT buffers); the unified
+    /// per-pixel kernel matches that pattern minimally.
     ///
-    /// This call ALSO captures async command buffer errors via
-    /// `add_completed_handler` and propagates a non-zero return back to
-    /// the FFI caller so silent fails fall through to mark_fallen.
-    /// (Earlier prep2b.2b versions returned Ok(()) immediately after
-    /// commit() — GPU-side timeouts / failures went undetected and
-    /// triggered "GPU では smooth 効果なし" silent fail in UAT.)
+    /// No atomics, no intermediate buffers, 1 dispatch. Maximum AE/Metal
+    /// compatibility. Trade-off: per-pixel cost is bounded by 4 ×
+    /// MAX_LENGTH cardinal-ray scans (worst case ~540K ops/pixel,
+    /// average much less due to early break on first match per block).
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
@@ -341,32 +340,13 @@ impl MetalBackend {
                 1,
             );
 
-            // Pass 1: combined — preprocess + detect + mode_flg=15
-            // inside (centre 4-corner avg). Writes dst for every pixel.
+            // Single unified per-pixel kernel: handles outside writer
+            // selection + mode_flg=15 inside + identity passthrough,
+            // writing dst exactly once per thread. Mirrors
+            // SDK_Invert_ProcAmp's 1-kernel-writes-dst pattern.
             {
                 let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_combined);
-                enc.set_buffer(0, Some(src), 0);
-                enc.set_buffer(1, Some(dst), 0);
-                enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &range_f32 as *const f32 as *const c_void);
-                enc.set_bytes(8, 4, &white_opt as *const u32 as *const c_void);
-                enc.dispatch_thread_groups(groups, group);
-                enc.end_encoding();
-            }
-
-            // Pass 2: per-output writer selection for mode_flg=15
-            // outside line blends. Conditionally overwrites dst at
-            // pixels that are written by some outside-block call from
-            // a nearby mode_flg=15 centre. Pixels not touched are left
-            // as smooth_combined wrote them.
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_blend_mode15_outside_per_output);
+                enc.set_compute_pipeline_state(&self.pipeline_per_pixel);
                 enc.set_buffer(0, Some(src), 0);
                 enc.set_buffer(1, Some(dst), 0);
                 enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);

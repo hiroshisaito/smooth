@@ -48,7 +48,16 @@ pub extern "C" fn smooth_core_version() -> u32 {
     //              the 0x0002_0009..0x0002_000b versions were issued for the
     //              option (b) variants and are now historical / not callable.
     //              See docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §7 for rationale.
-    0x0002_000c
+    // 0x0002_000d: dispatch_smooth_chain consolidated to ONE kernel (smooth_per_pixel)
+    //              that handles outside writer selection + mode_flg=15 inside +
+    //              identity passthrough in a single thread, writing dst exactly
+    //              once. The earlier Path β v2 variant (0x0002_000c) had 2
+    //              kernels both writing dst — AE flagged "smooth did not render
+    //              anything" despite kernels completing. SDK_Invert_ProcAmp
+    //              pattern uses 1 kernel writing dst (or multi-kernel writing
+    //              DIFFERENT buffers); this variant matches the SDK pattern.
+    //              FFI signature unchanged from 0x0002_000c.
+    0x0002_000d
 }
 
 /// Human-readable build identity, captured at Rust crate build time by

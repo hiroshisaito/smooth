@@ -586,9 +586,27 @@ inline WriterCandidate try_block_candidate(
     return updated;
 }
 
-kernel void smooth_blend_mode15_outside_per_output(
+// smooth_per_pixel: SOLE production kernel for the GPU smooth path
+// (replaces the prior 2-kernel chain smooth_combined → outside_per_output).
+//
+// Each thread = one output pixel. The thread:
+// 1. Searches Block 2 then Block 1 for outside writers LATER than self-inside
+//    in CPU scan order (cy > py, or cy=py with cx>px).
+// 2. If no later outside found, checks if THIS pixel is a mode_flg=15 centre
+//    (would do its own inside 4-corner avg write).
+// 3. If neither, searches Block 3 then Block 4 for EARLIER outside writers
+//    (since they're the only writers when no later writer exists).
+// 4. Writes dst exactly once based on the chosen writer (or src passthrough).
+//
+// This replaces the earlier 2-kernel design (smooth_combined + outside_per_output)
+// where AE flagged "smooth did not render anything" — likely because the second
+// kernel only conditionally wrote dst, confusing AE's render tracking. SDK
+// pattern (SDK_Invert_ProcAmp.cpp) uses 1 kernel writing dst, OR multiple
+// kernels but each writing DIFFERENT buffers. Consolidating to 1 kernel is the
+// minimum-risk pattern aligned with the SDK.
+kernel void smooth_per_pixel(
     device const float4* src           [[buffer(0)]],  // BGRA128 input
-    device float4*       dst           [[buffer(1)]],  // BGRA128 output (overwrite)
+    device float4*       dst           [[buffer(1)]],  // BGRA128 output (every pixel written)
     constant uint&       src_pitch     [[buffer(2)]],
     constant uint&       dst_pitch     [[buffer(3)]],
     constant uint&       width         [[buffer(4)]],
@@ -603,6 +621,10 @@ kernel void smooth_blend_mode15_outside_per_output(
     const int px = int(gid.x);
     const int py = int(gid.y);
 
+    // Default output: src[me] with white-strip applied (passthrough case).
+    const float4 src_me = src[uint(py) * src_pitch + uint(px)];
+    float4 out = load_strip(src_me, white_opt);
+
     WriterCandidate best;
     best.found = false;
     best.ref_off_x = 0;
@@ -611,11 +633,8 @@ kernel void smooth_blend_mode15_outside_per_output(
     best.last = 0;
     best.len = 0.0f;
 
-    // Block 2 priority (LARGEST cy): centres at (px, py+1+k)
-    //   in_target = (cx, cy-1) = (px, py+k), step = (0, -1) [upward]
-    //   sub-variants: flg & 1 → ref_off = (-1, 0) [left], flg & 2 → (1, 0) [right]
-    //   block fires: (flg & 0x3) != 0x3
-    //   scan: min=1, max=height-2, limit_from_here = cy
+    // ===== Phase 1: Block 2 (cy > py) — LATER than self-inside =====
+    // Centres at (px, py+1+k). Scan k=MAX-1 down (largest cy first).
     for (int k = SMOOTH_MAX_LENGTH - 1; k >= 0; k--) {
         const int cx = px;
         const int cy = py + 1 + k;
@@ -634,11 +653,8 @@ kernel void smooth_blend_mode15_outside_per_output(
         if (trial.found) { best = trial; break; }
     }
 
-    // Block 1 priority (cy = py, LARGEST cx > px): centres at (px+1+k, py)
-    //   in_target = (cx-1, cy) = (px+k, py), step = (-1, 0) [leftward]
-    //   sub-variants: flg & 1 → ref_off = (0, -1) [up], flg & 8 → (0, 1) [down]
-    //   block fires: (flg & 0x9) != 0x9
-    //   scan: min=1, max=width-2, limit_from_here = cx
+    // ===== Phase 1: Block 1 (cy=py, cx > px) — LATER than self-inside =====
+    // Centres at (px+1+k, py). Scan k=MAX-1 down (largest cx first).
     if (!best.found) {
         for (int k = SMOOTH_MAX_LENGTH - 1; k >= 0; k--) {
             const int cx = px + 1 + k;
@@ -659,29 +675,30 @@ kernel void smooth_blend_mode15_outside_per_output(
         }
     }
 
-    // Block 3 priority (cy = py, LARGEST cx < px = highest among block 3):
-    //   centres at (px-1-k, py)
-    //   in_target = (cx+1, cy) = (px-k, py), step = (1, 0) [rightward]
-    //   sub-variants: flg & 2 → ref_off = (0, -1) [up], flg & 4 → (0, 1) [down]
-    //   block fires: (flg & 0x6) != 0x6
-    //   scan: min=1, max=width-2, limit_from_here = cx
-    //
-    // Note: within block 3 with cy=py, candidates have cx = px-1-k. Larger
-    // k means smaller cx (farther left). For best WITHIN block 3 we want
-    // LARGEST cx, which is k=0 (cx=px-1). But block 3 winners are dominated
-    // by block 1 winners (cx > px) when both exist — so we only get here
-    // when no block 1 winner exists. Within block 3 we still scan k=127
-    // downward for consistency, but the FIRST k tested is k=127 which is
-    // the SMALLEST cx — opposite of what we want.
-    //
-    // To get largest cx within block 3 first, scan k = 0 upward and break
-    // on first match. This finds the CLOSEST centre that writes us, which
-    // has the largest cx within block 3.
+    // ===== Phase 2: My own inside (mode_flg=15 4-corner avg) =====
+    // Only relevant when no later outside writer exists. Inside is later
+    // than block 3 / block 4 candidates so it dominates them.
+    bool   is_inside  = false;
+    uint   inside_flg = 0u;
     if (!best.found) {
+        const uint flg_self = compute_centre_flg_15(
+            src, src_pitch, uint(px), uint(py),
+            logical_width, height, range, white_opt);
+        if (flg_self != 0xFFu) {
+            is_inside  = true;
+            inside_flg = flg_self;
+        }
+    }
+
+    // ===== Phase 3: Block 3 (cy=py, cx<px) then Block 4 (cy<py) =====
+    // Only when no later outside AND not self-inside.
+    if (!best.found && !is_inside) {
+        // Block 3: centres at (px-1-k, py). Scan k=0 up (largest cx
+        // within block 3 = closest to me).
         for (int k = 0; k < SMOOTH_MAX_LENGTH; k++) {
             const int cx = px - 1 - k;
             const int cy = py;
-            if (cx < 1) break;  // out-of-range, no further candidates
+            if (cx < 1) break;
             WriterCandidate trial = try_block_candidate(
                 best, src, src_pitch,
                 cx, cy, k, /*block_id*/ 3,
@@ -695,72 +712,68 @@ kernel void smooth_blend_mode15_outside_per_output(
                 range, white_opt, line_weight);
             if (trial.found) { best = trial; break; }
         }
-    }
-
-    // Block 4 priority (SMALLEST cy < py): centres at (px, py-1-k)
-    //   in_target = (cx, cy+1) = (px, py-k), step = (0, 1) [downward]
-    //   sub-variants: flg & 4 → ref_off = (1, 0) [right], flg & 8 → (-1, 0) [left]
-    //   block fires: (flg & 0xc) != 0xc
-    //   scan: min=1, max=height-2, limit_from_here = cy
-    //
-    // Same closest-first logic as block 3: largest cy within block 4 is
-    // k=0 (cy = py-1). Scan k=0 upward.
-    if (!best.found) {
-        for (int k = 0; k < SMOOTH_MAX_LENGTH; k++) {
-            const int cx = px;
-            const int cy = py - 1 - k;
-            if (cy < 1) break;
-            WriterCandidate trial = try_block_candidate(
-                best, src, src_pitch,
-                cx, cy, k, /*block_id*/ 4,
-                /*flg1*/  1, 0, 4u,
-                /*flg2*/ -1, 0, 8u,
-                /*block_fire_mask*/ 0xcu,
-                /*target*/ cx, cy + 1,
-                /*step*/   0, 1,
-                /*scan*/   1, int(height) - 2, cy,
-                width, height, logical_width,
-                range, white_opt, line_weight);
-            if (trial.found) { best = trial; break; }
+        // Block 4: centres at (px, py-1-k). Scan k=0 up (largest cy
+        // within block 4 = closest above me).
+        if (!best.found) {
+            for (int k = 0; k < SMOOTH_MAX_LENGTH; k++) {
+                const int cx = px;
+                const int cy = py - 1 - k;
+                if (cy < 1) break;
+                WriterCandidate trial = try_block_candidate(
+                    best, src, src_pitch,
+                    cx, cy, k, /*block_id*/ 4,
+                    /*flg1*/  1, 0, 4u,
+                    /*flg2*/ -1, 0, 8u,
+                    /*block_fire_mask*/ 0xcu,
+                    /*target*/ cx, cy + 1,
+                    /*step*/   0, 1,
+                    /*scan*/   1, int(height) - 2, cy,
+                    width, height, logical_width,
+                    range, white_opt, line_weight);
+                if (trial.found) { best = trial; break; }
+            }
         }
     }
 
-    // No writer touches this output pixel — leave dst unchanged (the
-    // smooth_combined kernel already wrote either passthrough or the
-    // mode_flg=15 inside 4-corner avg).
-    if (!best.found) return;
+    // ===== Output =====
+    if (best.found) {
+        // Outside writer (block 2/1/3/4): blend_line value at iter t.
+        float pre_ratio;
+        if (best.t == 0) {
+            pre_ratio = 0.0f;
+        } else {
+            const int t_prev = best.t - 1;
+            const float l_prev = best.len - float(best.last - t_prev);
+            pre_ratio = (l_prev * l_prev * 0.25f) / best.len;
+        }
+        const float l = best.len - float(best.last - best.t);
+        const float ratio = (l * l * 0.25f) / best.len;
+        const float r = 1.0f - (ratio - pre_ratio);
 
-    // Recompute the blend ratio at iter t. CPU blend_line:
-    //   l_t        = len - (last - t)
-    //   ratio_t    = l_t² × 0.25 / len
-    //   pre_ratio  = ratio_{t-1} for t > 0, else 0
-    //   r          = 1 - (ratio_t - pre_ratio)   (ratio_invert = true for outside)
-    float pre_ratio;
-    if (best.t == 0) {
-        pre_ratio = 0.0f;
-    } else {
-        const int t_prev = best.t - 1;
-        const float l_prev = best.len - float(best.last - t_prev);
-        pre_ratio = (l_prev * l_prev * 0.25f) / best.len;
+        const int rx = px + best.ref_off_x;
+        const int ry = py + best.ref_off_y;
+        if (rx >= 0 && ry >= 0 && uint(rx) < width && uint(ry) < height) {
+            const float4 a = load_strip(src[uint(py) * src_pitch + uint(px)], white_opt);
+            const float4 b = load_strip(src[uint(ry) * src_pitch + uint(rx)], white_opt);
+            out = blending_pixel_f(a, b, r);
+        }
+        // else: out keeps default (load_strip(src_me)) — defensive
+    } else if (is_inside) {
+        // Inside (mode_flg=15 self): 4-corner avg per link8_square_execute.
+        const float4 c  = load_strip(src[uint(py)        * src_pitch + uint(px)], white_opt);
+        const float4 ul = load_strip(src[uint(py - 1)    * src_pitch + uint(px - 1)], white_opt);
+        const float4 ur = load_strip(src[uint(py - 1)    * src_pitch + uint(px + 1)], white_opt);
+        const float4 br = load_strip(src[uint(py + 1)    * src_pitch + uint(px + 1)], white_opt);
+        const float4 bl = load_strip(src[uint(py + 1)    * src_pitch + uint(px - 1)], white_opt);
+        const float4 t_ul = ((inside_flg & 1u) != 0u) ? c : blending_pixel_f(c, ul, 0.5f);
+        const float4 t_ur = ((inside_flg & 2u) != 0u) ? c : blending_pixel_f(c, ur, 0.5f);
+        const float4 t_br = ((inside_flg & 4u) != 0u) ? c : blending_pixel_f(c, br, 0.5f);
+        const float4 t_bl = ((inside_flg & 8u) != 0u) ? c : blending_pixel_f(c, bl, 0.5f);
+        out = (t_ul + t_ur + t_br + t_bl) * 0.25f;
     }
-    const float l = best.len - float(best.last - best.t);
-    const float ratio = (l * l * 0.25f) / best.len;
-    const float r = 1.0f - (ratio - pre_ratio);
+    // else: out = identity (load_strip(src_me)), already initialised above
 
-    // Read source pixels (with white-key strip applied, matching CPU's
-    // pre_process semantics). My pixel = blend_target at iter t (CPU
-    // walks blend_target backward by step each iter; iter t lands at me).
-    const int rx = px + best.ref_off_x;
-    const int ry = py + best.ref_off_y;
-    if (rx < 0 || ry < 0 || uint(rx) >= width || uint(ry) >= height) {
-        // OOB ref pixel — bounds analysis says this shouldn't happen for
-        // valid block calls, but defend silently rather than corrupt dst.
-        return;
-    }
-    const float4 a = load_strip(src[uint(py) * src_pitch + uint(px)], white_opt);
-    const float4 b = load_strip(src[uint(ry) * src_pitch + uint(rx)], white_opt);
-    const float4 out_pixel = blending_pixel_f(a, b, r);
-    dst[uint(py) * dst_pitch + uint(px)] = out_pixel;
+    dst[uint(py) * dst_pitch + uint(px)] = out;
 }
 
 // ========================================================================
