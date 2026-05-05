@@ -192,6 +192,7 @@ impl MetalBackend {
         height: u32,
         logical_width: u32,
         range: f32,
+        white_opt: u32,
     ) -> Result<Buffer, GpuError> {
         if src_buffer_ptr.is_null() {
             return Err(GpuError::Dispatch("null src buffer".into()));
@@ -221,6 +222,7 @@ impl MetalBackend {
             enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
             enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
             enc.set_bytes(6, 4, &range as *const f32 as *const c_void);
+            enc.set_bytes(7, 4, &white_opt as *const u32 as *const c_void);
 
             let group = MTLSize::new(16, 16, 1);
             let groups = MTLSize::new(
@@ -420,6 +422,10 @@ impl MetalBackend {
 
             // Pass 1: smooth_detect → metadata buffer (1 byte/pixel).
             // Writes mode_flg + fast_compare bit; boundary pixels = 0.
+            // Step1 fix (2026-05-05): pass white_opt so the detect kernel
+            // applies the same white-key strip as smooth_per_pixel's
+            // compute_centre_corner_flg_only. Without this, transparent
+            // ON cases mismatch (UAT 76e5648 visual FAIL).
             {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.pipeline_detect);
@@ -430,6 +436,7 @@ impl MetalBackend {
                 enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
                 enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
                 enc.set_bytes(6, 4, &range_f32 as *const f32 as *const c_void);
+                enc.set_bytes(7, 4, &white_opt as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(groups, group);
                 enc.end_encoding();
             }
@@ -611,6 +618,7 @@ mod detect_tests {
                 /* height */           4,
                 /* logical_width */    4,
                 /* range */            0.1,
+                /* white_opt */        0,
             )
             .expect("detect dispatch");
         let modes_slice = unsafe {
@@ -662,6 +670,7 @@ mod detect_tests {
                 src.as_ptr() as *mut std::ffi::c_void,
                 4, 4, 4, 4,
                 /* range */ 5.0,
+                /* white_opt */ 0,
             )
             .expect("detect dispatch");
         let modes_slice = unsafe {

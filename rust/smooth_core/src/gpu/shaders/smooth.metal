@@ -134,6 +134,20 @@ kernel void smooth_preprocess(
     dst[gid.y * dst_pitch + gid.x] = p;
 }
 
+// White-key strip helper: read a BGRA pixel and replace it with the null
+// pixel if RGB == (1, 1, 1) and white_opt != 0. Channel layout: BGRA, so
+// .z=red, .y=green, .x=blue (matches the smooth_preprocess kernel).
+// Declared up here so smooth_detect (below) and downstream kernels can
+// share the same strip semantics — required after step1 (2026-05-05) to
+// keep detect's mode_flg consistent with smooth_per_pixel's blend
+// computations under transparent ON.
+inline float4 load_strip(float4 p, uint white_opt) {
+    if (white_opt != 0u && p.z == 1.0f && p.y == 1.0f && p.x == 1.0f) {
+        return float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+    return p;
+}
+
 // ========================================================================
 // C-2.5b.2-prep1: smooth_detect kernel.
 //
@@ -168,6 +182,7 @@ kernel void smooth_detect(
     constant uint&       height        [[buffer(4)]],
     constant uint&       logical_width [[buffer(5)]],
     constant float&      range         [[buffer(6)]],
+    constant uint&       white_opt     [[buffer(7)]],
     uint2                gid           [[thread_position_in_grid]])
 {
     if (gid.x >= width || gid.y >= height) return;
@@ -184,17 +199,22 @@ kernel void smooth_detect(
         return;
     }
 
-    const float4 c     = src[y * src_pitch + x];
-    const float4 right = src[y * src_pitch + (x + 1u)];
+    // Step1 fix (2026-05-05): apply white-key strip before computing
+    // mode_flg, so the metadata matches the stripped-pixel computation
+    // done in smooth_per_pixel's compute_centre_corner_flg_only. Without
+    // this, raw vs stripped mismatch causes wrong blend output for
+    // 32bpc + transparent ON cases (UAT 76e5648 visual FAIL).
+    const float4 c     = load_strip(src[y * src_pitch + x],         white_opt);
+    const float4 right = load_strip(src[y * src_pitch + (x + 1u)],  white_opt);
 
     if (!fast_compare_pixel(c, right)) {
         modes[out_idx] = 0;
         return;
     }
 
-    const float4 up    = src[(y - 1u) * src_pitch + x];
-    const float4 down  = src[(y + 1u) * src_pitch + x];
-    const float4 left  = src[y * src_pitch + (x - 1u)];
+    const float4 up    = load_strip(src[(y - 1u) * src_pitch + x],         white_opt);
+    const float4 down  = load_strip(src[(y + 1u) * src_pitch + x],         white_opt);
+    const float4 left  = load_strip(src[y * src_pitch + (x - 1u)],         white_opt);
 
     uint mode_flg = 0u;
     if (compare_pixel(c, right, range)) mode_flg |= (1u << 0);
@@ -209,15 +229,6 @@ kernel void smooth_detect(
     modes[out_idx] = (uchar)(mode_flg | 0x80u);
 }
 
-// White-key strip helper: read a BGRA pixel and replace it with the null
-// pixel if RGB == (1, 1, 1) and white_opt != 0. Channel layout: BGRA, so
-// .z=red, .y=green, .x=blue (matches the smooth_preprocess kernel).
-inline float4 load_strip(float4 p, uint white_opt) {
-    if (white_opt != 0u && p.z == 1.0f && p.y == 1.0f && p.x == 1.0f) {
-        return float4(0.0f, 0.0f, 0.0f, 0.0f);
-    }
-    return p;
-}
 
 // ========================================================================
 // C-2.5b.2-prep2b foundation: count_length_two_lines port.

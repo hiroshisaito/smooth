@@ -2380,3 +2380,51 @@ memory bandwidth bound(~780 GB/frame ÷ ~400 GB/s ≈ 2s)と整合。**workload 
 
 step1 PASS 後は cap sweet spot を確定し、step2 で CPU `process.rs` に GPU プロファイル(cap + 有効 mode セット)を共有する別 commit に進む。
 
+## Phase 2-A.3 prep2c-step1 UAT 結果 + step1.1 fix(2026-05-05)
+
+**step1 (commit `76e5648`) UAT 結果**:
+
+Phase 1(default cap=32):
+- log で `FrameTask 517` がゼロ(従来 1〜2 件/run と比較し劇的改善)
+- per-thread 1.61〜2.06s(従来 2.5〜2.9s から大幅短縮)
+- About 表示 PASS
+- **🔴 視覚 FAIL**(Hiroshi さん判定)= smooth 効果が期待と異なる
+
+Phase 2(cap=16):
+- log で **FrameTask 517 × 4** 発生(時刻 16384/17408/18432/19456 連続 4 frame)
+- per-thread 1.52s(cap=32 とほぼ同等、改善せず)
+- cap 縮小が逆効果 = 単純な workload 削減では説明できない
+
+**外部レビュー第 4 弾(2026-05-05)受領**:
+
+レビュワー指摘 2 点:
+
+1. **白色不整合(視覚 FAIL の主因候補)**: `smooth_detect` が `white_opt` を受け取らず `load_strip` を適用しないため、metadata は raw 値で `mode_flg=15` 判定するが `smooth_per_pixel` は `load_strip` 後の値で corner flg や blend を計算 → transparent ON の時 raw vs stripped で結果がずれて出力 artifact
+
+2. **🔴 metadata buffer lifetime(517 の主因候補)**: C++ が `gpu_suite->AllocateDeviceMemory` で確保 → Rust が raw pointer を MTLBuffer として bind + commit() → Rust が Ok(()) 即返却 → C++ がすぐ `FreeDeviceMemory` を呼ぶ。GPU はまだ async に metadata を読んでいる可能性があり、AE 側 FrameTask が破綻 → 517。「Metal cb は Completed なのに 517 が出る」「cap を下げても残る」「sporadic」の症状と一致
+   - Rust/C++ 境界で AE-managed buffer + Metal cb + completion/free の責務が分裂しているのが根本原因。短期対策は Rust-owned metadata buffer にして Rust が completion まで保持、長期は AE GPU suite + Metal cb + completion/free を C++/Obj-C++ shim にまとめる
+
+### step1.1 (本コミット) 対応
+
+**step1.1 = 白色不整合 fix のみ**(1 commit、独立に正当性のある変更):
+- `smooth_detect` に `white_opt: u32` parameter (buffer 7) を追加
+- 全 src read に `load_strip(p, white_opt)` 適用
+- `load_strip` helper の MSL 定義位置を `smooth_detect` より前に移動(MSL は前方参照不可、コンパイルエラー回避)
+- `MetalBackend::dispatch_detect` の Rust signature に `white_opt: u32` 追加、unit test 2 件は `white_opt=0`(従来動作)で呼び出し → 24/24 PASS
+- `dispatch_smooth_chain` の detect kernel encode で `white_opt` を buffer 7 に bind
+
+`smooth_core_metal_dispatch_smooth_chain` FFI は不変(`white_opt` は元々受け取っていたので追加引数なし)、smooth_core_version は **0x0002_000f のまま**(C ABI 不変)。
+
+### metadata lifetime 切り分け(本コミット build で UAT)
+
+レビュワー診断 1 と同等: 既存の `SMOOTH_GPU_INFLIGHT_LIMIT=1`(Rust が wait_until_completed してから Ok(()) 返却)を使えば、C++ が `FreeDeviceMemory` を呼ぶ時点で GPU は完了済 → metadata lifetime 問題は発生しないはず。
+
+UAT plan:
+- (A) `SMOOTH_GPU_MAX_LENGTH=32 SMOOTH_GPU_INFLIGHT_LIMIT=1`: 視覚正常 + 517 ゼロなら(i)白色 fix 効果(ii)lifetime が原因で確定。次コミットで metadata を Rust-owned 化
+- (B) `SMOOTH_GPU_MAX_LENGTH=32` (env var なし): 視覚正常で 517 散発なら lifetime が原因
+- (C) (A) でも 517 が残るなら workload / AE 時間予算の側面が残存 → metadata 拡張(direction lengths 等)を検討
+
+### Rust 境界整理の長期検討項目
+
+レビュワー指摘の通り、AE GPU suite + Metal cb + completion/free は同じ層にまとめるのが堅い。短期は Rust-owned metadata buffer で診断、長期は C++/Obj-C++ shim 化を design memo §10 / §11 で検討予定。
+
