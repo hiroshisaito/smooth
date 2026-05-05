@@ -1376,62 +1376,30 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // Match the CPU side's range_f32 derivation in smooth_core.h::
         // smoothing<> for the 32bpc branch: slider × max(=1.0) × 4 / 100.
         const float range_f32 = (float)((info->range * 4.0) / 100.0);
+        // Match the CPU side's line_weight derivation
+        // (info->line_weight / 2.0 + 0.5). Used by the Path β v2
+        // mode_flg=15 outside per-output kernel.
+        const float line_weight = (float)(info->line_weight / 2.0 + 0.5);
 
-        // Sub-stage C-2.5b.2-prep2b.2: allocate two uint32-per-pixel
-        // priority buffers via gpu_suite->AllocateDeviceMemory and pass
-        // them to dispatch_smooth_chain. The chain dispatcher runs
-        // smooth_priority_init (zero-fill to UINT32_MAX) before the
-        // combined kernel; prep2b.3+ claim/apply kernels will consume
-        // these buffers via atomic_min for CPU-equivalent line-blend
-        // write ordering.
-        //
-        // Allocation size at 4K UHD = 2 × 4 × 3840 × 2160 ≈ 66 MB; at
-        // 8000² ≈ 488 MB. gating PASS (commit fa8642c) confirmed that
-        // gpu_suite-managed priority buffers do not re-trigger the
-        // "smooth did not render anything" warning that Rust-allocated
-        // intermediates produced.
-        //
-        // Allocation failure (e.g. OOM under MFR + 4K) routes through
-        // the once-fallen-always-fall fallback per RFC §4.4 採用 (i).
-        const A_u_long dev_idx = extraP->input->device_index;
-        const size_t   priority_bytes = (size_t)width * (size_t)height * sizeof(uint32_t);
-        void *priority_v = NULL;
-        void *priority_h = NULL;
-        PF_Err pri_err = gpu_suite->AllocateDeviceMemory(
-            in_data->effect_ref, dev_idx, priority_bytes, &priority_v);
-        if (!pri_err) {
-            pri_err = gpu_suite->AllocateDeviceMemory(
-                in_data->effect_ref, dev_idx, priority_bytes, &priority_h);
-        }
-        if (pri_err || !priority_v || !priority_h) {
-            if (priority_v) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
-            if (priority_h) gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
+        // Sub-stage C-2.5b.2-prep2c (Path β v2): no intermediate
+        // buffers — per-output writer selection kernel does its own
+        // gather scan from src. Replaces option (b)'s atomic_min
+        // priority buffer chain (commits ac408f7 / 920e80e / 6f3a605
+        // all reverted after UAT FAIL). See
+        // docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §7.
+        int32_t rc = smooth_core_metal_dispatch_smooth_chain(
+            metal_handle, src_buf, dst_buf,
+            src_pitch_pixels, dst_pitch_pixels,
+            width, height, /* logical_width */ width,
+            range_f32, white_opt, line_weight);
+
+        if (rc != 0) {
             gpu_passthrough_to_dst(
                 metal_handle, src_buf, dst_buf,
                 src_pitch_pixels, dst_pitch_pixels, width, height);
             uint64_t uuid_lo, uuid_hi;
             if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
                 smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
-            }
-        } else {
-            int32_t rc = smooth_core_metal_dispatch_smooth_chain(
-                metal_handle, src_buf, dst_buf,
-                priority_v, priority_h,
-                src_pitch_pixels, dst_pitch_pixels,
-                width, height, /* logical_width */ width,
-                range_f32, white_opt);
-
-            gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_v);
-            gpu_suite->FreeDeviceMemory(in_data->effect_ref, dev_idx, priority_h);
-
-            if (rc != 0) {
-                gpu_passthrough_to_dst(
-                    metal_handle, src_buf, dst_buf,
-                    src_pitch_pixels, dst_pitch_pixels, width, height);
-                uint64_t uuid_lo, uuid_hi;
-                if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
-                    smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
-                }
             }
         }
     }

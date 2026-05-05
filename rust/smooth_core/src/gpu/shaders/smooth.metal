@@ -86,35 +86,6 @@ inline float4 blending_pixel_f(float4 target, float4 ref, float ratio) {
         out_a);
 }
 
-// C-2.5b.2-prep2b.2: smooth_priority_init kernel.
-//
-// Zero out the two `width × height × uint32` priority buffers that the
-// follow-up claim/apply kernels will use for line-level blends. Each
-// pixel's priority slot is initialised to UINT32_MAX so atomic_min() in
-// the claim kernel reduces to "lowest source-i-index that touched this
-// pixel" without needing a separate "untouched" sentinel.
-//
-// `priority_v` tracks vertical-line claims (used by up_mode / down_mode
-// cases); `priority_h` tracks horizontal-line claims (used by link8_*
-// line cases). Both are 1 uint32 per pixel; pitch = width.
-//
-// Driving this from a dedicated kernel rather than buffer.fill() so the
-// init lives on the same command queue as the smooth chain → AE's
-// synchroniser sees a single command-buffer dependency edge from src to
-// dst rather than a separate fill-then-compute pair.
-kernel void smooth_priority_init(
-    device uint*   priority_v [[buffer(0)]],
-    device uint*   priority_h [[buffer(1)]],
-    constant uint& width      [[buffer(2)]],
-    constant uint& height     [[buffer(3)]],
-    uint2          gid        [[thread_position_in_grid]])
-{
-    if (gid.x >= width || gid.y >= height) return;
-    const uint idx = gid.y * width + gid.x;
-    priority_v[idx] = 0xFFFFFFFFu;
-    priority_h[idx] = 0xFFFFFFFFu;
-}
-
 // C-1 plumbing kernel: identity copy src → dst. Kept for unit tests; the
 // production GPU path uses smooth_preprocess (below) instead.
 kernel void smooth_passthrough(
@@ -416,6 +387,380 @@ kernel void smooth_combined(
     }
 
     dst[y * dst_pitch + x] = out;
+}
+
+// ========================================================================
+// C-2.5b.2-prep2c (Path β v2): smooth_blend_mode15_outside_per_output.
+//
+// Port of `link8_square_blend_outside` (link8.rs:390-405) using
+// **per-output-pixel writer selection** to reproduce CPU row-major
+// last-writer-wins semantics WITHOUT atomics or intermediate buffers.
+//
+// Background (2026-05-04): prior option (b) attempts (prep2b.2b
+// monolithic / tile-dispatch / CreateGPUWorld variants) all FAILed at
+// real-device UAT with AE warning + FrameTask 517. External review
+// concluded that smooth's data-dependent atomic chain + intermediate
+// buffer + async completion combination is outside AE/Metal practical
+// envelope, and recommended pivoting to per-output writer selection.
+// See docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §7 + workbench_history.md.
+//
+// Algorithm: each thread = 1 output pixel (px, py). The thread scans
+// 4 cardinal rays for candidate centres that might write to (px, py)
+// via link8_square_blend_outside, in CPU row-major priority order, and
+// computes the winning centre's blend value at our position.
+//
+// CPU writer ordering analysis:
+//   Within link8_square_execute at centre (cx, cy), the 4 outside calls
+//   write disjoint pixel sets (each call walks a single cardinal ray
+//   from the centre). So per-centre, each output pixel is written by
+//   AT MOST 1 outside block.
+//
+//   Across centres in CPU scan order (j ascending, then i ascending),
+//   later centres overwrite earlier centres' writes at overlapping
+//   pixels. So the "last writer" for output pixel (px, py) is the
+//   centre with the largest scan-order index `cy * width + cx` among
+//   all centres whose outside call lines reach (px, py).
+//
+// Block priority (largest to smallest cy * width + cx for candidates
+// that could write to (px, py)):
+//   Block 2: centres at (px,        py + 1 + k), cy = py + 1 + k → LARGEST cy
+//   Block 1: centres at (px + 1 + k, py        ), cy = py, cx > px
+//   Block 3: centres at (px - 1 - k, py        ), cy = py, cx < px
+//   Block 4: centres at (px,        py - 1 - k), cy = py - 1 - k → SMALLEST cy
+//
+//   Thus we scan blocks in priority order 2 > 1 > 3 > 4. Within each
+//   block we scan k = MAX_LENGTH-1 downward to 0; first valid match is
+//   the largest-cy/cx winner within that block. If any block produces
+//   a winner, no need to scan lower-priority blocks.
+//
+// Per-output cost (worst case):
+//   4 blocks × 128 candidates × (compute_centre_flg ~30 ops +
+//   count_length_two_lines ~1024 ops) ≈ 540K ops. With early break on
+//   first match per block, average case is much faster. For 4400² this
+//   is bounded GPU compute that fits comfortably under watchdog.
+
+// Compute the 4-corner equality flg for the centre at (cx, cy), or
+// 0xFF if (cx, cy) is not a mode_flg=15 centre (early-out sentinel).
+// Mirrors link8_square_execute L416-420.
+inline uint compute_centre_flg_15(
+    device const float4* src,
+    uint src_pitch,
+    uint cx, uint cy,
+    uint logical_width, uint height,
+    float range,
+    uint white_opt)
+{
+    if (cx < 1u || cx + 1u >= logical_width || cy < 1u || cy + 1u >= height) {
+        return 0xFFu;
+    }
+    const float4 c     = load_strip(src[cy * src_pitch + cx], white_opt);
+    const float4 right = load_strip(src[cy * src_pitch + (cx + 1u)], white_opt);
+    if (!fast_compare_pixel(c, right)) return 0xFFu;
+
+    const float4 up   = load_strip(src[(cy - 1u) * src_pitch + cx], white_opt);
+    const float4 down = load_strip(src[(cy + 1u) * src_pitch + cx], white_opt);
+    const float4 left = load_strip(src[cy * src_pitch + (cx - 1u)], white_opt);
+
+    uint mode_flg = 0u;
+    if (compare_pixel(c, right, range)) mode_flg |= 1u;
+    if (compare_pixel(c, up,    range)) mode_flg |= 2u;
+    if (compare_pixel(c, down,  range)) mode_flg |= 4u;
+    if (compare_pixel(c, left,  range)) mode_flg |= 8u;
+    if (mode_flg != 15u) return 0xFFu;
+
+    const float4 ul = load_strip(src[(cy - 1u) * src_pitch + (cx - 1u)], white_opt);
+    const float4 ur = load_strip(src[(cy - 1u) * src_pitch + (cx + 1u)], white_opt);
+    const float4 br = load_strip(src[(cy + 1u) * src_pitch + (cx + 1u)], white_opt);
+    const float4 bl = load_strip(src[(cy + 1u) * src_pitch + (cx - 1u)], white_opt);
+
+    uint flg = 0u;
+    if (compare_pixel_equal(c, ul, range)) flg |= 1u;
+    if (compare_pixel_equal(c, ur, range)) flg |= 2u;
+    if (compare_pixel_equal(c, br, range)) flg |= 4u;
+    if (compare_pixel_equal(c, bl, range)) flg |= 8u;
+    return flg;
+}
+
+// State recorded for the winning centre — enough to recompute the
+// per-pixel blend value without a separate intermediate buffer.
+struct WriterCandidate {
+    bool  found;
+    int   ref_off_x;     // ref_offset.x relative to my pixel
+    int   ref_off_y;     // ref_offset.y relative to my pixel
+    int   t;             // CPU iter index (0 = farthest from centre, last = adjacent)
+    int   last;          // len_pixels - 1
+    float len;           // effective line length (count * lw)
+};
+
+// Try to update `best` with candidate centre (cx, cy) for `block_id`.
+// Validates: inner region, mode_flg=15, block fires, line reaches our
+// pixel. If valid AND beats current best, returns updated state with
+// found=true. The caller is responsible for ensuring this call is made
+// only when (cx, cy) corresponds to the per-block candidate at offset
+// k from our pixel along the appropriate ray.
+//
+// `k` is the distance from our pixel to the centre along the block's
+// cardinal step (k=0: centre adjacent to us, k=MAX-1: centre far away).
+// `t` returned for the winner = (len_pixels - 1) - k (CPU iter index
+// at which our pixel is written by this block's blend_line).
+//
+// Returns updated WriterCandidate. If validation fails, returns the
+// passed-in `best` unchanged.
+inline WriterCandidate try_block_candidate(
+    WriterCandidate best,
+    device const float4* src,
+    uint src_pitch,
+    int  cx, int cy,
+    int  k,
+    int  block_id,
+    int  ref_off_x_for_flg1, int ref_off_y_for_flg1,  // sub-variant 1 ref
+    uint flg1_mask,
+    int  ref_off_x_for_flg2, int ref_off_y_for_flg2,  // sub-variant 2 ref
+    uint flg2_mask,
+    uint block_fire_mask,                              // (flg & mask) == mask blocks block from firing
+    int  target_x, int target_y,                      // start pixel of the line
+    int  step_x, int step_y,
+    int  scan_min, int scan_max, int scan_limit,
+    uint width, uint height, uint logical_width,
+    float range, uint white_opt, float line_weight)
+{
+    // Inner region + mode_flg=15 check
+    if (cx < 1 || cy < 1 || uint(cx) + 1u >= logical_width || uint(cy) + 1u >= height) return best;
+    const uint flg = compute_centre_flg_15(src, src_pitch, uint(cx), uint(cy),
+                                            logical_width, height, range, white_opt);
+    if (flg == 0xFFu) return best;
+
+    // Block fires: (flg & block_fire_mask) != block_fire_mask
+    if ((flg & block_fire_mask) == block_fire_mask) return best;
+
+    // Determine sub-variant ref_offset
+    int ref_off_x, ref_off_y;
+    if ((flg & flg1_mask) != 0u) {
+        ref_off_x = ref_off_x_for_flg1;
+        ref_off_y = ref_off_y_for_flg1;
+    } else if ((flg & flg2_mask) != 0u) {
+        ref_off_x = ref_off_x_for_flg2;
+        ref_off_y = ref_off_y_for_flg2;
+    } else {
+        return best;  // neither sub-variant fires
+    }
+
+    // count_length_two_lines from centre's perspective
+    const CountLenResult clr = count_length_two_lines(
+        src, src_pitch,
+        target_x, target_y,
+        target_x + ref_off_x, target_y + ref_off_y,
+        step_x, step_y,
+        scan_min, scan_max, scan_limit,
+        range, white_opt);
+    if (clr.length <= 0) return best;
+
+    const float lw = clr.t0_flg ? 0.5f : line_weight;
+    const float len = float(clr.length) * lw;
+    const int   len_pixels = int(ceil(len));
+    if (len_pixels <= 0) return best;
+    const int   last = len_pixels - 1;
+
+    // Check if line reaches my pixel: line writes pixels at offsets
+    // 0..last along step from `target`. My distance from `target` is
+    // exactly k (caller ensures this by construction). So line reaches
+    // me iff k <= last, i.e., k < len_pixels.
+    if (k >= len_pixels) return best;
+
+    // CPU iter t at which my pixel is written: blend_line walks t = 0..last
+    // writing at offset (last - t) along step. For me at offset = k,
+    // t = last - k.
+    const int t = last - k;
+
+    // Within block scan, we always scan k from large to small and break
+    // on first match — caller's responsibility. So `best.found = true`
+    // means we already locked in the within-block winner. This function
+    // is only called with best.found == false at the time of update.
+    WriterCandidate updated;
+    updated.found = true;
+    updated.ref_off_x = ref_off_x;
+    updated.ref_off_y = ref_off_y;
+    updated.t = t;
+    updated.last = last;
+    updated.len = len;
+    return updated;
+}
+
+kernel void smooth_blend_mode15_outside_per_output(
+    device const float4* src           [[buffer(0)]],  // BGRA128 input
+    device float4*       dst           [[buffer(1)]],  // BGRA128 output (overwrite)
+    constant uint&       src_pitch     [[buffer(2)]],
+    constant uint&       dst_pitch     [[buffer(3)]],
+    constant uint&       width         [[buffer(4)]],
+    constant uint&       height        [[buffer(5)]],
+    constant uint&       logical_width [[buffer(6)]],
+    constant float&      range         [[buffer(7)]],
+    constant uint&       white_opt     [[buffer(8)]],
+    constant float&      line_weight   [[buffer(9)]],
+    uint2                gid           [[thread_position_in_grid]])
+{
+    if (gid.x >= width || gid.y >= height) return;
+    const int px = int(gid.x);
+    const int py = int(gid.y);
+
+    WriterCandidate best;
+    best.found = false;
+    best.ref_off_x = 0;
+    best.ref_off_y = 0;
+    best.t = 0;
+    best.last = 0;
+    best.len = 0.0f;
+
+    // Block 2 priority (LARGEST cy): centres at (px, py+1+k)
+    //   in_target = (cx, cy-1) = (px, py+k), step = (0, -1) [upward]
+    //   sub-variants: flg & 1 → ref_off = (-1, 0) [left], flg & 2 → (1, 0) [right]
+    //   block fires: (flg & 0x3) != 0x3
+    //   scan: min=1, max=height-2, limit_from_here = cy
+    for (int k = SMOOTH_MAX_LENGTH - 1; k >= 0; k--) {
+        const int cx = px;
+        const int cy = py + 1 + k;
+        if (cy < 1 || uint(cy) >= height) continue;
+        WriterCandidate trial = try_block_candidate(
+            best, src, src_pitch,
+            cx, cy, k, /*block_id*/ 2,
+            /*flg1*/ -1, 0, 1u,
+            /*flg2*/  1, 0, 2u,
+            /*block_fire_mask*/ 0x3u,
+            /*target*/ cx, cy - 1,
+            /*step*/   0, -1,
+            /*scan*/   1, int(height) - 2, cy,
+            width, height, logical_width,
+            range, white_opt, line_weight);
+        if (trial.found) { best = trial; break; }
+    }
+
+    // Block 1 priority (cy = py, LARGEST cx > px): centres at (px+1+k, py)
+    //   in_target = (cx-1, cy) = (px+k, py), step = (-1, 0) [leftward]
+    //   sub-variants: flg & 1 → ref_off = (0, -1) [up], flg & 8 → (0, 1) [down]
+    //   block fires: (flg & 0x9) != 0x9
+    //   scan: min=1, max=width-2, limit_from_here = cx
+    if (!best.found) {
+        for (int k = SMOOTH_MAX_LENGTH - 1; k >= 0; k--) {
+            const int cx = px + 1 + k;
+            const int cy = py;
+            if (uint(cx) >= width) continue;
+            WriterCandidate trial = try_block_candidate(
+                best, src, src_pitch,
+                cx, cy, k, /*block_id*/ 1,
+                /*flg1*/ 0, -1, 1u,
+                /*flg2*/ 0,  1, 8u,
+                /*block_fire_mask*/ 0x9u,
+                /*target*/ cx - 1, cy,
+                /*step*/   -1, 0,
+                /*scan*/   1, int(width) - 2, cx,
+                width, height, logical_width,
+                range, white_opt, line_weight);
+            if (trial.found) { best = trial; break; }
+        }
+    }
+
+    // Block 3 priority (cy = py, LARGEST cx < px = highest among block 3):
+    //   centres at (px-1-k, py)
+    //   in_target = (cx+1, cy) = (px-k, py), step = (1, 0) [rightward]
+    //   sub-variants: flg & 2 → ref_off = (0, -1) [up], flg & 4 → (0, 1) [down]
+    //   block fires: (flg & 0x6) != 0x6
+    //   scan: min=1, max=width-2, limit_from_here = cx
+    //
+    // Note: within block 3 with cy=py, candidates have cx = px-1-k. Larger
+    // k means smaller cx (farther left). For best WITHIN block 3 we want
+    // LARGEST cx, which is k=0 (cx=px-1). But block 3 winners are dominated
+    // by block 1 winners (cx > px) when both exist — so we only get here
+    // when no block 1 winner exists. Within block 3 we still scan k=127
+    // downward for consistency, but the FIRST k tested is k=127 which is
+    // the SMALLEST cx — opposite of what we want.
+    //
+    // To get largest cx within block 3 first, scan k = 0 upward and break
+    // on first match. This finds the CLOSEST centre that writes us, which
+    // has the largest cx within block 3.
+    if (!best.found) {
+        for (int k = 0; k < SMOOTH_MAX_LENGTH; k++) {
+            const int cx = px - 1 - k;
+            const int cy = py;
+            if (cx < 1) break;  // out-of-range, no further candidates
+            WriterCandidate trial = try_block_candidate(
+                best, src, src_pitch,
+                cx, cy, k, /*block_id*/ 3,
+                /*flg1*/ 0, -1, 2u,
+                /*flg2*/ 0,  1, 4u,
+                /*block_fire_mask*/ 0x6u,
+                /*target*/ cx + 1, cy,
+                /*step*/   1, 0,
+                /*scan*/   1, int(width) - 2, cx,
+                width, height, logical_width,
+                range, white_opt, line_weight);
+            if (trial.found) { best = trial; break; }
+        }
+    }
+
+    // Block 4 priority (SMALLEST cy < py): centres at (px, py-1-k)
+    //   in_target = (cx, cy+1) = (px, py-k), step = (0, 1) [downward]
+    //   sub-variants: flg & 4 → ref_off = (1, 0) [right], flg & 8 → (-1, 0) [left]
+    //   block fires: (flg & 0xc) != 0xc
+    //   scan: min=1, max=height-2, limit_from_here = cy
+    //
+    // Same closest-first logic as block 3: largest cy within block 4 is
+    // k=0 (cy = py-1). Scan k=0 upward.
+    if (!best.found) {
+        for (int k = 0; k < SMOOTH_MAX_LENGTH; k++) {
+            const int cx = px;
+            const int cy = py - 1 - k;
+            if (cy < 1) break;
+            WriterCandidate trial = try_block_candidate(
+                best, src, src_pitch,
+                cx, cy, k, /*block_id*/ 4,
+                /*flg1*/  1, 0, 4u,
+                /*flg2*/ -1, 0, 8u,
+                /*block_fire_mask*/ 0xcu,
+                /*target*/ cx, cy + 1,
+                /*step*/   0, 1,
+                /*scan*/   1, int(height) - 2, cy,
+                width, height, logical_width,
+                range, white_opt, line_weight);
+            if (trial.found) { best = trial; break; }
+        }
+    }
+
+    // No writer touches this output pixel — leave dst unchanged (the
+    // smooth_combined kernel already wrote either passthrough or the
+    // mode_flg=15 inside 4-corner avg).
+    if (!best.found) return;
+
+    // Recompute the blend ratio at iter t. CPU blend_line:
+    //   l_t        = len - (last - t)
+    //   ratio_t    = l_t² × 0.25 / len
+    //   pre_ratio  = ratio_{t-1} for t > 0, else 0
+    //   r          = 1 - (ratio_t - pre_ratio)   (ratio_invert = true for outside)
+    float pre_ratio;
+    if (best.t == 0) {
+        pre_ratio = 0.0f;
+    } else {
+        const int t_prev = best.t - 1;
+        const float l_prev = best.len - float(best.last - t_prev);
+        pre_ratio = (l_prev * l_prev * 0.25f) / best.len;
+    }
+    const float l = best.len - float(best.last - best.t);
+    const float ratio = (l * l * 0.25f) / best.len;
+    const float r = 1.0f - (ratio - pre_ratio);
+
+    // Read source pixels (with white-key strip applied, matching CPU's
+    // pre_process semantics). My pixel = blend_target at iter t (CPU
+    // walks blend_target backward by step each iter; iter t lands at me).
+    const int rx = px + best.ref_off_x;
+    const int ry = py + best.ref_off_y;
+    if (rx < 0 || ry < 0 || uint(rx) >= width || uint(ry) >= height) {
+        // OOB ref pixel — bounds analysis says this shouldn't happen for
+        // valid block calls, but defend silently rather than corrupt dst.
+        return;
+    }
+    const float4 a = load_strip(src[uint(py) * src_pitch + uint(px)], white_opt);
+    const float4 b = load_strip(src[uint(ry) * src_pitch + uint(rx)], white_opt);
+    const float4 out_pixel = blending_pixel_f(a, b, r);
+    dst[uint(py) * dst_pitch + uint(px)] = out_pixel;
 }
 
 // ========================================================================

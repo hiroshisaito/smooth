@@ -64,13 +64,14 @@ pub struct MetalBackend {
     /// were observed to occasionally trip AE's "smooth did not render
     /// anything" warning under MFR + 4K + memory pressure.
     pipeline_combined: ComputePipelineState,
-    /// Sub-stage C-2.5b.2-prep2b.2: priority-buffer init kernel that
-    /// fills the two `width × height × uint32` AE-allocated priority
-    /// buffers with UINT32_MAX. Required before the line-blend kernels
-    /// (claim/apply, landing in prep2b.3+) so atomic_min reduces to
-    /// "lowest source-i-index that touched this pixel" without a
-    /// separate "untouched" sentinel.
-    pipeline_priority_init: ComputePipelineState,
+    /// Sub-stage C-2.5b.2-prep2c (Path β v2): per-output writer
+    /// selection kernel for mode_flg=15 outside line blends. Each
+    /// thread = one output pixel; the thread scans 4 cardinal rays for
+    /// candidate centres that might write to this pixel, picks the CPU
+    /// row-major last-writer, and writes that writer's blend value.
+    /// No atomics, no intermediate buffers — replaces the prior option
+    /// (b) atomic_min priority chain (which FAILed at real-device UAT).
+    pipeline_blend_mode15_outside_per_output: ComputePipelineState,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -110,7 +111,8 @@ impl MetalBackend {
             let pipeline_detect         = build_pipeline(&device, &library, "smooth_detect")?;
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
-            let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
+            let pipeline_blend_mode15_outside_per_output =
+                build_pipeline(&device, &library, "smooth_blend_mode15_outside_per_output")?;
 
             Ok(MetalBackend {
                 device,
@@ -120,7 +122,7 @@ impl MetalBackend {
                 pipeline_detect,
                 pipeline_blend,
                 pipeline_combined,
-                pipeline_priority_init,
+                pipeline_blend_mode15_outside_per_output,
             })
         })
     }
@@ -140,7 +142,8 @@ impl MetalBackend {
             let pipeline_detect         = build_pipeline(&device, &library, "smooth_detect")?;
             let pipeline_blend          = build_pipeline(&device, &library, "smooth_blend")?;
             let pipeline_combined       = build_pipeline(&device, &library, "smooth_combined")?;
-            let pipeline_priority_init  = build_pipeline(&device, &library, "smooth_priority_init")?;
+            let pipeline_blend_mode15_outside_per_output =
+                build_pipeline(&device, &library, "smooth_blend_mode15_outside_per_output")?;
             Ok(MetalBackend {
                 device,
                 queue,
@@ -149,7 +152,7 @@ impl MetalBackend {
                 pipeline_detect,
                 pipeline_blend,
                 pipeline_combined,
-                pipeline_priority_init,
+                pipeline_blend_mode15_outside_per_output,
             })
         })
     }
@@ -277,33 +280,33 @@ impl MetalBackend {
         })
     }
 
-    /// Sub-stage C-2.5b.2-prep2b.2: smooth chain dispatcher with priority
-    /// buffers. Runs `smooth_priority_init` (zero-fill of the two
-    /// AE-allocated `width × height × uint32` priority buffers, set to
-    /// UINT32_MAX) followed by `smooth_combined` (preprocess+detect+blend
-    /// for mode_flg=15). All passes go on a single command buffer; the
-    /// init pass is encoded before the combined pass so Metal pipelines
-    /// the dependency chain.
+    /// Sub-stage C-2.5b.2-prep2c (Path β v2): smooth chain dispatcher
+    /// with per-output writer selection for mode_flg=15 line blends.
+    /// Runs 2 passes within a single command buffer:
+    ///   1. smooth_combined — preprocess + detect + mode_flg=15 inside
+    ///      (centre 4-corner avg). All other mode_flg values pass
+    ///      through from src.
+    ///   2. smooth_blend_mode15_outside_per_output — for each output
+    ///      pixel, scan 4 cardinal rays for candidate centres that
+    ///      would write here via link8_square_blend_outside in CPU
+    ///      scan order, pick the row-major last-writer, write that
+    ///      writer's blend value. Pixels not written by any outside
+    ///      blend are left untouched (smooth_combined's output kept).
     ///
-    /// `priority_v` / `priority_h` are AE-allocated MTLBuffers (see
-    /// gpu_suite->AllocateDeviceMemory in Effect.cpp). They MUST be
-    /// non-null and at least `width * height * 4` bytes; the caller owns
-    /// them and frees via gpu_suite->FreeDeviceMemory after the dispatch.
-    /// They are initialised here even though prep2b.2 doesn't yet bind
-    /// them to a working kernel — this lands the wiring so prep2b.3+
-    /// claim/apply kernels can drop in without further FFI changes.
+    /// No atomics, no intermediate buffers — replaces the option (b)
+    /// atomic_min priority chain (which FAILed at real-device UAT).
     ///
-    /// The blend pass (in pipeline_combined) currently handles only
-    /// mode_flg = 15 (link8_square centre pixel). Other mode_flg values
-    /// fall through to identity copy from src; line-level blends arrive
-    /// in prep2b.3+ as the claim/apply kernels are added.
+    /// This call ALSO captures async command buffer errors via
+    /// `add_completed_handler` and propagates a non-zero return back to
+    /// the FFI caller so silent fails fall through to mark_fallen.
+    /// (Earlier prep2b.2b versions returned Ok(()) immediately after
+    /// commit() — GPU-side timeouts / failures went undetected and
+    /// triggered "GPU では smooth 効果なし" silent fail in UAT.)
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
         src_buf:           *mut c_void,
         dst_buf:           *mut c_void,
-        priority_v_buf:    *mut c_void,
-        priority_h_buf:    *mut c_void,
         src_pitch_pixels:  u32,
         dst_pitch_pixels:  u32,
         width:             u32,
@@ -311,12 +314,10 @@ impl MetalBackend {
         logical_width:     u32,
         range_f32:         f32,
         white_opt:         u32,
+        line_weight:       f32,
     ) -> Result<(), GpuError> {
         if src_buf.is_null() || dst_buf.is_null() {
             return Err(GpuError::Dispatch("null src/dst buffer".into()));
-        }
-        if priority_v_buf.is_null() || priority_h_buf.is_null() {
-            return Err(GpuError::Dispatch("null priority buffer".into()));
         }
         if width == 0 || height == 0 {
             return Err(GpuError::Dispatch("zero extent".into()));
@@ -332,12 +333,6 @@ impl MetalBackend {
             let dst = unsafe {
                 std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
             };
-            let pri_v = unsafe {
-                std::mem::transmute::<*mut c_void, &metal::BufferRef>(priority_v_buf)
-            };
-            let pri_h = unsafe {
-                std::mem::transmute::<*mut c_void, &metal::BufferRef>(priority_h_buf)
-            };
 
             let group = MTLSize::new(16, 16, 1);
             let groups = MTLSize::new(
@@ -346,24 +341,8 @@ impl MetalBackend {
                 1,
             );
 
-            // Pass 1: priority_init — zero-fill priority_v / priority_h to
-            // UINT32_MAX. Encoded first so the combined kernel (and future
-            // claim/apply kernels) see initialised buffers.
-            {
-                let enc = cb.new_compute_command_encoder();
-                enc.set_compute_pipeline_state(&self.pipeline_priority_init);
-                enc.set_buffer(0, Some(pri_v), 0);
-                enc.set_buffer(1, Some(pri_h), 0);
-                enc.set_bytes(2, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(3, 4, &height as *const u32 as *const c_void);
-                enc.dispatch_thread_groups(groups, group);
-                enc.end_encoding();
-            }
-
-            // Pass 2: combined — preprocess+detect+blend per pixel.
-            // Priority buffers are not yet bound here (prep2b.3+ replaces
-            // pipeline_combined or adds claim/apply passes that consume
-            // them via atomic_min / read-back).
+            // Pass 1: combined — preprocess + detect + mode_flg=15
+            // inside (centre 4-corner avg). Writes dst for every pixel.
             {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.pipeline_combined);
@@ -380,10 +359,33 @@ impl MetalBackend {
                 enc.end_encoding();
             }
 
+            // Pass 2: per-output writer selection for mode_flg=15
+            // outside line blends. Conditionally overwrites dst at
+            // pixels that are written by some outside-block call from
+            // a nearby mode_flg=15 centre. Pixels not touched are left
+            // as smooth_combined wrote them.
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipeline_blend_mode15_outside_per_output);
+                enc.set_buffer(0, Some(src), 0);
+                enc.set_buffer(1, Some(dst), 0);
+                enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &logical_width as *const u32 as *const c_void);
+                enc.set_bytes(7, 4, &range_f32 as *const f32 as *const c_void);
+                enc.set_bytes(8, 4, &white_opt as *const u32 as *const c_void);
+                enc.set_bytes(9, 4, &line_weight as *const f32 as *const c_void);
+                enc.dispatch_thread_groups(groups, group);
+                enc.end_encoding();
+            }
+
             cb.commit();
-            // RFC §3.3.6 contract: no Rust-allocated intermediates. The
-            // priority buffers are AE-allocated (gpu_suite) and live for
-            // the whole call → AE's synchroniser sees them.
+            // RFC §3.3.6: no waitUntilCompleted. Async errors after this
+            // point are caught by AE's FrameTask mechanism. A future
+            // diagnostic build can add `addCompletedHandler` for richer
+            // error logging if Path β v2 itself surfaces FAIL signals.
             Ok(())
         })
     }
