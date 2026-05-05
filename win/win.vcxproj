@@ -86,7 +86,7 @@
     <EnableManagedIncrementalBuild>true</EnableManagedIncrementalBuild>
     <LinkIncremental>false</LinkIncremental>
     <GenerateManifest>true</GenerateManifest>
-    <IncludePath>$(SDKPath)Headers;$(SDKPath)Util;$(IncludePath)</IncludePath>
+    <IncludePath>$(SDKPath)Headers;$(SDKPath)Headers\SP;$(SDKPath)Util;$(IncludePath)</IncludePath>
     <TargetName>smooth</TargetName>
     <TargetExt>.aex</TargetExt>
     <OutDir>$(SolutionDir)Debug\x64\</OutDir>
@@ -100,7 +100,7 @@
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <LinkIncremental>false</LinkIncremental>
-    <IncludePath>$(SDKPath)Headers;$(SDKPath)Util;$(IncludePath)</IncludePath>
+    <IncludePath>$(SDKPath)Headers;$(SDKPath)Headers\SP;$(SDKPath)Util;$(IncludePath)</IncludePath>
     <TargetName>smooth</TargetName>
     <TargetExt>.aex</TargetExt>
     <OutDir>$(SolutionDir)Release\x64\</OutDir>

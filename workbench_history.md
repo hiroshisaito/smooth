@@ -2773,3 +2773,68 @@ memcpy(scratch, in_ptr, scratch_bytes);
 #### Hiroshi さん作成の external crash report
 
 `docs/AE_RENDER_QUEUE_CRASH_2026-05-05.md`(untracked)に Hiroshi さん側で integration ログとして整理済(本 commit では git に取り込まない、Hiroshi さん判断で別途 add 可)。
+
+---
+
+## v1.6.0 Windows build & UAT
+
+### 2026-05-05 19:50 JST — v1.6.0 Windows clean rebuild
+
+**背景**: Mac 側で v1.6.0 (32bpc CPU only + MFR + SmartRender + Rust core) リリース済 (HEAD `d172dec`)。Windows 側を clean rebuild で追従。
+
+**遭遇した build error と fix**:
+- `Effect.cpp(12): Cannot open include file: 'SPBasic.h': No such file or directory`
+  - 原因: v1.6.0 で `Effect.cpp` に `#include "SPBasic.h"`(`PF_WorldSuite2` の `pica_basicP` から AcquireSuite/ReleaseSuite 経由で `PF_GetPixelFormat` するため、`PF_PixelFormat_*` で 32bpc を判定する path)が追加された
+  - SDK 上の所在: `references/AfterEffectsSDK_25.6_61_win/.../Examples/Headers/SP/SPBasic.h`
+  - 修正: [win/win.vcxproj](win/win.vcxproj) の 4 つの `<IncludePath>` を `$(SDKPath)Headers;$(SDKPath)Util;...` → `$(SDKPath)Headers;$(SDKPath)Headers\SP;$(SDKPath)Util;...` に統一(Release|x64 / Debug|x64 / Release|Win32 / Debug|Win32)
+  - これは v1.6.0 から SP suite を使うようになったための恒久対応。Mac 側 Xcode は `HEADER_SEARCH_PATHS` に既に `Headers/SP` が入っていたため顕在化しなかった
+
+**ビルド結果**:
+- `win/Release/x64/smooth.aex` = **445,440 bytes**(v1.5.0 393,216 B から +52 KB、f32 path / SmartRender / detect 関連の追加分)
+
+**3 段偽成功検証(全通過)**:
+
+| # | 検証 | 結果 |
+|---|---|---|
+| 4a | サイズ | 445,440 bytes |
+| 4b | FFI シンボル(staticlib) | **8 個 External**: 旧 6 個 + `smooth_core_preprocess_f32` + `smooth_core_process_row_range_f32` |
+| 4c | 埋め込み build-id | `0.1.0+d172dec` |
+| §5 | EntryPointFunc unmangled | RVA `0x000399B0` |
+
+**PiPL flag 検証**(`win/Pipl.rc` を PiPLTool が `Pipl.r` から再生成):
+
+| タグ | 値(decimal) | 値(hex) | 内訳 |
+|---|---|---|---|
+| `OLGe` (AE_Effect_Global_OutFlags) | 33554432 | `0x02000000` | DEEP_COLOR_AWARE (bit 25) のみ。v1.5.0 の `0x02000800` から `I_WRITE_INPUT_BUFFER` (bit 11) を除去(Phase 2-A.1 で AE 2025 verifier との衝突回避) |
+| `2LGe` (AE_Effect_Global_OutFlags_2) | 142611472 | `0x08801410` | I_AM_THREADSAFE (bit 4) + SUPPORTS_SMART_RENDER (bit 10) + FLOAT_COLOR_AWARE (bit 12) + SUPPORTS_GET_FLATTENED_SEQUENCE_DATA (bit 23) + SUPPORTS_THREADED_RENDERING (bit 27) |
+
+**AE 2025 実機 UAT 結果**(ユーザー目視、2026-05-05):
+
+| # | 項目 | 結果 |
+|---|---|---|
+| 1 | 起動・プロジェクト読込時 verification-failure ダイアログなし | PASS |
+| 2 | `Effect Controls` の `Build: 0.1.0+d172dec` 表示 | PASS |
+| 3 | About に `smooth, v1.6.0` + `rust_core 0.1.0+d172dec` | PASS |
+| 4 | 黄色 ⚠️ 32bpc 非対応マークが消えている | PASS(v1.6.0 で 32bpc 対応の効果) |
+| 5 | MFR 並列レンダー(GUI プログレスバーで観察) | PASS |
+| 6 | 32bpc コンポでクラッシュなく描画 | PASS |
+| 7 | SmartRender(プレビュー / レンダー) | PASS |
+| 8 | range / line weight / white_option(8bpc/16bpc golden 一致) | PASS |
+
+**配布 zip 作成**(BUILD_WINDOWS.md §6 の手順、staging dir 経由で `references/` SDK や Rust target を含めない):
+```
+LICENSE                  14,886 B
+smooth.aex              445,440 B
+THIRD_PARTY_LICENSES.md   7,128 B
+```
+
+**配布ゴールド SHA-256**(Windows 配布の固定参照値):
+
+| ファイル | サイズ | SHA-256 |
+|---|---|---|
+| `win/Release/x64/smooth.aex` | 445,440 B | `AC88D80A0C03A6FE52F4B8F76D36AB51CEBC8E98145FEDAE5A47067B58192B72` |
+| `win/release/smooth.Win.1.6.0.AE2025.x64.zip` | 231,822 B | `7C338A756CE8630CAFA3388078C4D27DF719C102095B58070FC6FA6D2E84C0E6` |
+
+**ビルド環境**: Windows 10 Pro 19045.6456 / VS2022 v143 (MSVC 19.44.35225) / Windows SDK 10.0.26100.0 / Rust stable 1.95.0 / target `x86_64-pc-windows-msvc` (`+crt-static`)。MSVC linker non-determinism のため再ビルドで SHA は変わるが、上表 SHA は UAT 通過版を固定参照。
+
+**Windows v1.6.0 リリース準備完了**。Mac 側 RELEASE_NOTES-v1.6.0.md に Windows SHA-256 を追記する作業が次フェーズ。
