@@ -41,7 +41,7 @@
 | macOS (universal: Apple Silicon + Intel) | `smooth.Mac.1.6.0.AE2025.universal.zip` |
 | macOS (arm64 のみ) | `smooth.Mac.1.6.0.AE2025.arm64.zip` |
 | macOS (x86_64 のみ) | `smooth.Mac.1.6.0.AE2025.x86_64.zip` |
-| Windows x64 | `smooth.Win.1.6.0.AE2025.x64.zip` |
+| Windows (x86_64) | `smooth.Win.1.6.0.AE2025.x86_64.zip` |
 
 新規/再作成する配布 zip にはプラグイン本体に加えて `LICENSE` と `THIRD_PARTY_LICENSES.md` を同梱します。`references/` 配下の Adobe After Effects SDK、展開ツール、その他 vendor SDK/toolchain 類は配布物に含めません。
 

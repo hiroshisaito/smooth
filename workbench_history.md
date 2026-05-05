@@ -2833,7 +2833,7 @@ THIRD_PARTY_LICENSES.md   7,128 B
 | ファイル | サイズ | SHA-256 |
 |---|---|---|
 | `win/Release/x64/smooth.aex` | 445,440 B | `AC88D80A0C03A6FE52F4B8F76D36AB51CEBC8E98145FEDAE5A47067B58192B72` |
-| `win/release/smooth.Win.1.6.0.AE2025.x64.zip` | 231,822 B | `7C338A756CE8630CAFA3388078C4D27DF719C102095B58070FC6FA6D2E84C0E6` |
+| `win/release/smooth.Win.1.6.0.AE2025.x86_64.zip` | 231,822 B | `7C338A756CE8630CAFA3388078C4D27DF719C102095B58070FC6FA6D2E84C0E6` |
 
 **ビルド環境**: Windows 10 Pro 19045.6456 / VS2022 v143 (MSVC 19.44.35225) / Windows SDK 10.0.26100.0 / Rust stable 1.95.0 / target `x86_64-pc-windows-msvc` (`+crt-static`)。MSVC linker non-determinism のため再ビルドで SHA は変わるが、上表 SHA は UAT 通過版を固定参照。
 

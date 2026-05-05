@@ -65,7 +65,7 @@ New-Item -ItemType Directory -Force win\release\package | Out-Null
 Copy-Item win\Release\x64\smooth.aex win\release\package\
 Copy-Item LICENSE win\release\package\
 Copy-Item THIRD_PARTY_LICENSES.md win\release\package\
-Compress-Archive -Path win\release\package\* -DestinationPath win\release\smooth.Win.1.6.0.AE2025.x64.zip -Force
+Compress-Archive -Path win\release\package\* -DestinationPath win\release\smooth.Win.1.6.0.AE2025.x86_64.zip -Force
 ```
 
 ## 既知事項 / トラブルシュート
