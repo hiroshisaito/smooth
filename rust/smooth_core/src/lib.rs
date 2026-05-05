@@ -57,7 +57,19 @@ pub extern "C" fn smooth_core_version() -> u32 {
     //              pattern uses 1 kernel writing dst (or multi-kernel writing
     //              DIFFERENT buffers); this variant matches the SDK pattern.
     //              FFI signature unchanged from 0x0002_000c.
-    0x0002_000d
+    // 0x0002_000e: dispatch_smooth_chain accepts uuid_lo/uuid_hi for the
+    //              silent-fail handler (Sub-stage C-2.5b.2-prep2c diagnostic
+    //              priority 1, 2026-05-05). On every dispatch a
+    //              `cb.add_completed_handler` is installed; if the GPU
+    //              command buffer surfaces an error (timeout / OOM /
+    //              device-removed / etc.) the handler logs a diagnostic
+    //              line and calls `mark_fallen(uuid)` so subsequent frames
+    //              for the same instance fall back to CPU. Env var
+    //              `SMOOTH_GPU_INFLIGHT_LIMIT=1` forces serial GPU
+    //              execution (Mutex + wait_until_completed) for diagnosing
+    //              MFR queue saturation contribution to FrameTask 517.
+    //              See docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §9.
+    0x0002_000e
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -497,6 +509,13 @@ mod metal_ffi {
     /// `(slider_value / 2.0 + 0.5)` (see Effect.cpp::SmoothCore<>().run()
     /// core_params.line_weight) — pass the same encoded value here.
     ///
+    /// `uuid_lo` / `uuid_hi` identify the AE sequence instance for the
+    /// silent-fail completed handler (FFI 0x0002_000e+). The handler
+    /// inspects command-buffer status on completion; if the GPU
+    /// surfaced an error, it calls `mark_fallen` for this UUID so
+    /// subsequent frames take the CPU path. Caller may pass 0/0 to
+    /// opt out of fallen-state propagation (e.g., from unit tests).
+    ///
     /// SAFETY: same as dispatch_passthrough — `handle` is a live
     /// MetalBackend, src/dst are MTLBuffer pointers from AE's GPU
     /// suite, pitches are in pixels (= rowbytes/16 for BGRA128).
@@ -513,6 +532,8 @@ mod metal_ffi {
         range_f32: f32,
         white_opt: u32,
         line_weight: f32,
+        uuid_lo: u64,
+        uuid_hi: u64,
     ) -> i32 {
         if handle.is_null() { return -1; }
         let backend = &*(handle as *const gpu::metal::MetalBackend);
@@ -525,6 +546,7 @@ mod metal_ffi {
             src_pitch_pixels, dst_pitch_pixels,
             width, height, logical_width,
             range_f32, white_opt, line_weight,
+            uuid_lo, uuid_hi,
         );
         if dispatch.is_err() {
             let _ = <gpu::metal::MetalBackend as gpu::GpuBackend>::finish_frame(backend, ctx);

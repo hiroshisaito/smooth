@@ -16,10 +16,12 @@
 use super::{FrameContext, GpuBackend, GpuError};
 
 use std::ffi::c_void;
+use std::sync::Mutex;
 
+use block::ConcreteBlock;
 use metal::{
     Buffer, CommandBufferRef, CommandQueue, ComputePipelineState, Device, Library,
-    MTLResourceOptions, MTLSize,
+    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 use objc::rc::autoreleasepool;
 
@@ -75,6 +77,14 @@ pub struct MetalBackend {
     /// multiple kernels each writing DIFFERENT buffers); this kernel
     /// matches that pattern.
     pipeline_per_pixel: ComputePipelineState,
+    /// Sub-stage C-2.5b.2-prep2c diagnostic (priority 1, 2026-05-05):
+    /// per-backend mutex used only when env var
+    /// `SMOOTH_GPU_INFLIGHT_LIMIT=1` is set. Held across `commit()` +
+    /// `wait_until_completed()` so at most one command buffer is in
+    /// flight per device. Off by default; flip the env var at run-time
+    /// to diagnose whether MFR queue saturation contributes to
+    /// `FrameTask 517` timeouts.
+    inflight_lock: Mutex<()>,
 }
 
 unsafe impl Send for MetalBackend {}
@@ -126,6 +136,7 @@ impl MetalBackend {
                 pipeline_blend,
                 pipeline_combined,
                 pipeline_per_pixel,
+                inflight_lock: Mutex::new(()),
             })
         })
     }
@@ -156,6 +167,7 @@ impl MetalBackend {
                 pipeline_blend,
                 pipeline_combined,
                 pipeline_per_pixel,
+                inflight_lock: Mutex::new(()),
             })
         })
     }
@@ -301,6 +313,25 @@ impl MetalBackend {
     /// compatibility. Trade-off: per-pixel cost is bounded by 4 ×
     /// MAX_LENGTH cardinal-ray scans (worst case ~540K ops/pixel,
     /// average much less due to early break on first match per block).
+    ///
+    /// Sub-stage C-2.5b.2-prep2c diagnostic (priority 1, 2026-05-05):
+    /// `uuid_lo` / `uuid_hi` identify the AE sequence instance for the
+    /// fallen-state registry. A `cb.add_completed_handler` block is
+    /// installed before commit; on completion the handler inspects the
+    /// command buffer status and, if the GPU surfaced an error
+    /// (timeout / OOM / device-removed / etc.), logs a diagnostic line
+    /// and calls `mark_fallen(uuid)` so subsequent frames for the same
+    /// instance fall back to the CPU path. The current frame cannot be
+    /// rescued — it has already been returned `Ok(())` to AE — but
+    /// next-frame protection prevents repeated GPU FAIL on every frame
+    /// of a render queue.
+    ///
+    /// Env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` (read at every dispatch,
+    /// no rebuild required) toggles a per-backend `Mutex` held across
+    /// `commit() + wait_until_completed()`. With it set, only one
+    /// command buffer is in flight per device at any time — useful to
+    /// diagnose whether MFR queue saturation contributes to
+    /// `FrameTask 517` timeouts. Default off (concurrent MFR).
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
@@ -314,6 +345,8 @@ impl MetalBackend {
         range_f32:         f32,
         white_opt:         u32,
         line_weight:       f32,
+        uuid_lo:           u64,
+        uuid_hi:           u64,
     ) -> Result<(), GpuError> {
         if src_buf.is_null() || dst_buf.is_null() {
             return Err(GpuError::Dispatch("null src/dst buffer".into()));
@@ -322,6 +355,19 @@ impl MetalBackend {
             return Err(GpuError::Dispatch("zero extent".into()));
         }
         let _ = &ctx.scratch;
+
+        let inflight_limit_1 = std::env::var_os("SMOOTH_GPU_INFLIGHT_LIMIT")
+            .map(|v| v == "1")
+            .unwrap_or(false);
+
+        // Hold the in-flight mutex across the entire encode/commit/wait
+        // window when the env var is set. Without the env var, the
+        // mutex is never locked so MFR threads dispatch concurrently.
+        let _guard = if inflight_limit_1 {
+            Some(self.inflight_lock.lock().expect("inflight mutex poisoned"))
+        } else {
+            None
+        };
 
         autoreleasepool(|| -> Result<(), GpuError> {
             let cb: &CommandBufferRef = self.queue.new_command_buffer();
@@ -361,13 +407,42 @@ impl MetalBackend {
                 enc.end_encoding();
             }
 
+            // Silent-fail handler: on completion, inspect status. If the
+            // GPU failed (timeout / OOM / device-removed / etc.), log a
+            // diagnostic line and mark the AE sequence instance fallen
+            // so subsequent frames take the CPU path. The block is
+            // copied (heap) so it outlives this stack frame; metal-rs
+            // retains the heap block for the addCompletedHandler call.
+            let handler = ConcreteBlock::new(move |cb: &CommandBufferRef| {
+                let status = cb.status();
+                if status != MTLCommandBufferStatus::Completed {
+                    eprintln!(
+                        "[smooth GPU] command buffer FAILED: status={:?} \
+                         uuid_lo=0x{:016x} uuid_hi=0x{:016x} \
+                         (mark_fallen → next frame will use CPU path)",
+                        status, uuid_lo, uuid_hi,
+                    );
+                    let uuid = ((uuid_hi as u128) << 64) | (uuid_lo as u128);
+                    crate::gpu::fallback::mark_fallen(uuid);
+                }
+            }).copy();
+            cb.add_completed_handler(&handler);
+
             cb.commit();
-            // RFC §3.3.6: no waitUntilCompleted. Async errors after this
-            // point are caught by AE's FrameTask mechanism. A future
-            // diagnostic build can add `addCompletedHandler` for richer
-            // error logging if Path β v2 itself surfaces FAIL signals.
+
+            if inflight_limit_1 {
+                // Diagnostic mode: keep the in-flight mutex held until
+                // this command buffer completes. Forces serial GPU
+                // execution across MFR threads — per-thread frame time
+                // should fall to ~kernel time alone (no queue
+                // contention). If `FrameTask 517` disappears with this
+                // env var set, queue saturation was a contributor.
+                cb.wait_until_completed();
+            }
+
             Ok(())
         })
+        // _guard drops here, releasing inflight_lock.
     }
 
     /// Sub-stage C-1 dispatch: identity passthrough. Both buffers must hold

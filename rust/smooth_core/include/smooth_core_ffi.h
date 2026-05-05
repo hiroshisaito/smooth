@@ -323,6 +323,23 @@ int32_t smooth_core_metal_dispatch_preprocess(
  * range_f32 is the f32 sum-threshold (= raw slider * 4 / 100 for
  * max=1.0, matching Params::range_f32 on the C++ side).
  *
+ * `uuid_lo` / `uuid_hi` identify the AE sequence instance for the
+ * silent-fail completed handler (FFI 0x0002_000e+). On every dispatch
+ * a `cb.add_completed_handler` is installed; if the GPU command buffer
+ * surfaces an error (timeout / OOM / device-removed / etc.), the
+ * handler logs a diagnostic line and calls `mark_fallen(uuid)` so
+ * subsequent frames for the same instance fall back to CPU. The
+ * current frame cannot be rescued — it has already been returned 0 to
+ * AE and AE may report `FrameTask 517` independently. Pass 0/0 to opt
+ * out (e.g., from unit tests).
+ *
+ * Env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` (read at every dispatch, no
+ * rebuild required) forces serial GPU execution: a per-backend mutex
+ * is held across `commit() + wait_until_completed()` so at most one
+ * command buffer is in flight per device. Diagnostic only — useful
+ * for separating "kernel takes too long" from "MFR queue saturation
+ * pushes per-thread time over watchdog".
+ *
  * Returns 0 on success; non-zero on any kernel-submit failure. Caller
  * marks the instance fallen on non-zero per RFC §4.4 採用 (i). */
 int32_t smooth_core_metal_dispatch_smooth_chain(
@@ -336,7 +353,9 @@ int32_t smooth_core_metal_dispatch_smooth_chain(
     uint32_t logical_width,
     float    range_f32,
     uint32_t white_opt,
-    float    line_weight);
+    float    line_weight,
+    uint64_t uuid_lo,
+    uint64_t uuid_hi);
 #endif /* __APPLE__ */
 
 #ifdef __cplusplus

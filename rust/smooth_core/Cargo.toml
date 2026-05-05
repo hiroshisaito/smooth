@@ -23,6 +23,9 @@ uuid      = { version = "1", features = ["v4"] }
 metal = "0.27"
 objc  = "0.2"
 foreign-types = "0.5"
+# Sub-stage C-2.5b.2-prep2c diagnostic: completed handler for command buffer
+# error → mark_fallen wiring (silent fail bug fix).
+block = "0.1"
 
 [profile.release]
 opt-level   = 3

@@ -1387,19 +1387,33 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // priority buffer chain (commits ac408f7 / 920e80e / 6f3a605
         // all reverted after UAT FAIL). See
         // docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §7.
+        //
+        // FFI 0x0002_000e+: pass uuid_lo/uuid_hi so Rust can install a
+        // command-buffer completed handler that calls mark_fallen on
+        // GPU error (silent-fail bug fix). Env var
+        // SMOOTH_GPU_INFLIGHT_LIMIT=1 forces serial GPU execution
+        // (Mutex + wait_until_completed) for diagnostic builds. See
+        // docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §9.
+        uint64_t cb_uuid_lo = 0, cb_uuid_hi = 0;
+        (void)read_sequence_uuid(in_data, &cb_uuid_lo, &cb_uuid_hi);
+
         int32_t rc = smooth_core_metal_dispatch_smooth_chain(
             metal_handle, src_buf, dst_buf,
             src_pitch_pixels, dst_pitch_pixels,
             width, height, /* logical_width */ width,
-            range_f32, white_opt, line_weight);
+            range_f32, white_opt, line_weight,
+            cb_uuid_lo, cb_uuid_hi);
 
         if (rc != 0) {
             gpu_passthrough_to_dst(
                 metal_handle, src_buf, dst_buf,
                 src_pitch_pixels, dst_pitch_pixels, width, height);
-            uint64_t uuid_lo, uuid_hi;
-            if (read_sequence_uuid(in_data, &uuid_lo, &uuid_hi)) {
-                smooth_core_gpu_mark_fallen(uuid_lo, uuid_hi);
+            // The async completed handler will also mark_fallen if the
+            // GPU reports an error after this point; that path covers
+            // the silent-fail case where commit() returned but the GPU
+            // failed during execution. Marking here too is idempotent.
+            if (cb_uuid_lo || cb_uuid_hi) {
+                smooth_core_gpu_mark_fallen(cb_uuid_lo, cb_uuid_hi);
             }
         }
     }

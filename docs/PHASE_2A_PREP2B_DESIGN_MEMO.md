@@ -168,3 +168,101 @@ prep2b.1 自体は通った(allocate + 即 free だけ kernel 未使用)が、pr
 - 診断 C: command buffer を tile/chunk 単位で分割する build
 
 3 つすべて FAIL なら option (b) を確実に打ち切れる根拠になる。今回は 3 連続 UAT FAIL の重みを優先して診断省略で pivot 採用。
+
+---
+
+## 8. 2026-05-05: Path β v2 (prep2c) 連続 FAIL → 判断待ち停止
+
+Path β v2 を 2 variant 実装したが test 3(4400² + 32bpc + GPU ON + transparent ON、19 frames preview)で連続 FAIL。HEAD = `2c85871` で test 3 FAIL のまま判断待ち停止。
+
+### 8.1 FAIL 系譜
+
+**variant v1 — commit `1288bfa`(2 kernel + 2 encoder 構造)**:
+- 構造: `smooth_combined`(mode_flg=15 centre 4-corner avg を dst に書く)+ `smooth_blend_mode15_outside_per_output`(outside line blend を dst に書く)を別 compute encoder で sequential dispatch
+- 結果: AE 警告「smooth did not render anything」発生。**FrameTask 517 はゼロ**(GPU watchdog 問題は解消、別の理由で AE が dst を不正と判定)
+- 仮説: SDK_Invert_ProcAmp.cpp は 1 kernel writes dst または multi-kernel writing **異なる buffer** のパターン。**2 kernel 両方が同じ dst に書き込む**構造が AE の render tracking と相性悪い
+
+**variant v2 — commit `2c85871`(unified `smooth_per_pixel` 1 kernel + 1 encoder + 1 dispatch)**:
+- 構造: thread = 1 出力 pixel、Phase 1(Block 2 → Block 1 で LATER outside 探索)/ Phase 2(self mode_flg=15 inside の 4-corner avg)/ Phase 3(Block 3 → Block 4 で EARLIER outside 探索)を 1 kernel に統合、dst には必ず 1 度だけ書き込む(SDK パターン整合)
+- 結果: **test 3 FAIL**。AE 警告 + log で `FrameTask threw 517` × 1、12 frames render に 22.7 秒 = ~**1.9 秒/frame**
+- 数値根拠: 4400² = 19.4M thread × 4 cardinal × MAX_LENGTH=128 per-pixel scan、各 step ~5 read × 16 byte ≈ **780 GB/frame** の理論メモリ転送量。Apple Silicon ユニファイド帯域 ~400 GB/s でも 1 frame ~2 秒で GPU driver watchdog(~2 秒/dispatch)に断続接触
+
+### 8.2 残存盲点(prep2c でも未解決)
+
+外部レビュー指摘済の以下が prep2c では先行実装できていない:
+
+- 🔴 **silent fail bug**: Rust `dispatch_smooth_chain` は `cb.commit()` 直後に `Ok(())` を返却、command buffer の async error(GPU timeout / fail)を `mark_fallen` に伝播していない。test 3 FAIL の根本診断が困難になる原因の一つ
+- 🔴 **memory-bandwidth bound**: 上記 ~780 GB/frame の理論値が watchdog 接触の根本要因。`MAX_LENGTH=128` を kernel 内で削れば watchdog 抜けるが CPU と非 bit-identical になる(Path β v2 の最初の目標 = bit-identical 一致が直接破綻)
+
+### 8.3 選択肢(Hiroshi さん判断待ち)
+
+| 選択肢 | 内容 | bit-identical | 工数感 |
+|---|---|---|---|
+| A | GPU 用 `SMOOTH_GPU_MAX_LENGTH=16` or `32` を導入(CPU は 128 維持) + cb completed handler で silent fail 解消 | 非 bit-identical(視覚同等狙い、Path β 当初目標から後退) | 1〜2 session |
+| B | flat region(全 mode_flg=0 タイル)で early-out するタイル前処理を追加して平均負荷削減 | 維持可能 | 2〜3 session、効果は要実測 |
+| C | GPU を mode_flg=15 inside(centre 4-corner avg)のみに rollback、line blend は CPU 経由に戻す部分 GPU 化 | inside のみ bit-identical、line は CPU=CPU 同一 | 1 session、ただし §4「mid-stream fallback continuity」要件との適合は要再評価 |
+| D | GPU 経路を v1.6.0 から外す。Phase 2-A は 32bpc CPU only で出荷、GPU は v1.7.0+ に後回し | n/a(GPU 経路削除) | 1 session(削除と doc 整理) |
+
+A〜C いずれを採用しても **silent fail handler(cb completed handler で error→shared atomic→`mark_fallen` 伝播)は必須**。これは選択肢に依存しない先行実装可能項目。
+
+### 8.4 §4(option (c) = 部分 GPU 化)の再評価
+
+§4 では「mode_flg ∈ {3, 5, 7, 11, 13} は edge pixel の大多数を占めるので、これを GPU で skip すると半分は jaggy / 半分は smooth の混在 frame が出る」として option (c) を却下した。一方、選択肢 C は **mode_flg=15 inside だけ GPU**(line blend = mode 3/5/7/11/13/15 outside 全部 CPU)に rollback する形なので、§4 の「mode_flg=15 inside だけ GPU で他を skip」とは異なる。
+
+Hiroshi さん 2026-05-04 の hard requirement(no machine-by-machine differences in network rendering、no visible discontinuity at mid-stream fallback)は GPU↔CPU 切替が **同一 frame に視覚連続**であることを要求している。選択肢 C は GPU 経路でも「inside だけ GPU + line は CPU」の hybrid 出力を返すため、CPU only 経路と画素差があれば連続性は破綻する。**C 採用前に「inside-only GPU が CPU only 経路と bit-identical か」を tiny fixture で確認するのが前提条件**。
+
+### 8.5 §6 stop-and-reconsider trigger は何度発動したか
+
+- §6 trigger 発動 #1〜#3 = prep2b.2b 3 連続 FAIL(2026-05-04)
+- §7 で Path β v2 pivot に切替
+- §8 で Path β v2 も 2 連続 FAIL = **trigger に相当する事象を計 5 回観測**
+- 根本原因 = Path β v2 の per-pixel scan が memory-bandwidth bound で watchdog に届く / silent fail handler 未実装で診断不能の 2 つが残存
+
+判断待ちの位置: bit-identical を目標に持ち続けるか(B が候補、ただし不確実)、後退して視覚同等(A)/ 部分 GPU(C)/ GPU 撤退(D)へ pivot するかの分岐。
+
+---
+
+## 9. 2026-05-05: 外部レビュー第 2 弾 → Hybrid Path β + 4 段優先順位
+
+prep2c v1/v2 連続 FAIL 後に Hiroshi さん経由で受領した外部レビューで、§8 の選択肢 A 直行は時期尚早と判明。**Hybrid Path β を 1 回試す余地が技術的にはまだある**との指摘。
+
+### 9.1 §8 分析の見落とし(レビュワー指摘)
+
+1. **AE 観測 metric の優先**: `22.7s/12 frames = 1.9s/frame` より、log 中の `Frame render avg time(per thread): 2.75s` のほうが危険信号として強い。AE は GPU 同期待ちを含めた per-thread 時間で `FrameTask 517` を判定している
+2. **1-pass 寄せすぎ = 平坦領域でも安くならない**: 候補が見つからないピクセルほど Block 2/1/3/4 の MAX_LENGTH=128 走査を全 4 cardinal でやり切る。早期 break は edge 付近にしか効かない構造
+3. **MFR queue 滞留も原因**: 単体 kernel 時間がギリギリでも、MFR で複数 frame が同 queue に積まれると timeout 側に倒れやすい
+4. **completed handler は当該 frame を救えない**: error→`mark_fallen` 伝播は次 frame 以降の保護用、失敗した当該 frame 自体は AE 側で 517 化されてから retry / abort に入る
+
+### 9.2 Hybrid Path β 設計
+
+「multi-pass だが atomic / BGRA128 scratch / data-dependent writer chain なし」の安全パターン:
+
+- **prepass 1**: 各 pixel が `mode_flg=15` centre かを 1 byte/pixel metadata に書く(必要に応じて `flg` も)
+- **optional prepass 2**: 各 centre の 4 方向 line length / ref variant を小さい metadata buffer に書く
+- **final pass**: per-output gather。候補ごとに `compute_centre_flg_15` / `count_length_two_lines` を **再計算しない**(prepass 結果を read)、最終 kernel だけが dst を書く
+
+これは multi-pass だが、過去 FAIL の構造(複数 kernel が同 dst / atomic / BGRA128 scratch / data-dependent writer chain)とは別物。**metadata buffer にだけ書き、最終 kernel だけが dst を書く SDK サンプル相当の安全形式**。`prep2b.2a foundation`(commit `fd2aa05`)で AE-managed small buffer は通っているので、完全 1-pass(prep2c)より現実的。
+
+### 9.3 4 段優先順位(2026-05-05 Hiroshi さん承認、優先 1 着手中)
+
+1. **completed handler + error logging + GPU in-flight 1 診断**(本 step、選択肢非依存):
+   - Rust 側 `cb.add_completed_handler` で `cb.status` / `cb.error` を捕捉、`uuid` を渡して `mark_fallen` を直接呼ぶ
+   - env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` で in-flight 1 制限(Rust Mutex で同期化、`wait_until_completed` で次 dispatch まで block)。再 build 不要、UAT で flip して 517 が消えるかで「kernel 時間 vs queue 滞留」を切り分け
+   - **当該 frame は救えない**(AE に既に Ok 返却済み)、目的は ① 診断情報の確保 ② 次 frame 以降の CPU 逃がし ③ MFR 滞留の切り分け
+2. **Hybrid Path β prepass 試作**: `mode15_flg` metadata prepass(1 byte/pixel)→ final per-output gather kernel が prepass 結果を read。最終 kernel だけが dst を書く
+3. **それでも重い場合は `GPU_MAX_LENGTH=16/32` cap**(視覚同等狙い、bit-identical 後退)
+4. **cap 採用時は GPU だけでなく GPU ON プロファイルの CPU fallback も同 cap**:
+   - CPU 通常モード(GPU OFF / 8/16bpc)= MAX_LENGTH=128(従来)
+   - GPU ON プロファイル(GPU パス成功)= GPU MAX_LENGTH=16/32
+   - GPU ON プロファイル(once-fallen で CPU に戻った)= CPU MAX_LENGTH=16/32(GPU と視覚一致)
+   - SequenceData に「GPU プロファイル」flag 追加 →`process_row_range` の MAX_LENGTH 選択に反映
+
+### 9.4 §8 選択肢の再評価
+
+レビュワー判断を反映した位置づけ:
+- **A 直行**: ❌ 時期尚早、Hybrid Path β を試さずに視覚同等に後退するのはもったいない
+- **B(flat region early-out)**: ⚠ 効果不確実、Hybrid Path β に統合すれば prepass で自然に達成できる
+- **C(inside-only GPU)**: ⚠ 安定だが smooth の主効果が line blend なので機能として弱い
+- **D(GPU 撤退)**: ⚠ リリース判断としてはありだが、技術的にはまだ Hybrid Path β の余地
+
+**確定方針**: 優先 1(silent fail handler + in-flight 1 診断)→ 優先 2(Hybrid Path β prepass 試作)を順次 → 重ければ優先 3+4(cap、CPU fallback も同 cap)。優先 2 で十分なら 3+4 は不要、優先 2 でも Hybrid Path β が無効なら C / D に再 pivot 判断。

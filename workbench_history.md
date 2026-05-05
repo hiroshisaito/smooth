@@ -2240,3 +2240,86 @@ prep2b.2b は 3 連続実機 UAT FAIL で打ち切り、Path β(per-output write
 **Memory rule 追加**(2026-05-04):
 - `feedback_gpu_design_review_lessons.md`: command buffer error の async 捕捉、tile dispatch と watchdog の関係、atomic 方向と CPU semantics、Path β 進め方
 
+## Phase 2-A.3 prep2c (Path β v2) 実装 + 連続 FAIL → 判断待ち(2026-05-05)
+
+prep2b.2b option (b) 打ち切り後、Path β v2(per-output writer selection)に着手。2 つの実装 variant を試し、いずれも 32bpc + GPU ON + transparent ON の test 3 で FAIL。HEAD = `2c85871`(test 3 FAIL のまま)で **判断待ち停止**。
+
+**FAIL 系譜**(test 3 = 4400×4400 footage、32bpc Comp、GPU Acceleration ON、transparent ON、キャッシュクリア後 19 frames プレビュー):
+
+1. **commit `1288bfa`(prep2c v1、2 kernel + 2 encoder 構造)**:
+   - 構造: `smooth_combined`(mode_flg=15 centre 4-corner avg を dst に書く)+ `smooth_blend_mode15_outside_per_output`(outside line blend を dst に書く)を別 compute encoder で sequential dispatch
+   - 結果: AE 警告「smooth did not render anything. Transparent pixels will be rendered.」発生、ただし **FrameTask 517 はゼロ**(GPU watchdog 問題は解消、別の理由で AE が dst を不正と判定)
+   - 仮説: SDK_Invert_ProcAmp.cpp は 1 kernel writes dst または multi-kernel writing **異なる buffer** のパターン。**2 kernel 両方が同じ dst に書き込む構造**が AE の render tracking と相性悪いと推定
+
+2. **commit `2c85871`(prep2c v2、unified `smooth_per_pixel` 1 kernel + 1 encoder + 1 dispatch)**:
+   - 構造: thread = 1 出力 pixel、Phase 1(Block 2 → Block 1 で LATER outside 探索)/ Phase 2(self mode_flg=15 inside の 4-corner avg)/ Phase 3(Block 3 → Block 4 で EARLIER outside 探索)を 1 kernel に統合、dst には必ず 1 度だけ書き込む
+   - SDK パターン整合のため `smooth_combined` は pipeline 残置・production 未使用
+   - 結果: **test 3 FAIL**。AE 警告 + log で `FrameTask threw 517` × 1、12 frames render に 22.7 秒(約 **1.9 秒/frame**)
+   - 原因解析: 4400² = 19.4M thread × 4 cardinal × MAX_LENGTH=128 per-pixel scan、メモリ帯域 bound で GPU driver watchdog(~2 秒/dispatch)に断続接触。`MAX_LENGTH=128` を kernel 内で削れば watchdog 抜けるが CPU と非 bit-identical になる
+
+**外部レビュー指摘の盲点(prep2b.2b 受領分が prep2c でも未解決のまま残存)**:
+- 🔴 **silent fail bug 未修正**: Rust `dispatch_smooth_chain` は `cb.commit()` 直後に `Ok(())` を返却、command buffer の async error(GPU timeout / fail)を `mark_fallen` に伝播できていない。test 3 FAIL の根本診断が困難になる原因の一つ
+- 🔴 **memory-bandwidth bound**: 19M thread × 4 block × 128 iter × 5 read × 16 byte ≈ **780 GB / frame** の理論メモリ転送量。Apple Silicon ユニファイド帯域 ~400 GB/s でも 1 frame ~2 秒に近づく
+
+**現状(HEAD `2c85871`)**:
+- test 1(About verification)= **PASS**
+- test 3(32bpc + GPU ON + transparent ON、4400² 19 frames preview)= **FAIL**
+- test 2 / 4 / 5 は focus rule に従い未実施(test 3 PASS まで他 test 並走しない、`feedback_uat_format_consistency.md`)
+
+**選択肢**(Hiroshi さん判断待ち、本セッション開始時に提示済み):
+- A: GPU 用 `SMOOTH_GPU_MAX_LENGTH=16/32` 導入(CPU は MAX_LENGTH=128 維持)+ silent fail handler 実装。CPU と非 bit-identical だが視覚同等、watchdog 抜け
+- B: flat region(全 mode_flg=0 タイル)で early-out するタイル前処理を追加、平均負荷を軽減
+- C: GPU を mode_flg=15 inside(centre 4-corner avg)のみに rollback、line blend を CPU 経由に戻す部分 GPU 化
+- D: GPU 経路を v1.6.0 から外し、Phase 2-A は 32bpc CPU only で出荷(GPU は v1.7.0+ 後回し)
+
+A〜C いずれを採用しても **silent fail handler(cb completed handler で error→`mark_fallen` 伝播)は必須**。これは選択肢に依存しない先行実装可能項目。
+
+**ドキュメント反映状況**(本記載で同期):
+- `docs/PHASE_2A_STATUS.md`: prep2c FAIL 反映 + 判断待ち状態に更新
+- `docs/PHASE_2A_PREP2B_DESIGN_MEMO.md` §8: prep2c v1/v2 outcome + watchdog 衝突の数値根拠を追記
+- memory `feedback_gpu_design_review_lessons.md` の盲点リスト(silent fail / memory bandwidth)は引き続き有効
+
+## Phase 2-A.3 prep2c 後の外部レビュー第 2 弾 + 優先 1 着手(2026-05-05)
+
+prep2c v1/v2 連続 FAIL 後、Hiroshi さん経由の外部レビュー第 2 弾を受領。`§8` 選択肢 A 直行は時期尚早と判明し、4 段優先順位に再構成:
+
+1. **completed handler + error logging + GPU in-flight 1 診断**(本コミット、選択肢非依存)
+2. Hybrid Path β prepass 試作(`mode15_flg` metadata 1 byte/pixel + final per-output gather)
+3. それでも重い場合は `GPU_MAX_LENGTH=16/32` cap
+4. cap 採用時は GPU だけでなく GPU ON プロファイルの CPU fallback も同 cap
+
+詳細根拠 + Hybrid Path β 設計は `docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §9` + memory `feedback_gpu_design_review_lessons.md` の盲点 6〜10 番に記録。
+
+### 優先 1 実装(本コミット)
+
+**変更概要**:
+
+- **silent-fail completed handler**: `metal.rs::dispatch_smooth_chain` に `cb.add_completed_handler` を追加。完了時に `cb.status` を検査、`Completed` 以外なら `eprintln!` 診断 + `crate::gpu::fallback::mark_fallen(uuid)` を呼んで次フレーム以降を CPU 経路に逃がす
+- **`SMOOTH_GPU_INFLIGHT_LIMIT=1` env var**: dispatch 毎に env 確認、`1` なら per-backend `Mutex` を `commit() + wait_until_completed()` を跨いで保持。MFR 並行を 1 in-flight に絞り、queue 滞留 vs 純粋 kernel 時間を切り分け。再 build 不要、UAT で flip 可能
+- **FFI 0x0002_000d → 0x0002_000e**: `smooth_core_metal_dispatch_smooth_chain` に `uuid_lo: u64, uuid_hi: u64` を追加。Effect.cpp の sequence UUID を渡す配線
+- **Cargo.toml**: `block = "0.1"` を mac target dep に追加(metal-rs の transitive dep として既に lock 済、download 不要)
+
+**設計上の限界**(レビュワー指摘):
+- completed handler は **次フレーム以降を CPU に逃がす**ための機構。失敗した当該 frame 自体は AE に既に Ok 返却済みで、AE 側で `FrameTask 517` 化されてから retry / abort に入る。当該 frame の見た目を救う機構ではない
+- in-flight 1 制限は性能を犠牲にする診断モード、production では env var 無し(default 並行)
+
+**変更したファイル**:
+- `rust/smooth_core/Cargo.toml`: block dep 追加
+- `rust/smooth_core/src/gpu/metal.rs`: dispatch_smooth_chain に uuid + handler + inflight_lock を追加
+- `rust/smooth_core/src/lib.rs`: smooth_core_version 0x0002_000d → 0x0002_000e、FFI signature に uuid_lo/uuid_hi 追加
+- `rust/smooth_core/include/smooth_core_ffi.h`: signature 同期 + 仕様 doc 更新
+- `Effect.cpp`: SmartRenderGpu で uuid を read してから dispatch に渡す、rc!=0 時の mark_fallen は idempotent コメント追加
+
+**build / test 結果**:
+- `cargo test --release` 24/24 PASS
+- `xcodebuild -scheme smooth -configuration Release` BUILD SUCCEEDED
+- 既存 regression は次フェーズで実施(API 変更ありの sanity build)
+
+**期待される UAT 観測**(env var なし、default 並行):
+- test 1(About): `rust_core 0.1.0+<sha>` + `ffi=0x0002000e`
+- test 3(32bpc + GPU ON + transparent ON、4400² 19 frames preview): **依然 FAIL 想定**(優先 1 は当該 frame を救わない、診断情報を取るための build)
+- 観測ポイント: log に `[smooth GPU] command buffer FAILED: status=...` 行が出るか? 出れば silent fail bug が解消、status 値で原因切り分け可能(Timeout / OutOfMemory / 等)
+- env var 切替テスト: `export SMOOTH_GPU_INFLIGHT_LIMIT=1` → AE 再起動 → 同 footage で test 3 → `FrameTask 517` の発生数が変化するか観測(消えれば queue 滞留が要因の一つと確定)
+
+**次 step**: UAT 結果を見て、(i) status 値が timeout 系なら Hybrid Path β prepass(優先 2)で平坦領域を early-out できるか試す、(ii) in-flight 1 で 517 が消えるなら queue 滞留対策(serial-by-default option)も検討、(iii) status 値がない / 別経路の FAIL なら追加診断
+
