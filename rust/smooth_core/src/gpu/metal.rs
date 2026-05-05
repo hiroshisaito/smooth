@@ -314,29 +314,49 @@ impl MetalBackend {
     /// MAX_LENGTH cardinal-ray scans (worst case ~540K ops/pixel,
     /// average much less due to early break on first match per block).
     ///
-    /// Sub-stage C-2.5b.2-prep2c diagnostic (priority 1, 2026-05-05):
-    /// `uuid_lo` / `uuid_hi` identify the AE sequence instance for the
-    /// fallen-state registry. A `cb.add_completed_handler` block is
-    /// installed before commit; on completion the handler inspects the
-    /// command buffer status and, if the GPU surfaced an error
-    /// (timeout / OOM / device-removed / etc.), logs a diagnostic line
-    /// and calls `mark_fallen(uuid)` so subsequent frames for the same
-    /// instance fall back to the CPU path. The current frame cannot be
-    /// rescued — it has already been returned `Ok(())` to AE — but
-    /// next-frame protection prevents repeated GPU FAIL on every frame
-    /// of a render queue.
+    /// Sub-stage C-2.5b.2-prep2c-step1 (2026-05-05): metadata-driven
+    /// Hybrid Path β. Two-pass dispatch in a single command buffer:
+    ///   pass 1 — `smooth_detect` writes 1 byte/pixel mode_flg metadata
+    ///            into `metadata_buf` (AE-managed, allocated by C++ via
+    ///            `PF_GPUDeviceSuite::AllocateDeviceMemory`).
+    ///   pass 2 — `smooth_per_pixel` reads src + metadata, performs a
+    ///            cap-range cardinal scan early-out for flat regions,
+    ///            and runs full per-output writer selection bounded by
+    ///            `gpu_max_length` for the remainder. Writes dst once
+    ///            per thread.
     ///
-    /// Env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` (read at every dispatch,
-    /// no rebuild required) toggles a per-backend `Mutex` held across
-    /// `commit() + wait_until_completed()`. With it set, only one
-    /// command buffer is in flight per device at any time — useful to
-    /// diagnose whether MFR queue saturation contributes to
-    /// `FrameTask 517` timeouts. Default off (concurrent MFR).
+    /// The two passes write DIFFERENT buffers (metadata vs dst), which
+    /// matches the SDK_Invert_ProcAmp 2-kernel pattern. AE's
+    /// "smooth did not render anything" warning previously triggered on
+    /// designs with two kernels both writing dst (prep2c v1) — that
+    /// pitfall does not apply here because pass 1 only writes
+    /// `metadata_buf` and pass 2 is the sole writer to `dst`.
+    ///
+    /// `gpu_max_length` is read at run time from env var
+    /// `SMOOTH_GPU_MAX_LENGTH` (default 32). Pass 16 / 32 / 64 to
+    /// trade quality for speed without rebuilding. The cap bounds:
+    ///   - the cardinal early-out scan distance (4 × cap metadata reads)
+    ///   - the Phase 1/2/3 search radius for candidate centres
+    ///   - the inner `count_length_two_lines` line scan
+    /// CPU equivalence is broken at the cap — step2 will share the
+    /// same cap with the CPU path under the GPU profile flag.
+    ///
+    /// `uuid_lo` / `uuid_hi` identify the AE sequence instance. The
+    /// silent-fail completed handler is preserved from prep2c diag —
+    /// on GPU error it logs + calls `mark_fallen` for next-frame CPU
+    /// fallback. The current frame cannot be rescued (already returned
+    /// 0 to AE).
+    ///
+    /// Env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` is preserved as a
+    /// diagnostic toggle (Mutex + wait_until_completed). Production
+    /// path leaves it unset — wait_until_completed inside SmartRender
+    /// pushes the call duration past AE's per-frame budget.
     pub fn dispatch_smooth_chain(
         &self,
         ctx: &mut FrameContext,
         src_buf:           *mut c_void,
         dst_buf:           *mut c_void,
+        metadata_buf:      *mut c_void,
         src_pitch_pixels:  u32,
         dst_pitch_pixels:  u32,
         width:             u32,
@@ -348,13 +368,22 @@ impl MetalBackend {
         uuid_lo:           u64,
         uuid_hi:           u64,
     ) -> Result<(), GpuError> {
-        if src_buf.is_null() || dst_buf.is_null() {
-            return Err(GpuError::Dispatch("null src/dst buffer".into()));
+        if src_buf.is_null() || dst_buf.is_null() || metadata_buf.is_null() {
+            return Err(GpuError::Dispatch("null src/dst/metadata buffer".into()));
         }
         if width == 0 || height == 0 {
             return Err(GpuError::Dispatch("zero extent".into()));
         }
         let _ = &ctx.scratch;
+
+        // Read SMOOTH_GPU_MAX_LENGTH env var per dispatch (cheap, allows
+        // run-time cap sweep without rebuild). Parse failures fall back
+        // to default 32. Clamp to [4, 128] to avoid pathological inputs.
+        let gpu_max_length: u32 = std::env::var("SMOOTH_GPU_MAX_LENGTH")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .map(|n| n.clamp(4, 128))
+            .unwrap_or(32);
 
         let inflight_limit_1 = std::env::var_os("SMOOTH_GPU_INFLIGHT_LIMIT")
             .map(|v| v == "1")
@@ -378,6 +407,9 @@ impl MetalBackend {
             let dst = unsafe {
                 std::mem::transmute::<*mut c_void, &metal::BufferRef>(dst_buf)
             };
+            let metadata = unsafe {
+                std::mem::transmute::<*mut c_void, &metal::BufferRef>(metadata_buf)
+            };
 
             let group = MTLSize::new(16, 16, 1);
             let groups = MTLSize::new(
@@ -386,33 +418,48 @@ impl MetalBackend {
                 1,
             );
 
-            // Single unified per-pixel kernel: handles outside writer
-            // selection + mode_flg=15 inside + identity passthrough,
-            // writing dst exactly once per thread. Mirrors
-            // SDK_Invert_ProcAmp's 1-kernel-writes-dst pattern.
+            // Pass 1: smooth_detect → metadata buffer (1 byte/pixel).
+            // Writes mode_flg + fast_compare bit; boundary pixels = 0.
+            {
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&self.pipeline_detect);
+                enc.set_buffer(0, Some(src), 0);
+                enc.set_buffer(1, Some(metadata), 0);
+                enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(3, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &logical_width as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &range_f32 as *const f32 as *const c_void);
+                enc.dispatch_thread_groups(groups, group);
+                enc.end_encoding();
+            }
+
+            // Pass 2: smooth_per_pixel reads src + metadata → dst.
+            // Cap-range early-out + bounded per-output writer selection.
             {
                 let enc = cb.new_compute_command_encoder();
                 enc.set_compute_pipeline_state(&self.pipeline_per_pixel);
                 enc.set_buffer(0, Some(src), 0);
                 enc.set_buffer(1, Some(dst), 0);
-                enc.set_bytes(2, 4, &src_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(3, 4, &dst_pitch_pixels as *const u32 as *const c_void);
-                enc.set_bytes(4, 4, &width  as *const u32 as *const c_void);
-                enc.set_bytes(5, 4, &height as *const u32 as *const c_void);
-                enc.set_bytes(6, 4, &logical_width as *const u32 as *const c_void);
-                enc.set_bytes(7, 4, &range_f32 as *const f32 as *const c_void);
-                enc.set_bytes(8, 4, &white_opt as *const u32 as *const c_void);
-                enc.set_bytes(9, 4, &line_weight as *const f32 as *const c_void);
+                enc.set_buffer(2, Some(metadata), 0);
+                enc.set_bytes(3, 4, &src_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(4, 4, &dst_pitch_pixels as *const u32 as *const c_void);
+                enc.set_bytes(5, 4, &width  as *const u32 as *const c_void);
+                enc.set_bytes(6, 4, &height as *const u32 as *const c_void);
+                enc.set_bytes(7, 4, &logical_width as *const u32 as *const c_void);
+                enc.set_bytes(8, 4, &range_f32 as *const f32 as *const c_void);
+                enc.set_bytes(9, 4, &white_opt as *const u32 as *const c_void);
+                enc.set_bytes(10, 4, &line_weight as *const f32 as *const c_void);
+                enc.set_bytes(11, 4, &gpu_max_length as *const u32 as *const c_void);
                 enc.dispatch_thread_groups(groups, group);
                 enc.end_encoding();
             }
 
-            // Silent-fail handler: on completion, inspect status. If the
-            // GPU failed (timeout / OOM / device-removed / etc.), log a
-            // diagnostic line and mark the AE sequence instance fallen
-            // so subsequent frames take the CPU path. The block is
-            // copied (heap) so it outlives this stack frame; metal-rs
-            // retains the heap block for the addCompletedHandler call.
+            // Silent-fail handler (preserved from prep2c diag): on
+            // completion inspect status. GPU error → log + mark_fallen
+            // for next-frame CPU fallback. Step1 UAT result confirmed
+            // the GPU itself rarely errors here (handler stays silent),
+            // but the wiring is retained for non-step1 failure modes.
             let handler = ConcreteBlock::new(move |cb: &CommandBufferRef| {
                 let status = cb.status();
                 if status != MTLCommandBufferStatus::Completed {
@@ -431,12 +478,11 @@ impl MetalBackend {
             cb.commit();
 
             if inflight_limit_1 {
-                // Diagnostic mode: keep the in-flight mutex held until
-                // this command buffer completes. Forces serial GPU
-                // execution across MFR threads — per-thread frame time
-                // should fall to ~kernel time alone (no queue
-                // contention). If `FrameTask 517` disappears with this
-                // env var set, queue saturation was a contributor.
+                // Diagnostic mode only: forces serial GPU execution.
+                // Production path leaves env var unset — synchronous
+                // wait inside SmartRender pushes call duration past
+                // AE's per-frame budget (UAT 2026-05-05 confirmed 517
+                // worsens with this on under MFR).
                 cb.wait_until_completed();
             }
 

@@ -1377,44 +1377,76 @@ static PF_Err SmartRenderGpu(PF_InData            *in_data,
         // smoothing<> for the 32bpc branch: slider × max(=1.0) × 4 / 100.
         const float range_f32 = (float)((info->range * 4.0) / 100.0);
         // Match the CPU side's line_weight derivation
-        // (info->line_weight / 2.0 + 0.5). Used by the Path β v2
-        // mode_flg=15 outside per-output kernel.
+        // (info->line_weight / 2.0 + 0.5). Used by the per-output
+        // mode_flg=15 outside kernel.
         const float line_weight = (float)(info->line_weight / 2.0 + 0.5);
 
-        // Sub-stage C-2.5b.2-prep2c (Path β v2): no intermediate
-        // buffers — per-output writer selection kernel does its own
-        // gather scan from src. Replaces option (b)'s atomic_min
-        // priority buffer chain (commits ac408f7 / 920e80e / 6f3a605
-        // all reverted after UAT FAIL). See
-        // docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §7.
+        // Sub-stage C-2.5b.2-prep2c-step1 (FFI 0x0002_000f+, 2026-05-05):
+        // Hybrid Path β. Two-pass GPU dispatch — pass 1 (smooth_detect)
+        // writes 1 byte/pixel mode_flg metadata, pass 2 (smooth_per_pixel)
+        // reads metadata + src and writes dst with cap-range cardinal
+        // early-out for flat regions. The metadata buffer is AE-managed
+        // (allocated via PF_GPUDeviceSuite::AllocateDeviceMemory per the
+        // prep2b.2a foundation pattern that PASSed at real-device UAT).
+        // Cap is read at run-time by Rust from env var
+        // SMOOTH_GPU_MAX_LENGTH (default 32). See
+        // docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §10.
         //
-        // FFI 0x0002_000e+: pass uuid_lo/uuid_hi so Rust can install a
-        // command-buffer completed handler that calls mark_fallen on
-        // GPU error (silent-fail bug fix). Env var
-        // SMOOTH_GPU_INFLIGHT_LIMIT=1 forces serial GPU execution
-        // (Mutex + wait_until_completed) for diagnostic builds. See
-        // docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §9.
+        // CPU equivalence at the cap is intentionally broken in step1.
+        // step2 will share the cap with the CPU path under the GPU
+        // profile flag for network-render / mid-stream-fallback
+        // continuity. Step1 builds are therefore NOT for shipping.
         uint64_t cb_uuid_lo = 0, cb_uuid_hi = 0;
         (void)read_sequence_uuid(in_data, &cb_uuid_lo, &cb_uuid_hi);
 
-        int32_t rc = smooth_core_metal_dispatch_smooth_chain(
-            metal_handle, src_buf, dst_buf,
-            src_pitch_pixels, dst_pitch_pixels,
-            width, height, /* logical_width */ width,
-            range_f32, white_opt, line_weight,
-            cb_uuid_lo, cb_uuid_hi);
+        // Allocate metadata buffer (1 byte per pixel) via the GPU suite.
+        // Size = width * height bytes; allocations through this API are
+        // visible to AE's GPU world synchroniser (proven safe by the
+        // prep2b.2a foundation, commit fd2aa05, on the same MFR + 4400²
+        // + 32bpc + 19-frame preview test).
+        void *metadata_buf = NULL;
+        const A_u_long device_index = extraP->input->device_index;
+        const size_t metadata_bytes = (size_t)width * (size_t)height;
+        PF_Err alloc_err = gpu_suite->AllocateDeviceMemory(
+            in_data->effect_ref, device_index, metadata_bytes, &metadata_buf);
 
-        if (rc != 0) {
+        if (alloc_err || !metadata_buf) {
+            // OOM or other allocation failure — passthrough fill dst
+            // and mark fallen so the next frame goes to CPU.
             gpu_passthrough_to_dst(
                 metal_handle, src_buf, dst_buf,
                 src_pitch_pixels, dst_pitch_pixels, width, height);
-            // The async completed handler will also mark_fallen if the
-            // GPU reports an error after this point; that path covers
-            // the silent-fail case where commit() returned but the GPU
-            // failed during execution. Marking here too is idempotent.
             if (cb_uuid_lo || cb_uuid_hi) {
                 smooth_core_gpu_mark_fallen(cb_uuid_lo, cb_uuid_hi);
             }
+        } else {
+            int32_t rc = smooth_core_metal_dispatch_smooth_chain(
+                metal_handle, src_buf, dst_buf, metadata_buf,
+                src_pitch_pixels, dst_pitch_pixels,
+                width, height, /* logical_width */ width,
+                range_f32, white_opt, line_weight,
+                cb_uuid_lo, cb_uuid_hi);
+
+            if (rc != 0) {
+                gpu_passthrough_to_dst(
+                    metal_handle, src_buf, dst_buf,
+                    src_pitch_pixels, dst_pitch_pixels, width, height);
+                // The async completed handler will also mark_fallen on
+                // GPU error after this point — that path covers the
+                // silent-fail case where commit() returned but the GPU
+                // failed during execution. Marking here too is idempotent.
+                if (cb_uuid_lo || cb_uuid_hi) {
+                    smooth_core_gpu_mark_fallen(cb_uuid_lo, cb_uuid_hi);
+                }
+            }
+
+            // Free the metadata buffer in all paths. The kernels accessed
+            // it via raw MTLBuffer pointers; cb.commit() has already
+            // been called by Rust, but AE owns the device memory and
+            // schedules its release after kernel completion (no manual
+            // wait_until_completed needed on production path — env var
+            // SMOOTH_GPU_INFLIGHT_LIMIT=1 path is diagnostic only).
+            gpu_suite->FreeDeviceMemory(in_data->effect_ref, device_index, metadata_buf);
         }
     }
 

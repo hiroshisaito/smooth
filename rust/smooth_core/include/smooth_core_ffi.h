@@ -333,12 +333,27 @@ int32_t smooth_core_metal_dispatch_preprocess(
  * AE and AE may report `FrameTask 517` independently. Pass 0/0 to opt
  * out (e.g., from unit tests).
  *
- * Env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` (read at every dispatch, no
- * rebuild required) forces serial GPU execution: a per-backend mutex
- * is held across `commit() + wait_until_completed()` so at most one
- * command buffer is in flight per device. Diagnostic only — useful
- * for separating "kernel takes too long" from "MFR queue saturation
- * pushes per-thread time over watchdog".
+ * `metadata_buf` (FFI 0x0002_000f+, prep2c-step1) is an AE-managed
+ * device memory pointer of `width * height` bytes (1 byte per pixel),
+ * allocated by the caller via `PF_GPUDeviceSuite::AllocateDeviceMemory`
+ * before this call and freed after. Pass 1 (smooth_detect) writes
+ * mode_flg + fast_compare bit per pixel; pass 2 (smooth_per_pixel)
+ * reads it. Must not be NULL. The two passes write DIFFERENT buffers
+ * (metadata vs dst) — matches the SDK_Invert_ProcAmp 2-kernel pattern
+ * and avoids the prep2c v1 issue where two kernels both wrote dst.
+ *
+ * Cap is read at run time from env var `SMOOTH_GPU_MAX_LENGTH`
+ * (default 32, clamped to [4, 128]). Bounds (a) the cap-range cardinal
+ * early-out scan distance, (b) the per-output writer search radius,
+ * (c) the inner count_length_two_lines line scan. CPU equivalence at
+ * this cap is broken — step2 will share the same cap with the CPU
+ * path under the GPU profile flag.
+ *
+ * Env var `SMOOTH_GPU_INFLIGHT_LIMIT=1` (diagnostic only) forces
+ * serial GPU execution: a per-backend mutex is held across
+ * `commit() + wait_until_completed()`. Production path leaves it
+ * unset — the synchronous wait inside SmartRender pushes the call
+ * past AE's per-frame budget (UAT 2026-05-05 confirmed 517 worsens).
  *
  * Returns 0 on success; non-zero on any kernel-submit failure. Caller
  * marks the instance fallen on non-zero per RFC §4.4 採用 (i). */
@@ -346,6 +361,7 @@ int32_t smooth_core_metal_dispatch_smooth_chain(
     void    *handle,
     void    *src_buf,
     void    *dst_buf,
+    void    *metadata_buf,
     uint32_t src_pitch_pixels,
     uint32_t dst_pitch_pixels,
     uint32_t width,

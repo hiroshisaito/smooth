@@ -258,7 +258,8 @@ inline CountLenResult count_length_two_lines(
     int  step_x,    int step_y,
     int  min_bound, int max_bound, int limit_from_here,
     float range,
-    uint white_opt)
+    uint white_opt,
+    int  max_length)
 {
     CountLenResult result;
     result.length = 0;
@@ -274,9 +275,15 @@ inline CountLenResult count_length_two_lines(
 
     int length = 0;
 
-    // Bounded loop: SMOOTH_MAX_LENGTH iterations cap divergence between
-    // threads even if the CPU bounding logic would have allowed more.
-    for (int iter = 0; iter < SMOOTH_MAX_LENGTH; iter++) {
+    // Bounded loop: `max_length` iterations cap divergence between
+    // threads. Step1 (prep2c-step1, 2026-05-05) replaces the previous
+    // SMOOTH_MAX_LENGTH=128 with a runtime `gpu_max_length` derived from
+    // env var SMOOTH_GPU_MAX_LENGTH (default 32). Lines that would have
+    // extended past the cap don't reach the output pixel anyway because
+    // the per-output writer scan also bounds search radius by the same
+    // cap. CPU equivalence is broken at this point — that's accepted for
+    // the GPU profile (see design memo §10).
+    for (int iter = 0; iter < max_length; iter++) {
         const int probe = length + limit_from_here;
         if (!(min_bound < probe && probe < max_bound)) break;
 
@@ -506,9 +513,49 @@ struct WriterCandidate {
 //
 // Returns updated WriterCandidate. If validation fails, returns the
 // passed-in `best` unchanged.
+// Step1 helper (prep2c-step1, 2026-05-05): compute corner equality flg
+// for a centre that has ALREADY been verified as mode_flg=15 via
+// metadata. Skips the mode15 check (4 cardinal compares + fast_compare)
+// that compute_centre_flg_15 does, since metadata already provides that
+// answer. Returns the 4-bit corner flg (UL=1, UR=2, BR=4, BL=8).
+//
+// Caller MUST have verified `(metadata[cy*width+cx] & 0x0Fu) == 0x0Fu`
+// before calling this function. Boundary checks are also caller's
+// responsibility (the metadata kernel writes 0 for boundary pixels, so
+// metadata_is_mode15 = false there, which prevents reaching this).
+inline uint compute_centre_corner_flg_only(
+    device const float4* src,
+    uint src_pitch,
+    uint cx, uint cy,
+    float range,
+    uint white_opt)
+{
+    const float4 c  = load_strip(src[cy * src_pitch + cx], white_opt);
+    const float4 ul = load_strip(src[(cy - 1u) * src_pitch + (cx - 1u)], white_opt);
+    const float4 ur = load_strip(src[(cy - 1u) * src_pitch + (cx + 1u)], white_opt);
+    const float4 br = load_strip(src[(cy + 1u) * src_pitch + (cx + 1u)], white_opt);
+    const float4 bl = load_strip(src[(cy + 1u) * src_pitch + (cx - 1u)], white_opt);
+
+    uint flg = 0u;
+    if (compare_pixel_equal(c, ul, range)) flg |= 1u;
+    if (compare_pixel_equal(c, ur, range)) flg |= 2u;
+    if (compare_pixel_equal(c, br, range)) flg |= 4u;
+    if (compare_pixel_equal(c, bl, range)) flg |= 8u;
+    return flg;
+}
+
+// Step1 helper: 1 metadata byte → "is this a mode_flg=15 centre?"
+// Bits 0-3 of the metadata byte are the 4-cardinal compare result.
+// The detect kernel writes 0 for boundary / fast_compare-failing
+// pixels so this returns false in those cases.
+inline bool metadata_is_mode15(uchar m) {
+    return (m & 0x0Fu) == 0x0Fu;
+}
+
 inline WriterCandidate try_block_candidate(
     WriterCandidate best,
     device const float4* src,
+    device const uchar*  metadata,
     uint src_pitch,
     int  cx, int cy,
     int  k,
@@ -522,13 +569,20 @@ inline WriterCandidate try_block_candidate(
     int  step_x, int step_y,
     int  scan_min, int scan_max, int scan_limit,
     uint width, uint height, uint logical_width,
-    float range, uint white_opt, float line_weight)
+    float range, uint white_opt, float line_weight,
+    int  max_length)
 {
-    // Inner region + mode_flg=15 check
+    // Inner region check (also covered by metadata = 0 for boundary,
+    // but kept defensively for the candidate (cx, cy) coords).
     if (cx < 1 || cy < 1 || uint(cx) + 1u >= logical_width || uint(cy) + 1u >= height) return best;
-    const uint flg = compute_centre_flg_15(src, src_pitch, uint(cx), uint(cy),
-                                            logical_width, height, range, white_opt);
-    if (flg == 0xFFu) return best;
+
+    // Step1: mode_flg=15 check via metadata (replaces 5-src-read +
+    // 4-compare path inside compute_centre_flg_15).
+    if (!metadata_is_mode15(metadata[uint(cy) * width + uint(cx)])) return best;
+
+    // Corner equality flg still requires 4 diagonal src reads + compares.
+    const uint flg = compute_centre_corner_flg_only(
+        src, src_pitch, uint(cx), uint(cy), range, white_opt);
 
     // Block fires: (flg & block_fire_mask) != block_fire_mask
     if ((flg & block_fire_mask) == block_fire_mask) return best;
@@ -545,14 +599,14 @@ inline WriterCandidate try_block_candidate(
         return best;  // neither sub-variant fires
     }
 
-    // count_length_two_lines from centre's perspective
+    // count_length_two_lines from centre's perspective, bounded by cap.
     const CountLenResult clr = count_length_two_lines(
         src, src_pitch,
         target_x, target_y,
         target_x + ref_off_x, target_y + ref_off_y,
         step_x, step_y,
         scan_min, scan_max, scan_limit,
-        range, white_opt);
+        range, white_opt, max_length);
     if (clr.length <= 0) return best;
 
     const float lw = clr.t0_flg ? 0.5f : line_weight;
@@ -587,43 +641,103 @@ inline WriterCandidate try_block_candidate(
 }
 
 // smooth_per_pixel: SOLE production kernel for the GPU smooth path
-// (replaces the prior 2-kernel chain smooth_combined → outside_per_output).
+// (Sub-stage C-2.5b.2-prep2c-step1, 2026-05-05).
 //
 // Each thread = one output pixel. The thread:
+// 0. Reads metadata (1 byte/pixel) for self + 4 cardinal directions up
+//    to `gpu_max_length` distance. If NO mode_flg=15 candidate is found
+//    in any direction (and self is not mode_flg=15), no centre within
+//    cap range can write to me via line blend AND I'm not a self-inside
+//    centre → safe to copy src + return. Most flat regions exit here in
+//    O(1 + 4*cap) metadata reads.
 // 1. Searches Block 2 then Block 1 for outside writers LATER than self-inside
 //    in CPU scan order (cy > py, or cy=py with cx>px).
-// 2. If no later outside found, checks if THIS pixel is a mode_flg=15 centre
-//    (would do its own inside 4-corner avg write).
+// 2. If no later outside found, checks via metadata if THIS pixel is a
+//    mode_flg=15 centre (would do its own inside 4-corner avg write).
 // 3. If neither, searches Block 3 then Block 4 for EARLIER outside writers
 //    (since they're the only writers when no later writer exists).
 // 4. Writes dst exactly once based on the chosen writer (or src passthrough).
 //
-// This replaces the earlier 2-kernel design (smooth_combined + outside_per_output)
-// where AE flagged "smooth did not render anything" — likely because the second
-// kernel only conditionally wrote dst, confusing AE's render tracking. SDK
-// pattern (SDK_Invert_ProcAmp.cpp) uses 1 kernel writing dst, OR multiple
-// kernels but each writing DIFFERENT buffers. Consolidating to 1 kernel is the
-// minimum-risk pattern aligned with the SDK.
+// History: prep2c v2 (commit 2c85871) had this kernel without metadata
+// or cap — it ran 4 cardinal scans of MAX_LENGTH=128 per output pixel,
+// 19M threads × ~780 GB/frame memory traffic, hitting ~2 sec/frame at
+// 4400² and tripping AE's per-frame timeout (517 errors). step1 adds
+// metadata-driven early-out for flat regions and bounds the scan by a
+// runtime cap (env var SMOOTH_GPU_MAX_LENGTH, default 32) to bring the
+// per-frame time within AE's tolerance. CPU equivalence at the GPU
+// profile = "cap + GPU mode set" is enforced separately in step2.
 kernel void smooth_per_pixel(
-    device const float4* src           [[buffer(0)]],  // BGRA128 input
-    device float4*       dst           [[buffer(1)]],  // BGRA128 output (every pixel written)
-    constant uint&       src_pitch     [[buffer(2)]],
-    constant uint&       dst_pitch     [[buffer(3)]],
-    constant uint&       width         [[buffer(4)]],
-    constant uint&       height        [[buffer(5)]],
-    constant uint&       logical_width [[buffer(6)]],
-    constant float&      range         [[buffer(7)]],
-    constant uint&       white_opt     [[buffer(8)]],
-    constant float&      line_weight   [[buffer(9)]],
-    uint2                gid           [[thread_position_in_grid]])
+    device const float4* src            [[buffer(0)]],  // BGRA128 input
+    device float4*       dst            [[buffer(1)]],  // BGRA128 output (every pixel written)
+    device const uchar*  metadata       [[buffer(2)]],  // 1 byte/pixel mode_flg + fast_compare
+    constant uint&       src_pitch      [[buffer(3)]],
+    constant uint&       dst_pitch      [[buffer(4)]],
+    constant uint&       width          [[buffer(5)]],
+    constant uint&       height         [[buffer(6)]],
+    constant uint&       logical_width  [[buffer(7)]],
+    constant float&      range          [[buffer(8)]],
+    constant uint&       white_opt      [[buffer(9)]],
+    constant float&      line_weight    [[buffer(10)]],
+    constant uint&       gpu_max_length [[buffer(11)]],
+    uint2                gid            [[thread_position_in_grid]])
 {
     if (gid.x >= width || gid.y >= height) return;
     const int px = int(gid.x);
     const int py = int(gid.y);
+    const int cap = int(gpu_max_length);
+    const int width_i  = int(width);
+    const int height_i = int(height);
 
     // Default output: src[me] with white-strip applied (passthrough case).
     const float4 src_me = src[uint(py) * src_pitch + uint(px)];
-    float4 out = load_strip(src_me, white_opt);
+    const float4 out_default = load_strip(src_me, white_opt);
+
+    // ===== Phase 0: cap-range cardinal early-out scan =====
+    // Read metadata for self + 4 cardinal directions up to `cap`.
+    // If NO position (self or candidate) shows mode_flg=15, the output
+    // pixel cannot be touched by any line blend AND isn't itself a
+    // mode15 inside → src copy.
+    //
+    // Self flat alone is NOT sufficient (a centre within cap could write
+    // to me via line blend) — the cap-range cardinal scan is the
+    // tightest correct condition, per Hiroshi 2026-05-05 review.
+    const uchar m_self = metadata[uint(py) * width + uint(px)];
+    bool any_mode15 = metadata_is_mode15(m_self);
+    if (!any_mode15) {
+        for (int k = 1; k <= cap; k++) {
+            const int xp = px + k;
+            if (xp >= width_i) break;
+            if (metadata_is_mode15(metadata[uint(py) * width + uint(xp)])) { any_mode15 = true; break; }
+        }
+    }
+    if (!any_mode15) {
+        for (int k = 1; k <= cap; k++) {
+            const int xn = px - k;
+            if (xn < 0) break;
+            if (metadata_is_mode15(metadata[uint(py) * width + uint(xn)])) { any_mode15 = true; break; }
+        }
+    }
+    if (!any_mode15) {
+        for (int k = 1; k <= cap; k++) {
+            const int yp = py + k;
+            if (yp >= height_i) break;
+            if (metadata_is_mode15(metadata[uint(yp) * width + uint(px)])) { any_mode15 = true; break; }
+        }
+    }
+    if (!any_mode15) {
+        for (int k = 1; k <= cap; k++) {
+            const int yn = py - k;
+            if (yn < 0) break;
+            if (metadata_is_mode15(metadata[uint(yn) * width + uint(px)])) { any_mode15 = true; break; }
+        }
+    }
+    if (!any_mode15) {
+        dst[uint(py) * dst_pitch + uint(px)] = out_default;
+        return;
+    }
+
+    // ===== Phase 1/2/3: full per-output writer selection (cap-bounded) =====
+    float4 out = out_default;
 
     WriterCandidate best;
     best.found = false;
@@ -634,13 +748,13 @@ kernel void smooth_per_pixel(
     best.len = 0.0f;
 
     // ===== Phase 1: Block 2 (cy > py) — LATER than self-inside =====
-    // Centres at (px, py+1+k). Scan k=MAX-1 down (largest cy first).
-    for (int k = SMOOTH_MAX_LENGTH - 1; k >= 0; k--) {
+    // Centres at (px, py+1+k). Scan k=cap-1 down (largest cy first).
+    for (int k = cap - 1; k >= 0; k--) {
         const int cx = px;
         const int cy = py + 1 + k;
         if (cy < 1 || uint(cy) >= height) continue;
         WriterCandidate trial = try_block_candidate(
-            best, src, src_pitch,
+            best, src, metadata, src_pitch,
             cx, cy, k, /*block_id*/ 2,
             /*flg1*/ -1, 0, 1u,
             /*flg2*/  1, 0, 2u,
@@ -649,19 +763,19 @@ kernel void smooth_per_pixel(
             /*step*/   0, -1,
             /*scan*/   1, int(height) - 2, cy,
             width, height, logical_width,
-            range, white_opt, line_weight);
+            range, white_opt, line_weight, cap);
         if (trial.found) { best = trial; break; }
     }
 
     // ===== Phase 1: Block 1 (cy=py, cx > px) — LATER than self-inside =====
-    // Centres at (px+1+k, py). Scan k=MAX-1 down (largest cx first).
+    // Centres at (px+1+k, py). Scan k=cap-1 down (largest cx first).
     if (!best.found) {
-        for (int k = SMOOTH_MAX_LENGTH - 1; k >= 0; k--) {
+        for (int k = cap - 1; k >= 0; k--) {
             const int cx = px + 1 + k;
             const int cy = py;
             if (uint(cx) >= width) continue;
             WriterCandidate trial = try_block_candidate(
-                best, src, src_pitch,
+                best, src, metadata, src_pitch,
                 cx, cy, k, /*block_id*/ 1,
                 /*flg1*/ 0, -1, 1u,
                 /*flg2*/ 0,  1, 8u,
@@ -670,24 +784,23 @@ kernel void smooth_per_pixel(
                 /*step*/   -1, 0,
                 /*scan*/   1, int(width) - 2, cx,
                 width, height, logical_width,
-                range, white_opt, line_weight);
+                range, white_opt, line_weight, cap);
             if (trial.found) { best = trial; break; }
         }
     }
 
     // ===== Phase 2: My own inside (mode_flg=15 4-corner avg) =====
     // Only relevant when no later outside writer exists. Inside is later
-    // than block 3 / block 4 candidates so it dominates them.
+    // than block 3 / block 4 candidates so it dominates them. Step1
+    // uses metadata for the mode_flg=15 check and only falls into the
+    // corner-flg compute when necessary.
     bool   is_inside  = false;
     uint   inside_flg = 0u;
-    if (!best.found) {
-        const uint flg_self = compute_centre_flg_15(
-            src, src_pitch, uint(px), uint(py),
-            logical_width, height, range, white_opt);
-        if (flg_self != 0xFFu) {
-            is_inside  = true;
-            inside_flg = flg_self;
-        }
+    if (!best.found && metadata_is_mode15(m_self)
+        && px >= 1 && py >= 1 && uint(px) + 1u < logical_width && uint(py) + 1u < height) {
+        inside_flg = compute_centre_corner_flg_only(
+            src, src_pitch, uint(px), uint(py), range, white_opt);
+        is_inside = true;
     }
 
     // ===== Phase 3: Block 3 (cy=py, cx<px) then Block 4 (cy<py) =====
@@ -695,12 +808,12 @@ kernel void smooth_per_pixel(
     if (!best.found && !is_inside) {
         // Block 3: centres at (px-1-k, py). Scan k=0 up (largest cx
         // within block 3 = closest to me).
-        for (int k = 0; k < SMOOTH_MAX_LENGTH; k++) {
+        for (int k = 0; k < cap; k++) {
             const int cx = px - 1 - k;
             const int cy = py;
             if (cx < 1) break;
             WriterCandidate trial = try_block_candidate(
-                best, src, src_pitch,
+                best, src, metadata, src_pitch,
                 cx, cy, k, /*block_id*/ 3,
                 /*flg1*/ 0, -1, 2u,
                 /*flg2*/ 0,  1, 4u,
@@ -709,18 +822,18 @@ kernel void smooth_per_pixel(
                 /*step*/   1, 0,
                 /*scan*/   1, int(width) - 2, cx,
                 width, height, logical_width,
-                range, white_opt, line_weight);
+                range, white_opt, line_weight, cap);
             if (trial.found) { best = trial; break; }
         }
         // Block 4: centres at (px, py-1-k). Scan k=0 up (largest cy
         // within block 4 = closest above me).
         if (!best.found) {
-            for (int k = 0; k < SMOOTH_MAX_LENGTH; k++) {
+            for (int k = 0; k < cap; k++) {
                 const int cx = px;
                 const int cy = py - 1 - k;
                 if (cy < 1) break;
                 WriterCandidate trial = try_block_candidate(
-                    best, src, src_pitch,
+                    best, src, metadata, src_pitch,
                     cx, cy, k, /*block_id*/ 4,
                     /*flg1*/  1, 0, 4u,
                     /*flg2*/ -1, 0, 8u,
@@ -729,7 +842,7 @@ kernel void smooth_per_pixel(
                     /*step*/   0, 1,
                     /*scan*/   1, int(height) - 2, cy,
                     width, height, logical_width,
-                    range, white_opt, line_weight);
+                    range, white_opt, line_weight, cap);
                 if (trial.found) { best = trial; break; }
             }
         }

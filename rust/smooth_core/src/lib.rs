@@ -69,7 +69,23 @@ pub extern "C" fn smooth_core_version() -> u32 {
     //              execution (Mutex + wait_until_completed) for diagnosing
     //              MFR queue saturation contribution to FrameTask 517.
     //              See docs/PHASE_2A_PREP2B_DESIGN_MEMO.md §9.
-    0x0002_000e
+    // 0x0002_000f: dispatch_smooth_chain takes a `metadata_buf` AE-managed
+    //              pointer for Hybrid Path β step1 (Sub-stage
+    //              C-2.5b.2-prep2c-step1, 2026-05-05). Two-pass dispatch
+    //              in a single command buffer: pass 1 = smooth_detect →
+    //              metadata (1 byte/pixel, mode_flg + fast_compare bit);
+    //              pass 2 = smooth_per_pixel reads src + metadata, does
+    //              cap-range cardinal early-out for flat regions, runs
+    //              full per-output writer selection bounded by
+    //              `gpu_max_length` for the rest. Cap is read at run time
+    //              from env var `SMOOTH_GPU_MAX_LENGTH` (default 32,
+    //              clamped to [4, 128]). The two passes write DIFFERENT
+    //              buffers (metadata vs dst) — matches SDK_Invert_ProcAmp
+    //              pattern, avoids the prep2c v1 issue where two kernels
+    //              both wrote dst. CPU equivalence at the cap is broken;
+    //              step2 will share the cap with the CPU path under the
+    //              GPU profile flag. See PHASE_2A_PREP2B_DESIGN_MEMO.md §10.
+    0x0002_000f
 }
 
 /// Human-readable build identity, captured at Rust crate build time by
@@ -516,14 +532,21 @@ mod metal_ffi {
     /// subsequent frames take the CPU path. Caller may pass 0/0 to
     /// opt out of fallen-state propagation (e.g., from unit tests).
     ///
+    /// `metadata_buf` (FFI 0x0002_000f+) is an AE-managed device
+    /// memory pointer of `width * height` bytes (1 byte per pixel),
+    /// allocated by the C++ caller via `PF_GPUDeviceSuite::AllocateDeviceMemory`
+    /// and freed after this call returns. The smooth_detect pass writes
+    /// it; the smooth_per_pixel pass reads it. Must NOT be NULL.
+    ///
     /// SAFETY: same as dispatch_passthrough — `handle` is a live
-    /// MetalBackend, src/dst are MTLBuffer pointers from AE's GPU
-    /// suite, pitches are in pixels (= rowbytes/16 for BGRA128).
+    /// MetalBackend, src/dst/metadata are MTLBuffer pointers from AE's
+    /// GPU suite, pitches are in pixels (= rowbytes/16 for BGRA128).
     #[no_mangle]
     pub unsafe extern "C" fn smooth_core_metal_dispatch_smooth_chain(
         handle: *mut c_void,
         src_buf: *mut c_void,
         dst_buf: *mut c_void,
+        metadata_buf: *mut c_void,
         src_pitch_pixels: u32,
         dst_pitch_pixels: u32,
         width: u32,
@@ -542,7 +565,7 @@ mod metal_ffi {
             Err(_) => return -2,
         };
         let dispatch = backend.dispatch_smooth_chain(
-            &mut ctx, src_buf, dst_buf,
+            &mut ctx, src_buf, dst_buf, metadata_buf,
             src_pitch_pixels, dst_pitch_pixels,
             width, height, logical_width,
             range_f32, white_opt, line_weight,
