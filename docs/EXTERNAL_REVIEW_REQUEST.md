@@ -83,7 +83,7 @@ rust/smooth_core/ (staticlib)
 1. [`README.md`](../README.md) — プラグインの利用者向け概要(短い)
 2. [`docs/CAPTURE_32BPC_RUNBOOK.md`](CAPTURE_32BPC_RUNBOOK.md) — 32bpc goldens の
    取得 / 再生成手順(Phase 2-A.2 関連レビュー時のみ必要)
-3. **[`workbench_history.md`](../workbench_history.md)** — 作業ログ。
+3. **[`workbench_history.md`](workbench_history.md)** — 作業ログ。
    各 Phase / Step の実施記録 + 失敗例 + 根拠付きの設計判断。
    レビュー対象 Step の節を **時系列で前後 1〜2 Step 分** 読むと文脈が掴める
    (「なぜこの選択をしたか」がここに残っている例が多い)

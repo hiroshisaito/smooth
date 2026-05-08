@@ -119,25 +119,28 @@ MSBuild から `rust/smooth_core/build-windows.bat` が呼ばれ、`+crt-static`
 ├── win/                           # VS2022 project + リリース配布物(gitignored)
 ├── THIRD_PARTY_LICENSES.md        # Rust 依存関係と SDK/toolchain の third-party notices
 ├── RELEASE_NOTES-v1.x.x.md        # 各リリースの詳細 + SHA256 ゴールド
-├── workbench_history.md           # Phase/Step 単位の開発ログ(日本語)
-└── docs/                          # 運用ドキュメント(build-id 検証手順等)
+└── docs/                          # 運用ドキュメント、開発ログ、過去リリースノート
+    ├── workbench_history.md       # Phase/Step 単位の開発ログ(日本語)
+    ├── RELEASE_NOTES-v1.5.x.md    # 過去リリースの詳細
+    ├── WINDOWS_BUILD_ID_INTEGRATION.md
+    └── ...
 ```
 
 ## リリース履歴
 
 - **v1.6.0** — 32bpc(PF_PixelFloat / float color)対応。SmartRender 経路化 + 32bpc Comp / HDR / float color workflow に対応(CPU only)。[リリースノート](RELEASE_NOTES-v1.6.0.md)
-- **v1.5.1** (2026-04-22) — Multi-Frame Rendering + build-id UI 対応。[リリースノート](RELEASE_NOTES-v1.5.1.md)
+- **v1.5.1** (2026-04-22) — Multi-Frame Rendering + build-id UI 対応。[リリースノート](docs/RELEASE_NOTES-v1.5.1.md)
 - **v1.5.0** (2026-04-21, Phase 2-D 時点) — Rust コア移行 + Windows AE 2025 対応の統合
 - v1.5.0 (初出) — AE 2025 対応 + rayon 並列化 + Apple Silicon 対応
 - (この fork では未リリース)upstream smooth 1.4.0 — LoiLo 株式会社による AE CC2017 向け初版
 
-フェーズ単位の詳細開発ログ: [`workbench_history.md`](workbench_history.md)
+フェーズ単位の詳細開発ログ: [`docs/workbench_history.md`](docs/workbench_history.md)
 
 ## 開発ノート
 
-- 各 Phase/Step は commit 前に [`workbench_history.md`](workbench_history.md) へ追記するルール(同ファイル冒頭に明記)
+- 各 Phase/Step は commit 前に [`docs/workbench_history.md`](docs/workbench_history.md) へ追記するルール(同ファイル冒頭に明記)
 - [`docs/WINDOWS_BUILD_ID_INTEGRATION.md`](docs/WINDOWS_BUILD_ID_INTEGRATION.md) に build-id UI の検証手順と LTO インライン化対策を記載
-- 配布バイナリの SHA256 は非決定性(MSVC linker timestamp / Mac codesign timestamp のため)。ゴールド SHA と一致しない再ビルド binary の等価性は、Build キャプション + `EntryPointFunc` unmangled export + 3 段偽成功検証 で確認可能(`workbench_history.md` の「等価性検証手順」セクション参照)
+- 配布バイナリの SHA256 は非決定性(MSVC linker timestamp / Mac codesign timestamp のため)。ゴールド SHA と一致しない再ビルド binary の等価性は、Build キャプション + `EntryPointFunc` unmangled export + 3 段偽成功検証 で確認可能(`docs/workbench_history.md` の「等価性検証手順」セクション参照)
 
 ## ライセンス
 
